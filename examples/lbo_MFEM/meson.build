@@ -17,5 +17,7 @@ executable(
 )
 
 fs.copyfile('fix_CSR_bin_files.py')
+fs.copyfile('fix_node_files.py')
 fs.copyfile('make_sphere_data.sh', 'make_sphere_data.sh')
+fs.copyfile('make_sanity_check_plots.py', 'make_sanity_check_plots.py')
 fs.copyfile('make_plots.py', 'make_plots.py')
