@@ -225,19 +225,16 @@ cdef class FacStreamer:
     @staticmethod
     def from_trees(Tree rowTree, Tree colTree,
                    rowTreeInitDepth=None,
-                   colTreeInitDepth=None, BfReal tol=1e-15,
+                   BfReal tol=1e-15,
                    BfSize minNumRows=20, BfSize minNumCols=20,
                    bint compareRelativeErrors=False):
         if rowTreeInitDepth is None:
             rowTreeInitDepth = 1
-        if colTreeInitDepth is None:
-            colTreeInitDepth = colTree.get_max_depth()
 
         cdef BfFacSpec facSpec
         facSpec.rowTree = rowTree.tree
         facSpec.colTree = colTree.tree
         facSpec.rowTreeInitDepth = rowTreeInitDepth
-        facSpec.colTreeInitDepth = colTreeInitDepth
         facSpec.tol = tol
         facSpec.minNumRows = minNumRows
         facSpec.minNumCols = minNumCols

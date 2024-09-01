@@ -6,8 +6,17 @@
 typedef struct BfFacSpec {
   BfTree *rowTree;
   BfTree *colTree;
+
+  /* When streaming new column blocks, start on this level of the
+   * row/space tree when doing the adaptive butterfly.  For example,
+   * if we're computing the butterfly factorization of an orthogonal
+   * matrix, then starting at the top of the space tree
+   * (`rowTreeInitDepth == 0`) is a waste of time, since we will not
+   * be able to compress a column block of an orthgonal matrix using
+   * an SVD. On the other hand, if we set `rowTreeInitDepth >= 1`, we
+   * can guarantee that we will only do potentially useful
+   * computation. */
   BfSize rowTreeInitDepth;
-  BfSize colTreeInitDepth;
 
   /* The tolerance used to compute truncated SVDs of blocks when
    * streaming the butterfly factorization. */

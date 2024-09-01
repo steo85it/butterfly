@@ -123,7 +123,6 @@ int main(int argc, char const *argv[]) {
     .rowTree = rowTree,
     .colTree = bfIntervalTreeToTree(freqTree),
     .rowTreeInitDepth = rowTreeOffset,
-    .colTreeInitDepth = freqTreeDepth, // TODO: this is unused!
     .tol = tol,
     .minNumRows = 20,
     .minNumCols = 20,

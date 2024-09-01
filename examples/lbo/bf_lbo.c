@@ -1,4 +1,5 @@
 #include <bf/assert.h>
+#include <bf/const.h>
 #include <bf/error.h>
 #include <bf/error_macros.h>
 #include <bf/fac_span.h>
@@ -27,15 +28,16 @@ typedef struct {
   BfLogLevel logLevel;
 
   char const *objPath;
-  char const *matPath;
+  char const *matDirPath;
 
   bool useOctree;
   bool useFiedlerTree;
 
   BfReal tol;
+  BfReal freqMax;
   BfSize numLeafNodes;
-  BfSize rowTreeOffset;
-  BfSize freqTreeDepth;
+  BfSize rowTreeInitDepth;
+  BfSize freqTreeMaxDepth;
   BfSize freqTreeOffset;
 
   bool compareRelativeErrors;
@@ -51,16 +53,16 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   struct arg_str *logLevel;
 
   struct arg_str *objPath;
-  struct arg_str *matPath;
+  struct arg_str *matDirPath;
 
   struct arg_lit *useOctree;
   struct arg_lit *useFiedlerTree;
 
   struct arg_dbl *tol;
+  struct arg_dbl *freqMax;
   struct arg_int *numLeafNodes;
-  struct arg_int *rowTreeOffset;
-  struct arg_int *freqTreeDepth;
-  struct arg_int *freqTreeOffset;
+  struct arg_int *rowTreeInitDepth;
+  struct arg_int *freqTreeMaxDepth;
 
   struct arg_lit *compareRelativeErrors;
   struct arg_lit *bailIfBottomedOut;
@@ -71,19 +73,19 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
     help = arg_lit0(NULL, "help", "Display help and exit"),
 
     seed = arg_int0(NULL, "seed", NULL, "Seed for random number generator (default: 0)"),
-    logLevel = arg_str0(NULL, "logLevel", NULL, NULL),
+    logLevel = arg_str0(NULL, "logLevel", NULL, "Log level (must be TODO, DEBUG, INFO, WARN, or ERROR)"),
 
-    objPath = arg_str0(NULL, "objPath", NULL, NULL),
-    matPath = arg_str0(NULL, "matPath", NULL, NULL),
+    objPath = arg_str0(NULL, "objPath", NULL, "Path to Wavefront .obj file to load (must be watertight triangle mesh)"),
+    matDirPath = arg_str0(NULL, "matDirPath", NULL, "Path to directory containing {L,M}_{rowptr,colind,data}.bin defining stiffness (L) and mass (M) matrices in CSR format"),
 
-    useOctree = arg_lit0(NULL, "useOctree", NULL),
-    useFiedlerTree = arg_lit0(NULL, "useFiedlerTree", NULL),
+    useOctree = arg_lit0(NULL, "useOctree", "Use an octree for the row/space tree"),
+    useFiedlerTree = arg_lit0(NULL, "useFiedlerTree", "Use a Fiedler tree for the row/space tree (experimental)"),
 
-    tol = arg_dbl0(NULL, "tol", NULL, NULL),
-    numLeafNodes = arg_int0(NULL, "numLeafNodes", NULL, NULL),
-    rowTreeOffset = arg_int0(NULL, "rowTreeOffset", NULL, NULL),
-    freqTreeDepth = arg_int0(NULL, "freqTreeDepth", NULL, NULL),
-    freqTreeOffset = arg_int0(NULL, "freqTreeOffset", NULL, NULL),
+    tol = arg_dbl0(NULL, "tol", NULL, "Relative tolerance used for SVD truncation"),
+    freqMax = arg_dbl0(NULL, "freqMax", NULL, "Build column/frequency tree on [0, freqMax] (instead of using maximum eigenvalue)"),
+    numLeafNodes = arg_int0(NULL, "numLeafNodes", NULL, "Manually specify the number of leaf nodes to stream"),
+    rowTreeInitDepth = arg_int0(NULL, "rowTreeInitDepth", NULL, "The level (>= 0, where 0 == root) to start from in the row/space tree when doing an adaptive column butterfly"),
+    freqTreeMaxDepth = arg_int0(NULL, "freqTreeMaxDepth", NULL, "The maximum depth to which the frequency interval tree should be built"),
 
     compareRelativeErrors = arg_lit0(NULL, "compareRelativeErrors", NULL),
     bailIfBottomedOut = arg_lit0(NULL, "bailIfBottomedOut", NULL),
@@ -94,16 +96,16 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   *seed->ival = 0;
   *logLevel->sval = "error";
   *objPath->sval = "";
-  *matPath->sval = "";
+  *matDirPath->sval = "";
 
   useOctree->count = 1;
   useFiedlerTree->count = 0;
 
   *tol->dval = 1e-3;
+  *freqMax->dval = BF_NAN;
   *numLeafNodes->ival = -1;
-  *rowTreeOffset->ival = 0;
-  *freqTreeDepth->ival = -1;
-  *freqTreeOffset->ival = -1;
+  *rowTreeInitDepth->ival = 0;
+  *freqTreeMaxDepth->ival = -1;
 
   compareRelativeErrors->count = 0;
   bailIfBottomedOut->count = 0;
@@ -126,34 +128,22 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
     goto cleanup;
   }
 
-  if (*freqTreeDepth->ival >= 0 && *freqTreeOffset->ival >= 0) {
-    printf("Only one of --freqTreeDepth or --freqTreeOffset should be set\n");
-    success = false;
-    goto cleanup;
-  }
-
   if (!(useOctree->count ^ useFiedlerTree->count)) {
     printf("Pass exactly one of --useOctree or --useFiedlerTree\n");
     success = false;
     goto cleanup;
   }
 
-  if (!(strcmp(*objPath->sval, "") ^ strcmp(*matPath->sval, ""))) {
-    printf("Exactly one of --objPath or --matPath should be set\n");
+  if (!(strcmp(*objPath->sval, "") ^ strcmp(*matDirPath->sval, ""))) {
+    printf("Exactly one of --objPath or --matDirPath should be set\n");
     success = false;
     goto cleanup;
   }
 
-  if (strcmp(*matPath->sval, "") && useFiedlerTree->count) {
-    printf("Argument --useFiedlerTree is only implemented with --objPath, not --matPath\n");
+  if (strcmp(*matDirPath->sval, "") && useFiedlerTree->count) {
+    printf("Argument --useFiedlerTree is only implemented with --objPath, not --matDirPath\n");
     success = false;
     goto cleanup;
-  }
-
-  /* If neither --freqTreeDepth nor --freqTreeOffset are set, then we
-   * use a value of freqTreeOffset equal to 2 by default: */
-  if (*freqTreeDepth->ival == -1 && *freqTreeOffset->ival == -1) {
-    *freqTreeOffset->ival = 2;
   }
 
   opts->seed = *seed->ival;
@@ -175,33 +165,25 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   }
 
   opts->objPath = *objPath->sval;
-  opts->matPath  = *matPath->sval;
+  opts->matDirPath  = *matDirPath->sval;
 
   opts->useOctree = useOctree->count > 0;
   opts->useFiedlerTree = useFiedlerTree->count > 0;
 
   opts->tol = *tol->dval;
+  opts->freqMax = *tol->dval;
   opts->numLeafNodes = *numLeafNodes->ival;
-  opts->rowTreeOffset = *rowTreeOffset->ival;
+  opts->rowTreeInitDepth = *rowTreeInitDepth->ival;
 
-  if (*freqTreeDepth->ival == -1) {
-    opts->freqTreeDepth = BF_SIZE_BAD_VALUE;
+  if (*freqTreeMaxDepth->ival == -1) {
+    opts->freqTreeMaxDepth = BF_SIZE_BAD_VALUE;
   } else {
-    BF_ASSERT(*freqTreeDepth->ival >= 0);
-    opts->freqTreeDepth = *freqTreeDepth->ival;
-  }
-
-  if (*freqTreeOffset->ival == -1) {
-    opts->freqTreeOffset = BF_SIZE_BAD_VALUE;
-  } else {
-    BF_ASSERT(*freqTreeOffset->ival >= 0);
-    opts->freqTreeOffset = *freqTreeOffset->ival;
+    BF_ASSERT(*freqTreeMaxDepth->ival >= 0);
+    opts->freqTreeMaxDepth = *freqTreeMaxDepth->ival;
   }
 
   opts->compareRelativeErrors = compareRelativeErrors->count > 0;
   opts->bailIfBottomedOut = bailIfBottomedOut->count > 0;
-
-  BF_ASSERT((opts->freqTreeDepth != BF_SIZE_BAD_VALUE) ^ (opts->freqTreeOffset != BF_SIZE_BAD_VALUE));
 
 cleanup:
   arg_freetable(argtable, sizeof(argtable)/sizeof(argtable[0]));
@@ -253,16 +235,16 @@ int main(int argc, char *argv[]) {
 
     numVerts = bfTrimeshGetNumVerts(trimesh);
     printf("using linear FEM on triangle mesh from obj file %s (%lu verts)\n", opts.objPath, numVerts);
-  } else if (strcmp(opts.matPath, "")) {
+  } else if (strcmp(opts.matDirPath, "")) {
     /* Load mass matrix M and stiffness matrix L from binaries */
     char rowptrPath[200];
     char colindPath[200];
     char dataPath[200];
-    strcpy(rowptrPath, opts.matPath);
+    strcpy(rowptrPath, opts.matDirPath);
     strcat(rowptrPath, "/L_rowptr.bin");
-    strcpy(colindPath, opts.matPath);
+    strcpy(colindPath, opts.matDirPath);
     strcat(colindPath, "/L_colind.bin");
-    strcpy(dataPath, opts.matPath);
+    strcpy(dataPath, opts.matDirPath);
     strcat(dataPath, "/L_data.bin");
     L = bfMatCsrRealToMat(bfMatCsrRealNewFromBinaryFiles(rowptrPath, colindPath, dataPath));
     if (bfMatGetNumRows(L) != bfMatGetNumCols(L)) {
@@ -274,11 +256,11 @@ int main(int argc, char *argv[]) {
     rowptrPath[0] = '\0';
     colindPath[0] = '\0';
     dataPath[0] = '\0';
-    strcpy(rowptrPath, opts.matPath);
+    strcpy(rowptrPath, opts.matDirPath);
     strcat(rowptrPath, "/M_rowptr.bin");
-    strcpy(colindPath, opts.matPath);
+    strcpy(colindPath, opts.matDirPath);
     strcat(colindPath, "/M_colind.bin");
-    strcpy(dataPath, opts.matPath);
+    strcpy(dataPath, opts.matDirPath);
     strcat(dataPath, "/M_data.bin");
     M = bfMatCsrRealToMat(bfMatCsrRealNewFromBinaryFiles(rowptrPath, colindPath, dataPath));
     if (bfMatGetNumRows(M) != bfMatGetNumCols(M)) {
@@ -287,12 +269,12 @@ int main(int argc, char *argv[]) {
     }
 
     char vertsPath[200];
-    strcpy(vertsPath, opts.matPath);
+    strcpy(vertsPath, opts.matDirPath);
     strcat(vertsPath, "/nodes.bin");
     verts = bfPoints3NewFromBinaryFile(vertsPath);
 
     numVerts = bfPoints3GetSize(verts);
-    printf("using FEM matrices loaded from binaries in directory %s (%lu verts)\n", opts.matPath, numVerts);
+    printf("using FEM matrices loaded from binaries in directory %s (%lu verts)\n", opts.matDirPath, numVerts);
   }
 
   if (opts.useOctree) {
@@ -316,8 +298,8 @@ int main(int argc, char *argv[]) {
     rowTree = bfFiedlerTreeToTree(fiedlerTree);
   }
 
-  BfSize rowTreeDepth = bfTreeGetMaxDepth(rowTree);
-  printf("row tree has depth %lu\n", rowTreeDepth);
+  BfSize rowTreeMaxDepth = bfTreeGetMaxDepth(rowTree);
+  printf("row tree has depth %lu\n", rowTreeMaxDepth);
 
   /* Find the largest eigenvalue. We need this to determine the
    * interval on which we'll build the frequency tree. */
@@ -328,31 +310,38 @@ int main(int argc, char *argv[]) {
 
   /* The natural frequency of each eigenvector is the square root of
    * the associated eigenvalue. */
-  BfReal freqMax = sqrt(lamMax);
+  if (isfinite(opts.freqMax)) {
+    printf("- passed user-defined maximum frequency of %1.2f\n", opts.freqMax);
+    printf("- would have used %1.2f\n", sqrt(lamMax));
+  } else {
+    printf("- using maximum frequency of %1.2f = sqrt(%1.2f)\n", sqrt(lamMax), lamMax);
+  }
+  BfReal freqMax = isfinite(opts.freqMax) ? opts.freqMax : sqrt(lamMax);
 
   /* Set the valence of the frequency tree to match the valence of the
    * row tree: */
   BfSize k = opts.useOctree ? 8 : 2;
 
   /* Figure out the depth of the frequency tree: */
-  BfSize freqTreeDepth = BF_SIZE_BAD_VALUE;
-  if (opts.freqTreeDepth != BF_SIZE_BAD_VALUE) {
-    freqTreeDepth = opts.freqTreeDepth;
+  BfSize freqTreeMaxDepth = BF_SIZE_BAD_VALUE;
+  if (opts.freqTreeMaxDepth != BF_SIZE_BAD_VALUE) {
+    if (freqTreeMaxDepth > rowTreeMaxDepth) {
+      printf("user-defined frequency tree depth (%lu) exceeds row tree depth\n", freqTreeMaxDepth);
+      exit(EXIT_FAILURE);
+    }
+    freqTreeMaxDepth = opts.freqTreeMaxDepth;
   } else {
-    freqTreeDepth = rowTreeDepth - opts.freqTreeOffset;
+    freqTreeMaxDepth = rowTreeMaxDepth;
   }
-  if (freqTreeDepth > rowTreeDepth) {
-    printf("frequency tree depth (%lu) exceeds row tree depth\n", freqTreeDepth);
-    exit(EXIT_FAILURE);
-  }
+  BF_ASSERT(freqTreeMaxDepth <= rowTreeMaxDepth);
 
-  printf("building frequency tree with depth %lu (k = %lu)\n", freqTreeDepth, k);
+  printf("building frequency tree with depth %lu (k = %lu)\n", freqTreeMaxDepth, k);
 
   /* Set up the frequency tree. Note: we build the tree on the
    * frequency scale as opposed to the eigenvalue scale to preserve
    * the time-frequency product in the butterfly factorization. */
   BfIntervalTree *freqTree = bfIntervalTreeNew();
-  bfIntervalTreeInitEmpty(freqTree, 0, freqMax, k, freqTreeDepth);
+  bfIntervalTreeInitEmpty(freqTree, 0, freqMax, k, freqTreeMaxDepth);
   HANDLE_ERROR();
 
   /* Upcast frequency tree to get the column tree */
@@ -371,8 +360,7 @@ int main(int argc, char *argv[]) {
   BfFacSpec spec = {
     .rowTree = rowTree,
     .colTree = colTree,
-    .rowTreeInitDepth = opts.rowTreeOffset,
-    .colTreeInitDepth = freqTreeDepth, // TODO: this is unused!
+    .rowTreeInitDepth = opts.rowTreeInitDepth,
     .tol = opts.tol,
     .minNumRows = 20,
     .minNumCols = 20,
