@@ -21,4 +21,5 @@ BfReal bfIntervalGetMidpoint(BfInterval const* interval);
 bool bfIntervalIsEmpty(BfInterval const *interval);
 bool bfIntervalEquals(BfInterval const *I1, BfInterval const *I2);
 bool bfIntervalIsFinite(BfInterval const *interval);
+bool bfIntervalHasFiniteEndpoint(BfInterval const *interval);
 BfReal bfIntervalGetFiniteEndpoint(BfInterval const *interval);

@@ -134,6 +134,10 @@ bool bfIntervalIsFinite(BfInterval const *interval) {
   return isfinite(interval->endpoint[0]) && isfinite(interval->endpoint[1]);
 }
 
+bool bfIntervalHasFiniteEndpoint(BfInterval const *interval) {
+  return isfinite(interval->endpoint[0]) || isfinite(interval->endpoint[1]);
+}
+
 BfReal bfIntervalGetFiniteEndpoint(BfInterval const *interval) {
   if (isfinite(interval->endpoint[0])) return interval->endpoint[0];
   if (isfinite(interval->endpoint[1])) return interval->endpoint[1];
