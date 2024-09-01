@@ -50,15 +50,16 @@ static BfInterval getBracketFromNode(BfTreeNode const *treeNode) {
   /* Set up the bracket for computing the next eigenband: */
   BfInterval bracket = {
     .endpoint = {
-      left ? -BF_INFINITY : pow(intervalTreeNode->a, 2.0),
-      right ? BF_INFINITY : pow(intervalTreeNode->b, 2.0)
+      pow(intervalTreeNode->a, 2.0),
+      pow(intervalTreeNode->b, 2.0)
     },
-    .closed = {
-      !left, // (-inf, lam1) ...
-      false  // ... or [lam0, lam1) ...
-             // ... or [lam0, +inf)
-    }
+    .closed = {false, true}
   };
+
+  /* TODO: do this less dumb */
+  const double PADDING = 1e-5;
+  if (left) bracket.endpoint[0] -= PADDING;
+  if (right) bracket.endpoint[1] += PADDING;
 
   BF_ERROR_END() {
     BF_DIE();
@@ -102,8 +103,6 @@ BfLboFeedResult bfLboFeedFacStreamerNextEigenband(BfFacStreamer *facStreamer, Bf
   result.eigenbandTime = bfTime() - t0_eigs;
   HANDLE_ERROR();
 
-  printf("feed: bracket = %c%1.2f, %1.2f%c, num. eigs = %lu\n", bracket.closed[0] ? '[' : '(', bracket.endpoint[0], bracket.endpoint[1], bracket.closed[1] ? ']' : ')', Lam->super.size);
-
   /* Permute the rows of Phi, putting them into row tree order */
   bfMatPermuteRows(Phi, bfFacStreamerGetRowTreeReversePerm(facStreamer));
 
@@ -119,10 +118,9 @@ BfLboFeedResult bfLboFeedFacStreamerNextEigenband(BfFacStreamer *facStreamer, Bf
   bfPoints1InsertPointsSorted(freqs, newFreqs);
   HANDLE_ERROR();
 
-  /* We set update the tree's point set without rebuilding the
-   * tree. This has the effect of adjusting the range of points each
-   * tree node points to without actually changing with nodes are in
-   * the tree. */
+  /* Update the tree's point set without rebuilding the tree. This has
+   * the effect of adjusting the range of points each tree node points
+   * to without actually changing the nodes in the tree. */
   bfIntervalTreeSetPoints(intervalTree, freqs, /* rebuildTree: */ false);
   HANDLE_ERROR();
 
@@ -131,7 +129,7 @@ BfLboFeedResult bfLboFeedFacStreamerNextEigenband(BfFacStreamer *facStreamer, Bf
   if (bfTreeNodeGetNumPoints(treeNode) != Lam->super.size)
     RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
 
-  /* Feed the factorization the streamed band of eigenvectors */
+  /* Feed the streamed band of eigenvectors: */
   result.success = bfFacStreamerFeed(facStreamer, Phi);
   HANDLE_ERROR();
 
@@ -144,6 +142,10 @@ BfLboFeedResult bfLboFeedFacStreamerNextEigenband(BfFacStreamer *facStreamer, Bf
   bfVecRealDeinitAndDealloc(&Lam);
 
   result.totalTime = bfTime() - t0_total;
+
+  result.freqBand = bracket;
+  result.freqBand.endpoint[0] = sqrt(result.freqBand.endpoint[0]);
+  result.freqBand.endpoint[1] = sqrt(result.freqBand.endpoint[1]);
 
   return result;
 }

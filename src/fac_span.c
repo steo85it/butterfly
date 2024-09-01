@@ -119,8 +119,10 @@ void bfFacSpanDealloc(BfFacSpan **facSpan) {
 }
 
 void bfFacSpanDelete(BfFacSpan **facSpan) {
-  bfFacSpanDeinit(*facSpan);
-  bfFacSpanDealloc(facSpan);
+  if (facSpan != NULL && *facSpan != NULL) {
+    bfFacSpanDeinit(*facSpan);
+    bfFacSpanDealloc(facSpan);
+  }
 }
 
 BfMat *bfFacSpanGetMat(BfFacSpan const *facSpan, BfPolicy policy) {

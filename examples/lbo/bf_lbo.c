@@ -30,6 +30,8 @@ typedef struct {
   char const *objPath;
   char const *matDirPath;
 
+  bool computeMaxFreq;
+
   bool useOctree;
   bool useFiedlerTree;
 
@@ -55,6 +57,8 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   struct arg_str *objPath;
   struct arg_str *matDirPath;
 
+  struct arg_lit *computeMaxFreq;
+
   struct arg_lit *useOctree;
   struct arg_lit *useFiedlerTree;
 
@@ -78,6 +82,8 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
     objPath = arg_str0(NULL, "objPath", NULL, "Path to Wavefront .obj file to load (must be watertight triangle mesh)"),
     matDirPath = arg_str0(NULL, "matDirPath", NULL, "Path to directory containing {L,M}_{rowptr,colind,data}.bin defining stiffness (L) and mass (M) matrices in CSR format"),
 
+    computeMaxFreq = arg_lit0(NULL, "computeMaxFreq", "Compute the maximum frequency of the mesh and terminate"),
+
     useOctree = arg_lit0(NULL, "useOctree", "Use an octree for the row/space tree"),
     useFiedlerTree = arg_lit0(NULL, "useFiedlerTree", "Use a Fiedler tree for the row/space tree (experimental)"),
 
@@ -97,6 +103,8 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   *logLevel->sval = "error";
   *objPath->sval = "";
   *matDirPath->sval = "";
+
+  computeMaxFreq->count = 0;
 
   useOctree->count = 1;
   useFiedlerTree->count = 0;
@@ -128,10 +136,18 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
     goto cleanup;
   }
 
-  if (!(useOctree->count ^ useFiedlerTree->count)) {
+  if (computeMaxFreq->count == 0 && !(useOctree->count ^ useFiedlerTree->count)) {
     printf("Pass exactly one of --useOctree or --useFiedlerTree\n");
     success = false;
     goto cleanup;
+  }
+
+  if (computeMaxFreq->count > 0 && useOctree->count > 0) {
+    printf("WARNING: Passed --computeMaxFreq: --useOctree will be ignored");
+  }
+
+  if (computeMaxFreq->count > 0 && useFiedlerTree->count > 0) {
+    printf("WARNING: Passed --computeMaxFreq: --useOctree will be ignored");
   }
 
   if (!(strcmp(*objPath->sval, "") ^ strcmp(*matDirPath->sval, ""))) {
@@ -167,11 +183,13 @@ bool parseArgs(Opts *opts, int argc, char *argv[]) {
   opts->objPath = *objPath->sval;
   opts->matDirPath  = *matDirPath->sval;
 
+  opts->computeMaxFreq = computeMaxFreq->count > 0;
+
   opts->useOctree = useOctree->count > 0;
   opts->useFiedlerTree = useFiedlerTree->count > 0;
 
   opts->tol = *tol->dval;
-  opts->freqMax = *tol->dval;
+  opts->freqMax = *freqMax->dval;
   opts->numLeafNodes = *numLeafNodes->ival;
   opts->rowTreeInitDepth = *rowTreeInitDepth->ival;
 
@@ -277,6 +295,27 @@ int main(int argc, char *argv[]) {
     printf("using FEM matrices loaded from binaries in directory %s (%lu verts)\n", opts.matDirPath, numVerts);
   }
 
+  /* Find the largest eigenvalue. We need this to determine the
+   * interval on which we'll build the frequency tree. */
+  bfToc();
+  BfReal lamMax = bfGetMaxEigenvalue(L, M);
+  HANDLE_ERROR();
+  printf("maximum eigenvalue: %g [%.1fs]\n", lamMax, bfToc());
+  printf("maximum frequency: %g [%.1fs]\n", sqrt(lamMax), bfToc());
+  if (opts.computeMaxFreq) {
+    exit(EXIT_SUCCESS);
+  }
+
+  /* The natural frequency of each eigenvector is the square root of
+   * the associated eigenvalue. */
+  if (isfinite(opts.freqMax)) {
+    printf("- passed user-defined maximum frequency of %1.2f\n", opts.freqMax);
+    printf("- would have used %1.2f\n", sqrt(lamMax));
+  } else {
+    printf("- using maximum frequency of %1.2f = sqrt(%1.2f)\n", sqrt(lamMax), lamMax);
+  }
+  BfReal freqMax = isfinite(opts.freqMax) ? opts.freqMax : sqrt(lamMax);
+
   if (opts.useOctree) {
     BfOctree *octree = bfOctreeNew();
     HANDLE_ERROR();
@@ -301,23 +340,6 @@ int main(int argc, char *argv[]) {
   BfSize rowTreeMaxDepth = bfTreeGetMaxDepth(rowTree);
   printf("row tree has depth %lu\n", rowTreeMaxDepth);
 
-  /* Find the largest eigenvalue. We need this to determine the
-   * interval on which we'll build the frequency tree. */
-  bfToc();
-  BfReal lamMax = bfGetMaxEigenvalue(L, M);
-  HANDLE_ERROR();
-  printf("computed lambda_max = %g [%.1fs]\n", lamMax, bfToc());
-
-  /* The natural frequency of each eigenvector is the square root of
-   * the associated eigenvalue. */
-  if (isfinite(opts.freqMax)) {
-    printf("- passed user-defined maximum frequency of %1.2f\n", opts.freqMax);
-    printf("- would have used %1.2f\n", sqrt(lamMax));
-  } else {
-    printf("- using maximum frequency of %1.2f = sqrt(%1.2f)\n", sqrt(lamMax), lamMax);
-  }
-  BfReal freqMax = isfinite(opts.freqMax) ? opts.freqMax : sqrt(lamMax);
-
   /* Set the valence of the frequency tree to match the valence of the
    * row tree: */
   BfSize k = opts.useOctree ? 8 : 2;
@@ -325,11 +347,11 @@ int main(int argc, char *argv[]) {
   /* Figure out the depth of the frequency tree: */
   BfSize freqTreeMaxDepth = BF_SIZE_BAD_VALUE;
   if (opts.freqTreeMaxDepth != BF_SIZE_BAD_VALUE) {
+    freqTreeMaxDepth = opts.freqTreeMaxDepth;
     if (freqTreeMaxDepth > rowTreeMaxDepth) {
       printf("user-defined frequency tree depth (%lu) exceeds row tree depth\n", freqTreeMaxDepth);
       exit(EXIT_FAILURE);
     }
-    freqTreeMaxDepth = opts.freqTreeMaxDepth;
   } else {
     freqTreeMaxDepth = rowTreeMaxDepth;
   }
@@ -375,12 +397,15 @@ int main(int argc, char *argv[]) {
   bfFacStreamerInit(facStreamer, &spec);
   HANDLE_ERROR();
 
-  if (opts.numLeafNodes != BF_SIZE_BAD_VALUE)
+  if (opts.numLeafNodes != BF_SIZE_BAD_VALUE) {
     printf("streaming %lu leaf nodes\n", opts.numLeafNodes);
-  else if (opts.bailIfBottomedOut)
+  } else if (opts.bailIfBottomedOut) {
     printf("streaming until we bottom out in the space tree\n");
-  else
+  } else if (isfinite(opts.freqMax)) {
+    printf("streaming until we cover [0, %1.2f]\n", opts.freqMax);
+  } else {
     printf("streaming the entire eigenvector matrix (PROBABLY A BAD IDEA!)\n");
+  }
 
   BfReal t_total = 0;
   BfReal t_eigs = 0;
@@ -393,9 +418,14 @@ int main(int argc, char *argv[]) {
     BfReal t0_column = bfTime();
 
     BfLboFeedResult result = bfLboFeedFacStreamerNextEigenband(facStreamer, freqs, L, M);
+    printf("streamed frequency band %c%1.2f, %1.2f%c:\n",
+           result.freqBand.closed[0] ? '[' : '(',
+           result.freqBand.endpoint[0],
+           result.freqBand.endpoint[1],
+           result.freqBand.closed[1] ? ']' : ')');
 
     BfSize numBytesUncompressed = sizeof(BfReal)*numVerts*freqs->size;
-    printf("- streamed %lu eigs (%1.1f%% of total) in %1.2fs\n",
+    printf("- streamed %lu eigs total (%1.1f%% of total) in %1.2fs\n",
            freqs->size,
            (100.0*freqs->size)/numVerts,
            result.eigenbandTime);

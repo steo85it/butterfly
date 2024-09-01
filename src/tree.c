@@ -515,7 +515,7 @@ void bfTreeMapConst(BfTree const *tree, BfTreeNode const *node,
 }
 
 BfSize bfTreeGetNumPoints(BfTree const *tree) {
-  return bfTreeNodeGetNumPoints(tree->root);
+  return tree->perm->size;
 }
 
 BfTreeNode *bfTreeGetNode(BfTree *tree, BfSize depth, BfSize nodeIndex) {

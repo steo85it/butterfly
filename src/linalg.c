@@ -820,13 +820,22 @@ static bool doublesHaveDistinctMidpoint(double lam0, double lam1) {
   return lam0 != lam_mid && lam_mid != lam1;
 }
 
+static double getSigmaForInterval(BfInterval const *interval) {
+  if (bfIntervalIsFinite(interval)) {
+    return bfIntervalGetMidpoint(interval);
+  } else if (bfIntervalHasFiniteEndpoint(interval)) {
+    return bfIntervalGetFiniteEndpoint(interval);
+  } else {
+    return 0;
+  }
+}
+
 static BfInterval getPairsCoveringInterval(BfMat const *A, BfMat const *M, BfInterval const *interval, BfRealArray *LamData, BfRealArray *PhiTransposeData) {
   BF_ERROR_BEGIN();
 
   BfMat *coverPhiTranspose = NULL;
   BfVecReal *coverLam = NULL;
-  BfReal const sigma = bfIntervalIsFinite(interval) ?
-    bfIntervalGetMidpoint(interval) : bfIntervalGetFiniteEndpoint(interval);
+  BfReal const sigma = getSigmaForInterval(interval);
 
   /* If we don't have a finite gap between the two eigenvalues on the
    * edges of the covering interval, then we can't isolate the

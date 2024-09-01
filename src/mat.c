@@ -41,7 +41,7 @@ BfVec *bfMatGetColRangeView(BfMat *mat, BfSize i0, BfSize i1, BfSize j) {
 }
 
 void bfMatDelete(BfMat **mat) {
-  (*mat)->vtbl->Delete(mat);
+  if (mat != NULL && *mat != NULL) (*mat)->vtbl->Delete(mat);
 }
 
 BfMat *bfMatEmptyLike(BfMat const *mat, BfSize numRows, BfSize numCols) {

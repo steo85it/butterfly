@@ -139,6 +139,9 @@ BfSize bfTreeNodeGetDepth(BfTreeNode const *node) {
 
 BfSize bfTreeNodeGetNumPoints(BfTreeNode const *node) {
   if (bfTreeNodeIsLeaf(node)) {
+    if (bfTreeNodeIsRoot(node)) {
+      return bfTreeGetNumPoints(bfTreeNodeGetTreeConst(node));
+    }
     BfSize const *parentOffset = bfTreeNodeGetParentConst(node)->offset;
     return parentOffset[node->index + 1] - parentOffset[node->index];
   } else {
