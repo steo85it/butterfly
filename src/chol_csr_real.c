@@ -35,7 +35,7 @@ BfMat *bfCholCsrRealSolve(BfCholCsrReal const *cholCsrReal, BfMat const *B) {
 }
 
 static BfVec *
-solve_vecReal(BfCholCsrReal const *cholCsrReal, BfVecReal const *b, int sys) {
+solve_vecReal(BfCholCsrReal const *cholCsrReal, BfVecReal const *b, int solve_sys) {
   BF_ERROR_BEGIN();
 
   BfVecReal *x = bfVecRealNew();
@@ -61,7 +61,7 @@ solve_vecReal(BfCholCsrReal const *cholCsrReal, BfVecReal const *b, int sys) {
 
   // TODO: we can probably optimize this a bit by using cholmod_solve2
   // instead of cholmod_solve.
-  cholmod_dense *x_ = cholmod_solve(sys, cholCsrReal->impl->RFactor, &b_, c);
+  cholmod_dense *x_ = cholmod_solve(solve_sys, cholCsrReal->impl->RFactor, &b_, c);
 
   bfMemCopy(x_->x, n, sizeof(BfReal), x->data);
   cholmod_free_dense(&x_, c);
@@ -88,8 +88,10 @@ BfVec *bfCholCsrRealSolveVec(BfCholCsrReal const *cholCsrReal, BfVec const *b) {
 BfVec *bfCholCsrRealFacSolveVec(BfCholCsrReal const *cholCsrReal, BfVec const *b, bool transposed) {
   switch (bfVecGetType(b)) {
   case BF_TYPE_VEC_REAL:
-    int sys = transposed ? CHOLMOD_L : CHOLMOD_Lt;
-    return solve_vecReal(cholCsrReal, bfVecConstToVecRealConst(b), sys);
+    {
+    int solve_sys = transposed ? CHOLMOD_L : CHOLMOD_Lt;
+    return solve_vecReal(cholCsrReal, bfVecConstToVecRealConst(b), solve_sys);
+    }
   default:
     bfSetError(BF_ERROR_NOT_IMPLEMENTED);
     return NULL;

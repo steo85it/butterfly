@@ -557,6 +557,23 @@ cdef class MatBlockDiag(Mat):
 cdef class MatCsrReal(Mat):
     cdef BfMatCsrReal *mat_csr_real
 
+    def to_scipy_csr(self):
+        import numpy as np
+        import scipy.sparse as sp
+        cdef BfSize m = bfMatGetNumRows(self.mat)
+        cdef BfSize n = bfMatGetNumCols(self.mat)
+        cdef const BfSize* rp = bfMatCsrRealGetRowptrConstPtr(self.mat_csr_real)
+        cdef BfSize nnz = rp[m]
+        cdef const BfSize* ci = bfMatCsrRealGetColindConstPtr(self.mat_csr_real)
+        cdef const BfReal*  da = bfMatCsrRealGetDataConstPtr  (self.mat_csr_real)
+
+        # Copy to NumPy so SciPy owns the buffers (safe if BF frees its memory)
+        rowptr = np.asarray(<BfSize[:m+1]> rp, dtype=np.uintp).copy()
+        colind = np.asarray(<BfSize[:nnz]>  ci, dtype=np.uintp).copy()
+        data   = np.asarray(<BfReal[:nnz]>  da, dtype=np.float64).copy()
+
+        return sp.csr_matrix((data, colind, rowptr), shape=(m, n))
+
     @staticmethod
     def new_view_factor_matrix_from_trimesh(Trimesh trimesh, BfSize[::1] I=None, BfSize[::1] J=None):
         if I is None:

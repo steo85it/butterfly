@@ -57,3 +57,8 @@ void bfMatCsrRealDump(BfMatCsrReal const *mat, char const *rowptrPath, char cons
                       char const *dataPath);
 bool bfMatCsrRealHasSameSparsityPattern(BfMatCsrReal const *matCsrReal, BfMatCsrReal const *otherMatCsrReal);
 BfMatDiagReal *bfMatCsrRealLump(BfMatCsrReal const *matCsrReal);
+
+/* Read-only accessors for CSR buffers */
+BfSize const *bfMatCsrRealGetRowptrConstPtr(BfMatCsrReal const *A);
+BfSize const *bfMatCsrRealGetColindConstPtr(BfMatCsrReal const *A);
+BfReal const *bfMatCsrRealGetDataConstPtr  (BfMatCsrReal const *A);

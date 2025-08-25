@@ -14,6 +14,8 @@
 #include <bf/vectors.h>
 
 #include <math.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 /** Interface: Mat */
 
@@ -279,6 +281,11 @@ BfMat *bfMatCsrRealGetSubmatByMask(BfMatCsrReal const *matCsrReal, bool const *r
   return bfMatCsrRealToMat(submat);
 }
 
+/** Indices: */
+BfSize const *bfMatCsrRealGetRowptrConstPtr(BfMatCsrReal const *A) { return A->rowptr; }
+BfSize const *bfMatCsrRealGetColindConstPtr(BfMatCsrReal const *A) { return A->colind; }
+BfReal const *bfMatCsrRealGetDataConstPtr  (BfMatCsrReal const *A) { return A->data;   }
+
 /** Upcasting: */
 
 BfMat *bfMatCsrRealToMat(BfMatCsrReal *matCsrReal) {
@@ -421,10 +428,18 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimes
   BfRealArray *data = bfRealArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
 
-  for (BfSize i = 0; i < bfSizeArrayGetSize(rowInds); ++i) {
+  const char *env = getenv("BF_PROGRESS");
+  size_t progress_step = env ? strtoul(env, NULL, 10) : 0;
+
+  for (BfSize i = 0; i < numRows; ++i) {
+
+    if (progress_step && (i % progress_step == 0)) {
+      fprintf(stderr, "[bf] view-factor rows: %zu/%zu\n", (size_t)i, (size_t)numRows);
+    }
+
     BfSize rowInd = bfSizeArrayGet(rowInds, i);
 
-    BfSizeArray *visibleColInds = bfTrimeshGetVisibility(trimesh, i, colInds);
+    BfSizeArray *visibleColInds = bfTrimeshGetVisibility(trimesh, rowInd, colInds);
     HANDLE_ERROR();
 
     bfSizeArrayExtend(colind, visibleColInds);

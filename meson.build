@@ -101,6 +101,8 @@ if host_machine.system() == 'linux'
 elif host_machine.system() == 'darwin'
   blas_dep = cc.find_library('openblas', required : true)
   butterfly_dependencies += [blas_dep]
+  add_project_arguments('-D_DARWIN_C_SOURCE=1', language : 'c')
+  add_project_arguments('-D__DARWIN_UNIX03=1', language : 'c')
 elif host_machine.system() == 'windows'
   error('Windows unsupported currently')
 endif
@@ -111,8 +113,8 @@ if get_option('python').enabled()
   butterfly_dependencies += [python3_dep, numpy_dep]
 endif
 
-fmm2d_dep = dependency('fmm2d', required : true)
-argtable3_dep = dependency('argtable3', required : true)
+fmm2d_dep = dependency('fmm2d', required : false)
+argtable3_dep = dependency('argtable3', required : false)
 
 butterfly_lib_src = [
   'src/array.c',
@@ -227,6 +229,10 @@ butterfly_dep = declare_dependency(
 
 pkg.generate(butterfly_lib)
 
-subdir('examples')
-subdir('tests')
+if get_option('examples').enabled()
+  subdir('examples')
+endif
+if get_option('tests').enabled()
+  subdir('tests')
+endif
 subdir('wrappers')

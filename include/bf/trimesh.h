@@ -57,3 +57,5 @@ bool bfTrimeshHasVertexNormals(BfTrimesh const *trimesh);
 BfVectors3 *bfTrimeshGetVertexNormalsPtr(BfTrimesh *trimesh);
 BfVectors3 *bfTrimeshGetFaceNormalsPtr(BfTrimesh *trimesh);
 void bfTrimeshComputeFaceNormalsMatchingVertexNormals(BfTrimesh *trimesh);
+/* Compute per-face unit normals from geometry if not present. */
+void bfTrimeshEnsureFaceNormals(BfTrimesh *trimesh);

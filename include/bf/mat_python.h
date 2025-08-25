@@ -1,7 +1,18 @@
 #pragma once
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Initialize NumPy C-API once. Returns 0 on success, -1 on failure. */
+int bfInit(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+/* Avoid including Python.h here — forward declare PyObject instead */
+typedef struct _object PyObject;
 
 #include "mat.h"
 

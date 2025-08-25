@@ -14,6 +14,57 @@
 
 #include "macros.h"
 
+/* Portable qsort_r wrapper: accept glibc-style signature at the call site */
+typedef int (*bf_qsort_cmp_fn)(const void *, const void *, void *);
+
+/* macOS/BSD qsort_r has different arg order and comparator type */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+
+/* Thunk to adapt (const void*,const void*,void*) -> (void*,const void*,const void*) */
+struct bf_qsort_thunk {
+  bf_qsort_cmp_fn cmp;
+  void *aux;
+};
+
+static int bf_qsort_bsd_thunk(void *thunk, const void *a, const void *b) {
+  struct bf_qsort_thunk *t = (struct bf_qsort_thunk *)thunk;
+  return t->cmp(a, b, t->aux);
+}
+
+static void bf_qsort_r(void *base, size_t n, size_t size,
+                       bf_qsort_cmp_fn cmp, void *aux)
+{
+  struct bf_qsort_thunk t = { cmp, aux };
+  qsort_r(base, n, size, &t, bf_qsort_bsd_thunk); /* BSD order: aux first */
+}
+
+#elif defined(__GLIBC__) || defined(__linux__) || defined(__CYGWIN__)
+
+/* glibc order matches our desired call site */
+static void bf_qsort_r(void *base, size_t n, size_t size,
+                       bf_qsort_cmp_fn cmp, void *aux)
+{
+  qsort_r(base, n, size, cmp, aux);
+}
+
+#else
+/* Fallback: emulate with qsort + thread-local context (not signal-safe) */
+static _Thread_local void *bf_qsort_aux;
+static _Thread_local bf_qsort_cmp_fn bf_qsort_tls_cmp;
+
+static int bf_qsort_fallback_cmp(const void *a, const void *b) {
+  return bf_qsort_tls_cmp(a, b, bf_qsort_aux);
+}
+
+static void bf_qsort_r(void *base, size_t n, size_t size,
+                       bf_qsort_cmp_fn cmp, void *aux)
+{
+  bf_qsort_aux = aux;
+  bf_qsort_tls_cmp = cmp;
+  qsort(base, n, size, bf_qsort_fallback_cmp);
+}
+#endif
+
 BfReal bfToc(void) {
   static clock_t t1 = 0;
   clock_t t0 = t1;
@@ -178,7 +229,7 @@ void bfReadFileToMemory(char const *path, BfSize numBytes, BfByte *ptr) {
 }
 
 void bfSort(BfPtr ptr, BfSize n, BfSize size, BfCompar compar, BfPtr aux) {
-  qsort_r(ptr, n, size, compar, aux);
+  bf_qsort_r(ptr, n, size, compar, aux);
 }
 
 static int sgn(BfReal x) {

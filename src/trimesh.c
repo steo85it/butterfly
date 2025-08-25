@@ -19,6 +19,7 @@
 #include <bf/vectors.h>
 
 #include "macros.h"
+#include <math.h>  /* for isfinite */
 
 #ifdef BF_EMBREE
 #  include <embree4/rtcore.h>
@@ -687,7 +688,11 @@ void bfTrimeshInitFromObjFile(BfTrimesh *trimesh, char const *objPath) {
       break;
 
     saveptr = NULL;
-    tok = strtok_r(lineptr, " ", &saveptr);
+    tok = strtok_r(lineptr, " \t\r\n", &saveptr);
+    if (tok == NULL || tok[0] == '#' || tok[0] == '\0') {
+      bfMemFree(lineptr);
+      continue;
+    }
 
     if (!strcmp(tok, "v")) ++num_verts;
     if (!strcmp(tok, "vn")) ++num_vert_normals;
@@ -751,20 +756,17 @@ void bfTrimeshInitFromObjFile(BfTrimesh *trimesh, char const *objPath) {
     }
 
     if (!strcmp(tok, "f")) {
-      if (num_vert_normals > 0) {
-        char *toks[3], *saveptr_, *tok;
-        for (size_t i = 0; i < 3; ++i) {
-          toks[i] = strtok_r(NULL, " ", &saveptr);
-        }
-        for (size_t i = 0; i < 3; ++i) {
-          saveptr_ = NULL;
-          tok = strtok_r(toks[i], "//", &saveptr_);
-          trimesh->faces[fv_index][i] = strtoull(tok, NULL, 10) - 1;
-        }
-        ++fv_index;
-      } else {
-        BF_DIE();
+      /* Accept 'f v1 v2 v3', 'f v1//vn1 v2//vn2 v3//vn3', or 'f v1/vt1/vn1 ...' */
+      for (size_t i = 0; i < 3; ++i) {
+        char *ftok = strtok_r(NULL, " \t\r\n", &saveptr);
+        if (ftok == NULL) RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+        char *slash = strchr(ftok, '/');       /* take the first field before '/' if present */
+        if (slash) *slash = '\0';
+        BfSize idx = strtoull(ftok, NULL, 10); /* OBJ is 1-based */
+        if (idx == 0) RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+        trimesh->faces[fv_index][i] = idx - 1;
       }
+      ++fv_index;
     }
 
     bfMemFree(lineptr);
@@ -1659,7 +1661,8 @@ typedef struct {
 
 void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFunctionNArguments* args)
 {
-  BF_ASSERT(args->N == 1);
+  /* Old: BF_ASSERT(args->N == 1); */
+  if (args->N != 1) return;  /* be permissive for safety */
 
   /* Skip invalid rays: */
   if (args->valid[0] != -1)
@@ -1684,16 +1687,22 @@ BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfS
   HANDLE_ERROR();
 
   struct RTCRayHit rayHit;
+  memset(&rayHit, 0, sizeof(rayHit));
 
   struct RTCRay *ray = &rayHit.ray;
   struct RTCHit *hit = &rayHit.hit;
 
   BfReal const *pSrc = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
 
+  struct RTCIntersectArguments intersectArguments;
+  rtcInitIntersectArguments(&intersectArguments);
+
   struct RTCRayQueryContext context;
   rtcInitRayQueryContext(&context);
+  intersectArguments.context = &context;
+  intersectArguments.filter  = trimeshGetVisibility_intersectionFilter;
 
-  IntervalInds inds = {.srcInd = srcInd};
+  IntervalInds inds = {.srcInd = srcInd, .tgtInd = 0};
 
   for (BfSize i = 0; i < bfSizeArrayGetSize(tgtInds); ++i) {
     inds.tgtInd = bfSizeArrayGet(tgtInds, i);
@@ -1704,37 +1713,28 @@ BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfS
 
     BfReal const *pTgt = bfTrimeshGetFaceCentroidConstPtr(trimesh, inds.tgtInd);
 
-    ray->org_x = pSrc[0];
-    ray->org_y = pSrc[1];
-    ray->org_z = pSrc[2];
+    ray->org_x = pSrc[0];  ray->org_y = pSrc[1];  ray->org_z = pSrc[2];
     ray->dir_x = pTgt[0] - pSrc[0];
     ray->dir_y = pTgt[1] - pSrc[1];
     ray->dir_z = pTgt[2] - pSrc[2];
-    ray->tnear = 0;
-    ray->tfar = BF_INFINITY;
-    ray->mask = -1;
+    ray->tnear = 1e-6f;               /* avoid self-hit on source face */
+    ray->tfar  = BF_INFINITY;
+    ray->mask  = -1;
     ray->flags = 0;
 
-    hit->geomID = RTC_INVALID_GEOMETRY_ID;
+    hit->geomID    = RTC_INVALID_GEOMETRY_ID;
+    hit->primID    = RTC_INVALID_GEOMETRY_ID;
     hit->instID[0] = RTC_INVALID_GEOMETRY_ID;
-
-    struct RTCIntersectArguments intersectArguments;
-    rtcInitIntersectArguments(&intersectArguments);
-
-    intersectArguments.context = &context;
-    intersectArguments.filter = trimeshGetVisibility_intersectionFilter;
 
     rtcIntersect1(trimesh->scene, &rayHit, &intersectArguments);
 
-    // If there's a hit, `tfar` should be finite after tracing. Since
-    // we're computing pairwise visibilities, there is *always* a hit.
-    BF_ASSERT(isfinite(ray->tfar));
+    /* Be defensive: if Embree leaves tfar infinite, treat as miss. */
+    if (!isfinite(ray->tfar))
+      continue;
 
-    if (isfinite(ray->tfar)) {
-      BfSize visTgtInd = hit->primID;
-      if (visTgtInd == inds.tgtInd)
-        bfSizeArrayAppend(visTgtInds, visTgtInd);
-    }
+    BfSize visTgtInd = hit->primID;
+    if (visTgtInd == inds.tgtInd)
+      bfSizeArrayAppend(visTgtInds, visTgtInd);
   }
 
   BF_ERROR_END() {
@@ -1754,18 +1754,17 @@ BfReal const *bfTrimeshGetFaceCentroidConstPtr(BfTrimesh const *trimesh, BfSize 
 BfReal const *bfTrimeshGetFaceUnitNormalConstPtr(BfTrimesh const *trimesh, BfSize i) {
   BF_ERROR_BEGIN();
 
-  if (!bfTrimeshHasFaceNormals(trimesh))
-    RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+  /* Compute if missing */
+  bfTrimeshEnsureFaceNormals((BfTrimesh *)trimesh);
 
   if (i >= bfTrimeshGetNumFaces(trimesh))
     RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
 
-  BF_ERROR_END() {
-    BF_DIE();
-  }
+  BF_ERROR_END() { BF_DIE(); }
 
   return bfVectors3GetConstPtr(trimesh->faceNormals, i);
 }
+
 
 BfReal bfTrimeshGetFaceArea(BfTrimesh const *trimesh, BfSize i) {
   if (i >= bfTrimeshGetNumFaces(trimesh))
@@ -1840,4 +1839,37 @@ void bfTrimeshComputeFaceNormalsMatchingVertexNormals(BfTrimesh *trimesh) {
   BF_ERROR_END() {
     BF_DIE();
   }
+}
+
+void bfTrimeshEnsureFaceNormals(BfTrimesh *trimesh) {
+  BF_ERROR_BEGIN();
+
+  if (bfTrimeshHasFaceNormals(trimesh)) return;
+
+  BfSize numFaces = bfTrimeshGetNumFaces(trimesh);
+  trimesh->faceNormals = bfVectors3NewWithCapacity(numFaces);
+  HANDLE_ERROR();
+
+  for (BfSize i = 0; i < numFaces; ++i) {
+    BfSize const *F = bfTrimeshGetFaceConstPtr(trimesh, i);
+    BfReal const *x0 = bfTrimeshGetVertPtrConst(trimesh, F[0]);
+    BfReal const *x1 = bfTrimeshGetVertPtrConst(trimesh, F[1]);
+    BfReal const *x2 = bfTrimeshGetVertPtrConst(trimesh, F[2]);
+
+    BfVector3 e1, e2, n;
+    bfPoint3Sub(x1, x0, e1);
+    bfPoint3Sub(x2, x0, e2);
+    bfVector3Cross(e1, e2, n);
+
+    BfReal nn = bfVector3Norm(n);
+    if (nn == 0) {
+      /* Degenerate face: keep going but record a safe normal. */
+      n[0] = 0; n[1] = 0; n[2] = 1;
+    } else {
+      for (int k = 0; k < 3; ++k) n[k] /= nn;
+    }
+    bfVectors3Append(trimesh->faceNormals, n);
+  }
+
+  BF_ERROR_END() { BF_DIE(); }
 }

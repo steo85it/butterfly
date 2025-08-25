@@ -11,8 +11,15 @@
 #  error "Building mat_python.c without python Meson feature enabled"
 #endif
 
-#define NO_IMPORT_ARRAY
+/* This TU is the one that DEFINES the NumPy C-API pointer and imports it */
 #include "numpy.h"
+
+int bfInit(void) {
+  /* macOS-safe: our numpy.h already handles the Darwin signal macros */
+  /* Initialize NumPy’s C-API exactly once; return -1 on failure */
+  import_array1(-1);  /* provided by numpy/arrayobject.h */
+  return 0;
+}
 
 /** Interface: Mat */
 

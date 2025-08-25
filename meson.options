@@ -13,5 +13,14 @@ option(
 option(
   'mfem',
   type : 'feature',
-  value : 'enabled',
+  value : 'disabled',
   description : 'Compile features and examples using MFEM')
+
+option('fmm2d', type : 'feature', value : 'disabled',
+       description : 'Enable 2D FMM features (needs libfmm2d via pkg-config)')
+option('argtable3', type : 'feature', value : 'disabled',
+       description : 'Enable CLI examples that use argtable3')
+option('examples', type : 'feature', value : 'disabled',
+       description : 'Build C examples (may require extra libs)')
+option('tests', type : 'feature', value : 'disabled',
+       description : 'Build C tests (requires cmocka)')

@@ -18,8 +18,21 @@
 #include <bf/vec_real.h>
 
 #ifdef BF_PYTHON
-#  define NO_IMPORT_ARRAY
-#  include "numpy.h"
+  /* macOS: ensure NSIG is defined before NumPy pulls <signal.h> */
+  #if defined(__APPLE__)
+    #include <sys/param.h>
+    #include <sys/signal.h>
+    /* Prefer the SDK’s number if available; else use a safe fallback */
+    #if !defined(NSIG) && defined(_NSIG)
+      #define NSIG _NSIG
+    #endif
+    #if !defined(NSIG)
+      #define NSIG 32
+    #endif
+  #endif
+
+  #define NO_IMPORT_ARRAY
+  #include "numpy.h"
 #endif
 
 /** Static functions: */

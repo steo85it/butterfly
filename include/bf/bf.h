@@ -6,4 +6,4 @@
 
 #include "fac_streamer.h"
 
-void bfInit(void);
+int bfInit(void);
