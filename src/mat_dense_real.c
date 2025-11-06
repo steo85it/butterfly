@@ -2,9 +2,13 @@
 
 #include <string.h>
 
+#include <bf/blas.h>                 /* must precede any CBLAS use */
+#ifndef CblasNoTrans                 /* belt & suspenders: include again if needed */
+#  include <bf/blas.h>
+#endif
+
 #include <bf/real_array.h>
 #include <bf/assert.h>
-#include <bf/blas.h>
 #include <bf/const.h>
 #include <bf/error.h>
 #include <bf/error_macros.h>
@@ -17,7 +21,7 @@
 
 #include "macros.h"
 
-static enum CBLAS_TRANSPOSE getCblasTranspose(BfMatDenseReal const *mat) {
+static CBLAS_TRANSPOSE getCblasTranspose(BfMatDenseReal const *mat) {
   BfMat const *super = bfMatDenseRealConstToMatConst(mat);
   if (super->props & (BF_MAT_PROPS_TRANS | BF_MAT_PROPS_CONJ))
     return CblasConjTrans;
@@ -1342,7 +1346,7 @@ static BfVec *mulVec_vecReal(BfMatDenseReal const *matDenseReal,
                              BfSize m, BfSize n) {
   BF_ERROR_BEGIN();
 
-  enum CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseReal);
+  CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseReal);
 
   BfVecReal *result = bfVecRealNew();
   HANDLE_ERROR();
@@ -1411,7 +1415,7 @@ static BfVec *rmulVec_vecReal(BfMatDenseReal const *matDenseReal,
                               BfSize m, BfSize n) {
   BF_ERROR_BEGIN();
 
-  enum CBLAS_TRANSPOSE trans =
+  CBLAS_TRANSPOSE trans =
     getCblasTranspose(matDenseReal) == CblasNoTrans ? CblasTrans : CblasNoTrans;
 
   BfVecReal *result = bfVecRealNew();
@@ -1446,8 +1450,8 @@ static BfVec *rmulVec_vecReal(BfMatDenseReal const *matDenseReal,
 //   if (bfMatIsTransposed(TO_MAT(res)))
 //     RAISE_ERROR(BF_ERROR_NOT_IMPLEMENTED);
 
-//   enum CBLAS_TRANSPOSE transa = getCblasTranspose(op1);
-//   enum CBLAS_TRANSPOSE transb = getCblasTranspose(op2);
+//   CBLAS_TRANSPOSE transa = getCblasTranspose(op1);
+//   CBLAS_TRANSPOSE transb = getCblasTranspose(op2);
 
 //   BfSize m = bfMatDenseRealGetNumRows(res);
 //   BfSize n = bfMatDenseRealGetNumCols(res);

@@ -2,8 +2,12 @@
 
 #include <math.h>
 
+#include <bf/blas.h>                 /* must precede any CBLAS use */
+#ifndef CblasNoTrans                 /* belt & suspenders: include again if needed */
+#  include <bf/blas.h>
+#endif
+
 #include <bf/assert.h>
-#include <bf/blas.h>
 #include <bf/error.h>
 #include <bf/error_macros.h>
 #include <bf/lu_dense_complex.h>
@@ -37,7 +41,7 @@
 
 /** Static functions: */
 
-static enum CBLAS_TRANSPOSE getCblasTranspose(BfMatDenseComplex const *mat) {
+static CBLAS_TRANSPOSE getCblasTranspose(BfMatDenseComplex const *mat) {
   BfMat const *super = bfMatDenseComplexConstToMatConst(mat);
   if (super->props & (BF_MAT_PROPS_TRANS | BF_MAT_PROPS_CONJ))
     return CblasConjTrans;
@@ -1070,7 +1074,7 @@ mulVec_complex(BfMatDenseComplex const *matDenseComplex,
 {
   BF_ERROR_BEGIN();
 
-  enum CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseComplex);
+  CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseComplex);
 
   BfVecComplex *result = bfVecComplexNew();
   HANDLE_ERROR();
@@ -1110,8 +1114,8 @@ static BfMat *rmul_matDenseComplex(BfMatDenseComplex const *matDenseComplex, BfM
   bfMatDenseComplexInit(result, m, n);
   HANDLE_ERROR();
 
-  enum CBLAS_TRANSPOSE transa = getCblasTranspose(otherMatDenseComplex);
-  enum CBLAS_TRANSPOSE transb = getCblasTranspose(matDenseComplex);
+  CBLAS_TRANSPOSE transa = getCblasTranspose(otherMatDenseComplex);
+  CBLAS_TRANSPOSE transb = getCblasTranspose(matDenseComplex);
 
   BfComplex alpha = 1;
   BfComplex beta = 0;
@@ -1331,7 +1335,7 @@ backwardSolveVec_complex(BfMatDenseComplex const *matDenseComplex,
   BfVecComplex *result = bfVecToVecComplex(bfVecCopy(&vecComplex->super));
   HANDLE_ERROR();
 
-  enum CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseComplex);
+  CBLAS_TRANSPOSE trans = getCblasTranspose(matDenseComplex);
   BfSize lda = getLeadingDimension(matDenseComplex);
 
   cblas_ztrsv(CblasRowMajor, CblasUpper, trans, CblasNonUnit, m,
@@ -1720,8 +1724,8 @@ bfMatDenseComplexDenseComplexMul(BfMatDenseComplex const *op1,
 {
   BF_ERROR_BEGIN();
 
-  enum CBLAS_TRANSPOSE transa = getCblasTranspose(op1);
-  enum CBLAS_TRANSPOSE transb = getCblasTranspose(op2);
+  CBLAS_TRANSPOSE transa = getCblasTranspose(op1);
+  CBLAS_TRANSPOSE transb = getCblasTranspose(op2);
 
   BfMat const *super1 = bfMatDenseComplexConstToMatConst(op1);
   BfMat const *super2 = bfMatDenseComplexConstToMatConst(op2);

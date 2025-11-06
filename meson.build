@@ -34,11 +34,12 @@ endif
 
 cc = meson.get_compiler('c')
 
+libm = cc.find_library('m', required : true)
 fortran_dep = cc.find_library('gfortran', required : true)
 cholmod_dep = cc.find_library('cholmod', required : true)
 m_dep = cc.find_library('m', required : false)
 umfpack_dep = cc.find_library('umfpack', required : true)
-arpack_dep = dependency('arpack', required : true)
+arpack_dep = dependency('arpack', required : false)
 gsl_dep = dependency('gsl', required : true)
 
 if get_option('embree').enabled()
@@ -87,17 +88,27 @@ if get_option('python').enabled()
 endif
 
 butterfly_dependencies = [
+  libm,
   fortran_dep,
   cholmod_dep,
   m_dep,
-  arpack_dep,
+  # arpack_dep,
   gsl_dep,
   umfpack_dep,
 ]
+
+if arpack_dep.found()
+  add_project_arguments('-DBF_HAVE_ARPACK', language : 'c')
+  butterfly_dependencies += [arpack_dep]
+else
+  message('ARPACK not found — building without ARPACK-dependent code')
+endif
+
 if host_machine.system() == 'linux'
   blas_dep = dependency('flexiblas', required : true)
   lapacke_dep = dependency('lapacke', required : true)
   butterfly_dependencies += [blas_dep, lapacke_dep]
+  add_project_arguments('-D_DEFAULT_SOURCE', language : 'c')
 elif host_machine.system() == 'darwin'
   blas_dep = cc.find_library('openblas', required : true)
   butterfly_dependencies += [blas_dep]
@@ -115,6 +126,13 @@ endif
 
 fmm2d_dep = dependency('fmm2d', required : false)
 argtable3_dep = dependency('argtable3', required : false)
+
+# OpenMP (optional but recommended)
+openmp_dep = dependency('openmp', required : false)
+if openmp_dep.found()
+  add_project_arguments('-DBF_OPENMP', language : 'c')
+  butterfly_dependencies += [openmp_dep]
+endif
 
 butterfly_lib_src = [
   'src/array.c',
@@ -205,6 +223,11 @@ butterfly_lib_src = [
 if get_option('python').enabled()
   butterfly_lib_src += ['src/mat_python.c']
 endif
+
+#if arpack_dep.found()
+#  butterfly_lib_src += ['src/linalg.c']   # and 'src/lbo.c' if applicable
+#endif
+
 
 butterfly_inc = include_directories('include')
 

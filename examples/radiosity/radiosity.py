@@ -2,7 +2,7 @@
 
 import sys
 sys.path.insert(-1, '..') # for util
-sys.path.insert(-1, '../../wrappers/python') # for butterfly
+sys.path.insert(-1, '../../build/wrappers/python') # for butterfly
 
 import colorcet as cc
 import numpy as np

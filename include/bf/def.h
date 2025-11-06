@@ -1,7 +1,10 @@
 #pragma once
 
 /* For getline */
-#define _POSIX_C_SOURCE 200809L
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+//#define _POSIX_C_SOURCE 200809L
 
 /* For j0, j1, y0, and y1: */
 #ifndef _DEFAULT_SOURCE
