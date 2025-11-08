@@ -17,6 +17,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifdef BF_OPENMP
+#include <omp.h>
+#endif
+
 /** Interface: Mat */
 
 static BfMatVtable MAT_VTABLE = {
@@ -424,40 +428,112 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimes
 
   BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
-
-  BfRealArray *data = bfRealArrayNewWithDefaultCapacity();
+  BfRealArray *data   = bfRealArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
 
+  /* Per-row scratch: each row builds its own colind/data, then we stitch */
+  BfSizeArray **row_colind = bfMemAlloc(numRows, sizeof(*row_colind));
+  BfRealArray **row_data   = bfMemAlloc(numRows, sizeof(*row_data));
+  for (BfSize i = 0; i < numRows; ++i) { row_colind[i] = NULL; row_data[i] = NULL; }
+
+  /* Optional progress */
   const char *env = getenv("BF_PROGRESS");
   size_t progress_step = env ? strtoul(env, NULL, 10) : 0;
 
+  #ifdef BF_OPENMP
+  #pragma omp parallel for schedule(dynamic,8)
+  #endif
   for (BfSize i = 0; i < numRows; ++i) {
 
     if (progress_step && (i % progress_step == 0)) {
+  #ifdef BF_OPENMP
+  #pragma omp critical
+  #endif
       fprintf(stderr, "[bf] view-factor rows: %zu/%zu\n", (size_t)i, (size_t)numRows);
     }
 
     BfSize rowInd = bfSizeArrayGet(rowInds, i);
 
-    BfSizeArray *visibleColInds = bfTrimeshGetVisibility(trimesh, rowInd, colInds);
-    HANDLE_ERROR();
-
-    bfSizeArrayExtend(colind, visibleColInds);
-    HANDLE_ERROR();
-
-    BfSize numVisibleColInds = bfSizeArrayGetSize(visibleColInds);
-
-    bfSizeArrayAppend(rowptr, numVisibleColInds + bfSizeArrayGetLast(rowptr));
-    HANDLE_ERROR();
-
-    for (BfSize j = 0; j < numVisibleColInds; ++j) {
-      BfSize colInd = bfSizeArrayGet(visibleColInds, j);
-      BfReal value = integrateViewFactorMidpointRule(trimesh, rowInd, colInd);
-      bfRealArrayAppend(data, value);
+    /* 1) Thread-safe visibility (open-segment occlusion) */
+    BfSizeArray *visibleColInds =
+//        bfTrimeshGetVisibilityOpenSegment(trimesh, rowInd, colInds);
+        bfTrimeshGetVisibility(trimesh, rowInd, colInds);
+    if (visibleColInds == NULL) {
+      /* Defensive: if something failed, leave row empty */
+      visibleColInds = bfSizeArrayNewWithCapacity(0);
     }
 
-    bfSizeArrayDeinitAndDealloc(&visibleColInds);
+    /* 2) Compute values for this row */
+    BfRealArray *rowVals = bfRealArrayNewWithCapacity(bfSizeArrayGetSize(visibleColInds));
+    for (BfSize j = 0; j < bfSizeArrayGetSize(visibleColInds); ++j) {
+      BfSize colInd = bfSizeArrayGet(visibleColInds, j);
+      BfReal value  = integrateViewFactorMidpointRule(trimesh, rowInd, colInd);
+      bfRealArrayAppend(rowVals, value);
+    }
+
+    /* 3) Store per-row results (ownership moved) */
+    row_colind[i] = visibleColInds;
+    row_data[i]   = rowVals;
   }
+
+  /* 4) Stitch into a single CSR (serial, no locks) */
+  for (BfSize i = 0; i < numRows; ++i) {
+    BfSizeArray *ci = row_colind[i];
+    BfRealArray *ri = row_data[i];
+
+    /* extend global arrays */
+    bfSizeArrayExtend(colind, ci);
+    bfRealArrayExtend(data, ri);
+
+    /* rowptr += row_nnz */
+    BfSize nnz_i = bfSizeArrayGetSize(ci);
+    BfSize prev  = bfSizeArrayGetLast(rowptr);
+    bfSizeArrayAppend(rowptr, prev + nnz_i);
+
+    /* cleanup per-row */
+    bfSizeArrayDeinitAndDealloc(&ci);
+    bfRealArrayDeinitAndDealloc(&ri);
+  }
+  bfMemFree(row_colind);
+  bfMemFree(row_data);
+
+
+//  BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
+//  HANDLE_ERROR();
+//
+//  BfRealArray *data = bfRealArrayNewWithDefaultCapacity();
+//  HANDLE_ERROR();
+//
+//  const char *env = getenv("BF_PROGRESS");
+//  size_t progress_step = env ? strtoul(env, NULL, 10) : 0;
+//
+//  for (BfSize i = 0; i < numRows; ++i) {
+//
+//    if (progress_step && (i % progress_step == 0)) {
+//      fprintf(stderr, "[bf] view-factor rows: %zu/%zu\n", (size_t)i, (size_t)numRows);
+//    }
+//
+//    BfSize rowInd = bfSizeArrayGet(rowInds, i);
+//
+//    BfSizeArray *visibleColInds = bfTrimeshGetVisibility(trimesh, rowInd, colInds);
+//    HANDLE_ERROR();
+//
+//    bfSizeArrayExtend(colind, visibleColInds);
+//    HANDLE_ERROR();
+//
+//    BfSize numVisibleColInds = bfSizeArrayGetSize(visibleColInds);
+//
+//    bfSizeArrayAppend(rowptr, numVisibleColInds + bfSizeArrayGetLast(rowptr));
+//    HANDLE_ERROR();
+//
+//    for (BfSize j = 0; j < numVisibleColInds; ++j) {
+//      BfSize colInd = bfSizeArrayGet(visibleColInds, j);
+//      BfReal value = integrateViewFactorMidpointRule(trimesh, rowInd, colInd);
+//      bfRealArrayAppend(data, value);
+//    }
+//
+//    bfSizeArrayDeinitAndDealloc(&visibleColInds);
+//  }
 
   BfMatCsrReal *matCsrReal = bfMatCsrRealNewFromArrays(numRows, numCols, rowptr, colind, data, BF_POLICY_STEAL);
   HANDLE_ERROR();
@@ -466,9 +542,9 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimes
     BF_DIE();
   }
 
-  bfSizeArrayDeinitAndDealloc(&rowptr);
-  bfSizeArrayDeinitAndDealloc(&colind);
-  bfRealArrayDeinitAndDealloc(&data);
+//  bfSizeArrayDeinitAndDealloc(&rowptr);
+//  bfSizeArrayDeinitAndDealloc(&colind);
+//  bfRealArrayDeinitAndDealloc(&data);
 
   return matCsrReal;
 }

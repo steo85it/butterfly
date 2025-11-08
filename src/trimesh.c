@@ -1659,28 +1659,69 @@ typedef struct {
   BfSize tgtInd;
 } IntervalInds;
 
-void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFunctionNArguments* args)
-{
-  /* Old: BF_ASSERT(args->N == 1); */
-  if (args->N != 1) return;  /* be permissive for safety */
+typedef struct {
+  BfSize srcInd;
+  BfSize tgtInd;
+} VisQuery;
 
-  /* Skip invalid rays: */
-  if (args->valid[0] != -1)
-    return;
+/* Portable-ish thread-local specifier */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+  #define BF_THREAD_LOCAL _Thread_local
+#else
+  /* GCC/Clang */
+  #define BF_THREAD_LOCAL __thread
+#endif
 
-  IntervalInds const *inds = (IntervalInds const *)args->geometryUserPtr;
+/* one payload per thread */
+static BF_THREAD_LOCAL VisQuery bf_tls_vis;
+//#endif
 
-  struct RTCHit const *hit = (struct RTCHit *)args->hit;
-  BfSize hitInd = hit->primID;
-
-  struct RTCRay *ray = (struct RTCRay *)args->ray;
-  if (inds->srcInd == hitInd) {
-    ray->tfar = BF_INFINITY;
-    args->valid[0] = 0;
-  }
+void *bfTrimeshGetRTCSceneHandle(const BfTrimesh *trimesh) {
+  /* Defensive: if Embree wasn’t initialized, return NULL */
+  if (!trimesh || !trimesh->embreeInitialized) return NULL;
+  return (void *)trimesh->scene;
 }
 
-BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfSizeArray const *tgtInds) {
+//void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFunctionNArguments* args)
+//{
+//  /* Old: BF_ASSERT(args->N == 1); */
+//  if (args->N != 1) return;  /* be permissive for safety */
+//
+//  /* Skip invalid rays: */
+//  if (args->valid[0] != -1)
+//    return;
+//
+//  IntervalInds const *inds = (IntervalInds const *)args->geometryUserPtr;
+//
+//  struct RTCHit const *hit = (struct RTCHit *)args->hit;
+//  BfSize hitInd = hit->primID;
+//
+//  struct RTCRay *ray = (struct RTCRay *)args->ray;
+//  if (inds->srcInd == hitInd) {
+//    ray->tfar = BF_INFINITY;
+//    args->valid[0] = 0;
+//  }
+//}
+
+static void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFunctionNArguments* args)
+{
+  /* We call rtcIntersect1, so Embree will invoke N==1. */
+  if (args->N != 1) return;
+
+  unsigned int* valid = (unsigned int*)args->valid;
+  if (!valid || valid[0] != -1) return;
+
+  const struct RTCHit* hit = (const struct RTCHit*)args->hit;
+  const unsigned int primID = hit->primID;
+
+  /* Drop self-hits only. Target testing happens AFTER intersect. */
+  if ((BfSize)primID == bf_tls_vis.srcInd) { valid[0] = 0; return; }
+}
+
+BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh,
+                                    BfSize srcInd,
+                                    BfSizeArray const *tgtInds)
+{
   BF_ERROR_BEGIN();
 
   BfSizeArray *visTgtInds = bfSizeArrayNewWithDefaultCapacity();
@@ -1692,26 +1733,24 @@ BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfS
   struct RTCRay *ray = &rayHit.ray;
   struct RTCHit *hit = &rayHit.hit;
 
-  BfReal const *pSrc = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
+  const BfReal *pSrc = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
 
-  struct RTCIntersectArguments intersectArguments;
-  rtcInitIntersectArguments(&intersectArguments);
+  struct RTCIntersectArguments iargs;
+  rtcInitIntersectArguments(&iargs);
 
   struct RTCRayQueryContext context;
   rtcInitRayQueryContext(&context);
-  intersectArguments.context = &context;
-  intersectArguments.filter  = trimeshGetVisibility_intersectionFilter;
+  iargs.context = &context;
+  iargs.filter  = trimeshGetVisibility_intersectionFilter;
 
-  IntervalInds inds = {.srcInd = srcInd, .tgtInd = 0};
+  /* per-thread src for the self-hit filter */
+  bf_tls_vis.srcInd = srcInd;
 
   for (BfSize i = 0; i < bfSizeArrayGetSize(tgtInds); ++i) {
-    inds.tgtInd = bfSizeArrayGet(tgtInds, i);
-    if (srcInd == inds.tgtInd)
-      continue;
+    BfSize tgt = bfSizeArrayGet(tgtInds, i);
+    if (tgt == srcInd) continue;
 
-    rtcSetGeometryUserData(trimesh->geometry, &inds);
-
-    BfReal const *pTgt = bfTrimeshGetFaceCentroidConstPtr(trimesh, inds.tgtInd);
+    const BfReal *pTgt = bfTrimeshGetFaceCentroidConstPtr(trimesh, tgt);
 
     ray->org_x = pSrc[0];  ray->org_y = pSrc[1];  ray->org_z = pSrc[2];
     ray->dir_x = pTgt[0] - pSrc[0];
@@ -1719,30 +1758,96 @@ BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfS
     ray->dir_z = pTgt[2] - pSrc[2];
     ray->tnear = 1e-6f;               /* avoid self-hit on source face */
     ray->tfar  = BF_INFINITY;
-    ray->mask  = -1;
+    ray->mask  = ~0u;
     ray->flags = 0;
 
     hit->geomID    = RTC_INVALID_GEOMETRY_ID;
     hit->primID    = RTC_INVALID_GEOMETRY_ID;
     hit->instID[0] = RTC_INVALID_GEOMETRY_ID;
 
-    rtcIntersect1(trimesh->scene, &rayHit, &intersectArguments);
+    rtcIntersect1(trimesh->scene, &rayHit, &iargs);
 
-    /* Be defensive: if Embree leaves tfar infinite, treat as miss. */
-    if (!isfinite(ray->tfar))
-      continue;
+    /* If Embree leaves tfar infinite, treat as miss (defensive). */
+    if (!isfinite(ray->tfar)) continue;
 
-    BfSize visTgtInd = hit->primID;
-    if (visTgtInd == inds.tgtInd)
-      bfSizeArrayAppend(visTgtInds, visTgtInd);
+    /* PHYSICS: visible iff *closest accepted* hit is exactly the target */
+    if ((BfSize)hit->primID == tgt)
+      bfSizeArrayAppend(visTgtInds, tgt);
   }
 
-  BF_ERROR_END() {
-    BF_DIE();
-  }
+  BF_ERROR_END() { BF_DIE(); }
 
   return visTgtInds;
 }
+
+
+BfSizeArray *bfTrimeshGetVisibilityOpenSegment(BfTrimesh const *trimesh,
+                                               BfSize srcInd,
+                                               BfSizeArray const *tgtInds)
+{
+  BF_ERROR_BEGIN();
+
+  BfSizeArray *vis = bfSizeArrayNewWithDefaultCapacity();
+  HANDLE_ERROR();
+
+  /* Source centroid */
+  BfReal const *pSrc = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
+
+  for (BfSize k = 0; k < bfSizeArrayGetSize(tgtInds); ++k) {
+    BfSize tgtInd = bfSizeArrayGet(tgtInds, k);
+    if (tgtInd == srcInd) continue;
+
+    BfReal const *pTgt = bfTrimeshGetFaceCentroidConstPtr(trimesh, tgtInd);
+
+    /* Direction and distance */
+    BfVector3 v;
+    v[0] = pTgt[0] - pSrc[0];
+    v[1] = pTgt[1] - pSrc[1];
+    v[2] = pTgt[2] - pSrc[2];
+
+    BfReal d2 = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+    if (d2 == 0) continue;
+
+    BfReal d    = sqrt(d2);
+    BfReal invd = 1.0/d;
+    BfVector3 dir = { v[0]*invd, v[1]*invd, v[2]*invd };
+
+    /* along-ray epsilon (don’t push off the normal) */
+    const float eps = fmaxf(1e-8f, 1e-6f * (float)d);
+
+    struct RTCRay ray;
+    ray.org_x = (float)(pSrc[0] + eps*dir[0]);
+    ray.org_y = (float)(pSrc[1] + eps*dir[1]);
+    ray.org_z = (float)(pSrc[2] + eps*dir[2]);
+    ray.dir_x = (float)dir[0];
+    ray.dir_y = (float)dir[1];
+    ray.dir_z = (float)dir[2];
+    ray.tnear = eps;
+    ray.tfar  = (float)(d - eps);
+    ray.mask  = ~0u;
+    ray.flags = 0;
+
+    struct RTCOccludedArguments oargs;
+    rtcInitOccludedArguments(&oargs);
+    oargs.flags = RTC_RAY_QUERY_FLAG_COHERENT; /* same intent as “context.flags = COHERENT” */
+
+    rtcOccluded1(trimesh->scene, &ray, &oargs);
+
+    /* Embree 4: occlusion sets tfar < 0 */
+    if (!(ray.tfar < 0.0f)) {
+      bfSizeArrayAppend(vis, tgtInd);
+      HANDLE_ERROR();
+    }
+  }
+
+  BF_ERROR_END() {
+    bfSizeArrayDeinitAndDealloc(&vis);
+    BF_DIE();
+  }
+
+  return vis;
+}
+
 #endif
 
 BfReal const *bfTrimeshGetFaceCentroidConstPtr(BfTrimesh const *trimesh, BfSize i) {

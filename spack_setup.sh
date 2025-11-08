@@ -28,7 +28,7 @@ spack add py-numpy py-cython py-pip py-setuptools py-scipy
 # Optional: OpenMP (usually provided by compiler, but make sure we can link it)
 #spack add llvm-openmp  # if using clang; for GCC you don’t need this
 
-spack concretize -f
+#spack concretize -f
 spack install
 
 
@@ -42,6 +42,7 @@ spack env activate butterfly
 #spack load /rbonybh ninja meson pkgconf
 #spack load suite-sparse openblas arpack-ng gsl embree
 spack load /k5oyloa /rbonybh /yz4faop /kg47p7y /mpuudue py-cython ninja meson suite-sparse arpack-ng embree
+ml load gcc/12.1.0
 
 python3 -m venv ~/nobackup/venvs/butterfly
 source ~/nobackup/venvs/butterfly/bin/activate
@@ -56,6 +57,9 @@ pip install -e .
 source ~/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
 cd ~/nobackup/illumrad/python-embree
 pip install .
+
+# go back to pwd
+cd ~/nobackup/butterfly
 
 # (1) Load everything you need:
 # if you use clang+OpenMP, also: spack load llvm-openmp

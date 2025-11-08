@@ -1211,6 +1211,18 @@ cdef class Trimesh:
     def compute_face_normals_matching_vertex_normals(self):
         bfTrimeshComputeFaceNormalsMatchingVertexNormals(self.trimesh)
 
+    def get_embree_handle(self) -> int:
+        """
+        Return the opaque Embree RTCScene handle as an integer.
+        NOTE: You must call self.init_embree() first; otherwise this may be 0.
+        """
+        cdef void *h = bfTrimeshGetRTCSceneHandle(self.trimesh)
+        return <size_t> h
+
+    def get_native_ptr(self) -> int:
+        """Return the native BfTrimesh* as an integer (size_t)."""
+        return <size_t> self.trimesh
+
 cdef class Vec:
     cdef BfVec *vec
 

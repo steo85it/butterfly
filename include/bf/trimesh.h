@@ -11,6 +11,10 @@ void bfTrimeshInitFromObjFile(BfTrimesh *trimesh, char const *objPath);
 void bfTrimeshInitFromVertsAndFaces(BfTrimesh *trimesh, BfPoints3 const *verts, BfSize numFaces, BfSize3 const *faces);
 #ifdef BF_EMBREE
 void bfTrimeshInitEmbree(BfTrimesh *trimesh);
+/* Returns an opaque handle to the Embree scene for this mesh.
+ * The handle is actually an RTCScene, but returned as void* to
+ * avoid leaking Embree types into the public API. */
+void *bfTrimeshGetRTCSceneHandle(const struct BfTrimesh *trimesh);
 #endif
 void bfTrimeshDeinit(BfTrimesh *trimesh);
 void bfTrimeshDealloc(BfTrimesh **trimesh);
@@ -48,6 +52,9 @@ BfSize const *bfTrimeshGetFaceConstPtr(BfTrimesh const *trimesh, BfSize i);
 void bfTrimeshGetLboFemDiscretization(BfTrimesh const *trimesh, BfMat **L, BfMat **M);
 #ifdef BF_EMBREE
 BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh, BfSize srcInd, BfSizeArray const *tgtInds);
+BfSizeArray *bfTrimeshGetVisibilityOpenSegment(BfTrimesh const *trimesh,
+                                               BfSize srcInd,
+                                               BfSizeArray const *tgtInds);
 #endif
 BfReal const *bfTrimeshGetFaceCentroidConstPtr(BfTrimesh const *trimesh, BfSize i);
 BfReal const *bfTrimeshGetFaceUnitNormalConstPtr(BfTrimesh const *trimesh, BfSize i);
