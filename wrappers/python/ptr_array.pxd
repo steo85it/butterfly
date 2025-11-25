@@ -8,3 +8,4 @@ cdef extern from "bf/ptr_array.h":
     BfSize bfPtrArraySize(const BfPtrArray *arr)
     void bfPtrArrayAppend(BfPtrArray *arr, BfPtr ptr)
     BfPtr bfPtrArrayGet(const BfPtrArray *arr, BfSize pos)
+    void bfPtrArrayDelete(BfPtrArray** arr)

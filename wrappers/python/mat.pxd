@@ -1,6 +1,6 @@
 from cython cimport typeof
 
-from defs cimport BfSize
+from defs cimport BfSize, BfPolicy
 from types cimport BfMat, BfType, BfVec
 
 cdef extern from "bf/mat.h":
@@ -14,3 +14,9 @@ cdef extern from "bf/mat.h":
     BfMat *bfMatRmul(const BfMat *, const BfMat *)
     BfMat *bfMatToType(const BfMat *mat, BfType type)
     void bfMatTranspose(BfMat *mat)
+
+    BfMat *bfMatCopy(const BfMat *)
+    BfMat *bfMatGet(BfMat *, BfPolicy)
+    void bfMatDelete(BfMat **)
+    BfMat *bfMatGetBlockView(BfMat *mat, BfSize, BfSize, BfSize, BfSize)
+

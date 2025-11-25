@@ -497,54 +497,12 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimes
   bfMemFree(row_colind);
   bfMemFree(row_data);
 
-
-//  BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
-//  HANDLE_ERROR();
-//
-//  BfRealArray *data = bfRealArrayNewWithDefaultCapacity();
-//  HANDLE_ERROR();
-//
-//  const char *env = getenv("BF_PROGRESS");
-//  size_t progress_step = env ? strtoul(env, NULL, 10) : 0;
-//
-//  for (BfSize i = 0; i < numRows; ++i) {
-//
-//    if (progress_step && (i % progress_step == 0)) {
-//      fprintf(stderr, "[bf] view-factor rows: %zu/%zu\n", (size_t)i, (size_t)numRows);
-//    }
-//
-//    BfSize rowInd = bfSizeArrayGet(rowInds, i);
-//
-//    BfSizeArray *visibleColInds = bfTrimeshGetVisibility(trimesh, rowInd, colInds);
-//    HANDLE_ERROR();
-//
-//    bfSizeArrayExtend(colind, visibleColInds);
-//    HANDLE_ERROR();
-//
-//    BfSize numVisibleColInds = bfSizeArrayGetSize(visibleColInds);
-//
-//    bfSizeArrayAppend(rowptr, numVisibleColInds + bfSizeArrayGetLast(rowptr));
-//    HANDLE_ERROR();
-//
-//    for (BfSize j = 0; j < numVisibleColInds; ++j) {
-//      BfSize colInd = bfSizeArrayGet(visibleColInds, j);
-//      BfReal value = integrateViewFactorMidpointRule(trimesh, rowInd, colInd);
-//      bfRealArrayAppend(data, value);
-//    }
-//
-//    bfSizeArrayDeinitAndDealloc(&visibleColInds);
-//  }
-
   BfMatCsrReal *matCsrReal = bfMatCsrRealNewFromArrays(numRows, numCols, rowptr, colind, data, BF_POLICY_STEAL);
   HANDLE_ERROR();
 
   BF_ERROR_END() {
     BF_DIE();
   }
-
-//  bfSizeArrayDeinitAndDealloc(&rowptr);
-//  bfSizeArrayDeinitAndDealloc(&colind);
-//  bfRealArrayDeinitAndDealloc(&data);
 
   return matCsrReal;
 }
@@ -571,7 +529,7 @@ void bfMatCsrRealInitFromPtrs(BfMatCsrReal *mat, BfSize numRows, BfSize numCols,
 
   bfMemCopy(rowptr, numRows + 1, sizeof(BfSize), mat->rowptr);
   bfMemCopy(colind, nnz, sizeof(BfSize), mat->colind);
-  bfMemCopy(data, nnz, sizeof(BfSize), mat->data);
+  bfMemCopy(data, nnz, sizeof(BfReal), mat->data);
 
   BF_ERROR_END() {
     BF_DIE();

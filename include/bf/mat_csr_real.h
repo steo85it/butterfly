@@ -48,6 +48,11 @@ BfMatCsrReal* bfMatCsrRealNewFromPtrs(BfSize numRows, BfSize numCols, BfSize con
 BfMatCsrReal *bfMatCsrRealNewFromArrays(BfSize numRows, BfSize numCols, BfSizeArray *rowptrArray, BfSizeArray *colindArray, BfRealArray *dataArray, BfPolicy policy);
 BfMatCsrReal *bfMatCsrRealNewFromBinaryFiles(char const *rowptrPath, char const *colindPath, char const *dataPath);
 BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimesh, BfSizeArray const *rowInds, BfSizeArray const *colInds);
+BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimeshTol(
+    BfTrimesh const *trimesh,
+    BfSizeArray const *rowInds,
+    BfSizeArray const *colInds,
+    BfReal eps);  // absolute drop threshold (0 => disabled)
 void bfMatCsrRealInitFromPtrs(BfMatCsrReal *mat, BfSize numRows, BfSize numCols, BfSize const *rowptr, BfSize const *colind, BfReal const *data);
 void bfMatCsrRealInitFromArrays(BfMatCsrReal *matCsrReal, BfSize numRows, BfSize numCols, BfSizeArray *rowptrArray, BfSizeArray *colindArray, BfRealArray *dataArray, BfPolicy policy);
 void bfMatCsrRealDeinit(BfMatCsrReal *mat);

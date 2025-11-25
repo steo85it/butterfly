@@ -60,6 +60,10 @@ bool bfTypeDerivedFrom(BfType derived, BfType parent) {
       [BF_TYPE_MAT]      = true,
       [BF_TYPE_MAT_ZERO] = true
     },
+    [BF_TYPE_MAT_VF_HIER] = {
+      [BF_TYPE_MAT]         = true,
+      [BF_TYPE_MAT_VF_HIER] = true,
+    },
     [BF_TYPE_MAT_DIFF] = {
       [BF_TYPE_MAT]      = true,
       [BF_TYPE_MAT_DIFF] = true

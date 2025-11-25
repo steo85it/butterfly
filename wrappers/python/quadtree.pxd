@@ -1,5 +1,5 @@
 from points cimport BfPoints2
-from types cimport BfTree, BfQuadtree
+from types cimport BfTree, BfQuadtree, BfPtrArray
 from vectors cimport BfVectors2
 
 cdef extern from "bf/quadtree.h":

@@ -3,6 +3,7 @@ from geom cimport BfPoint2
 from points cimport BfPoints2
 from quadtree cimport BfQuadtree
 from tree_node cimport BfTreeNode
+from circle cimport BfCircle
 
 cdef extern from "bf/quadtree_node.h":
     cdef struct BfQuadtreeNode:
@@ -14,3 +15,8 @@ cdef extern from "bf/quadtree_node.h":
     BfQuadtree *bfQuadtreeNodeGetQuadtree(BfQuadtreeNode *node)
     BfBbox2 bfQuadtreeNodeGetBbox(const BfQuadtreeNode *node)
     void bfQuadtreeNodeGetSplit(const BfQuadtreeNode *node, BfPoint2 split)
+
+    BfCircle  bfQuadtreeNodeGetBoundingCircle(const BfQuadtreeNode *node) nogil
+    bint      bfQuadtreeNodesAreSeparated(const BfQuadtreeNode *node1,
+                                          const BfQuadtreeNode *node2) nogil
+

@@ -185,6 +185,7 @@ butterfly_lib_src = [
   'src/mat_perm.c',
   'src/mat_product.c',
   'src/mat_sum.c',
+  'src/mat_vf_hier.c',
   'src/mat_zero.c',
   'src/mem.c',
   'src/node_array.c',
@@ -218,6 +219,7 @@ butterfly_lib_src = [
   'src/vec_real.c',
   'src/vec_zero.c',
   'src/vectors.c',
+  'src/vf_hier.c',
   'src/xoshiro256plus.c',
 ]
 if get_option('python').enabled()
@@ -227,7 +229,6 @@ endif
 #if arpack_dep.found()
 #  butterfly_lib_src += ['src/linalg.c']   # and 'src/lbo.c' if applicable
 #endif
-
 
 butterfly_inc = include_directories('include')
 

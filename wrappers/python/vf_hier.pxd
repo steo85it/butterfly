@@ -1,0 +1,59 @@
+from quadtree cimport BfQuadtree
+from types cimport BfTrimesh, BfMatCsrReal
+from defs cimport BfReal, BfSize
+
+cdef extern from "bf/vf_hier.h":
+    cdef struct BfVfHier:
+        pass
+
+    cdef struct BfVfHierStats:
+        BfSize numSparseLeaves
+        BfSize numSvdLeaves
+        BfSize numNodeBlocks
+        unsigned long long nnzSparseTotal
+        unsigned long long memBytesSparseEst
+        unsigned long long memBytesSvdEst
+        unsigned long long rankTotal
+
+    void bfVfHierCollectStats(const BfVfHier *vfHier,
+                              BfVfHierStats *stats)
+
+    BfVfHier *bfVfHierNewFromTrimesh(const BfTrimesh *trimesh,
+                                     BfReal eta,
+                                     BfSize leafMax,
+                                     BfSize leafMin)
+
+    BfVfHier *bfVfHierNewFromQuadtree(const BfTrimesh *trimesh,
+                                      BfQuadtree *quadtree,
+                                      BfReal eta,
+                                      BfSize leafMax,
+                                      BfSize leafMin,
+                                      BfReal tol,
+                                      BfSize minSvdSize,
+                                      BfReal maxSvdRankFrac)
+
+    void bfVfHierInitFromCsrAndQuadtree(BfVfHier *vfHier,
+                                        BfMatCsrReal *Afull,
+                                        BfQuadtree *quadtree,
+                                        BfReal eta,
+                                        BfSize leafMax,
+                                        BfSize leafMin,
+                                        BfReal tol,
+                                        BfSize minSvdSize,
+                                        BfReal maxSvdRankFrac)
+
+    BfVfHier *bfVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
+                                            BfQuadtree *quadtree,
+                                            BfReal eta,
+                                            BfSize leafMax,
+                                            BfSize leafMin,
+                                            BfReal tol,
+                                            BfSize minSvdSize,
+                                            BfReal maxSvdRankFrac)
+
+    void bfVfHierApply(const BfVfHier *vfHier,
+                       const BfReal *x,
+                       BfReal *y)
+
+    void bfVfHierDeinitAndDealloc(BfVfHier **vfHierPtr)
+

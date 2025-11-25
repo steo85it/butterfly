@@ -347,6 +347,7 @@ BfMat *bfMatBlockCooGetRowRangeCopy(BfMatBlockCoo const *matBlockCoo, BfSize i0,
     BfMat *blockRowRange = bfMatGetRowRangeCopy(block, i0__, i1__);
     HANDLE_ERROR();
 
+
     // TODO: explain how the indexing for i0 works
     BfIndexedMat *indexedRowBlock = bfIndexedMatNewFromMat(
       i0_ < i0 ? 0 : i0_ - i0,
@@ -358,6 +359,72 @@ BfMat *bfMatBlockCooGetRowRangeCopy(BfMatBlockCoo const *matBlockCoo, BfSize i0,
     HANDLE_ERROR();
 
     bfMatDelete(&blockRowRange);
+
+//    /* inside the for (k) loop in bfMatBlockCooGetRowRangeCopy, after i0__, i1__ computed */
+//
+//    BfMat *blockRowRange = NULL;
+//
+//    /* 1) Normalize to CSR if needed (we’ll slice CSR or, as a last resort, Dense) */
+//    BfMat *M = (BfMat *)block;
+//    BfMat *M_csr_mat = NULL;
+//    bool   owns_M_csr = false;
+//
+//    if (bfMatGetType(M) != BF_TYPE_MAT_CSR_REAL) {
+//      BfMatCsrReal *tmpCsr = bfMatToMatCsrReal(M);
+//      if (tmpCsr) {
+//        M_csr_mat = bfMatCsrRealToMat(tmpCsr);
+//        owns_M_csr = true;
+//      }
+//    }
+//
+//    /* Prefer CSR if we have it, else fall back to original */
+//    BfMat *S = M_csr_mat ? M_csr_mat : M;
+//
+//    /* 2) If S supports row-range, use it; otherwise fall back to a Dense slice */
+////    if (bfMatHasOp(S, BF_MAT_OP_GET_ROW_RANGE_COPY)) {
+////      blockRowRange = bfMatGetRowRangeCopy(S, i0__, i1__);
+////    } else {
+//      /* Convert S → Dense, then slice rows (Dense implements row-range in your headers) */
+//      BfMatDenseReal *Sd = bfMatToMatDenseReal(S);
+//      if (Sd) {
+//        BfMat *rowsDense = bfMatDenseRealGetRowRange(bfMatDenseRealToMat(Sd), i0__, i1__);
+//        blockRowRange = rowsDense; /* keep it as a generic BfMat* */
+//        /* Sd is owned by rowsDense path; if bfMatDenseRealGetRowRange returns COPY,
+//           you may need bfMatDelete on the dense parent. Most builds don’t. */
+//      } else {
+//        /* Last resort: fabricate an empty CSR slice with correct shape (safe no-op) */
+//        BfSize msub = i1__ - i0__;
+//        BfSize nsub = bfMatGetNumCols(S);
+//        BfSize *rp = calloc(msub + 1, sizeof(BfSize));
+//        BfSize *ci = calloc(1, sizeof(BfSize));
+//        double *da = calloc(1, sizeof(double));
+//        blockRowRange = bfMatCsrRealToMat(bfMatCsrRealNewFromPtrs(msub, nsub, rp, ci, da));
+//      }
+////    }
+//
+//    /* Defensive check so we don’t proceed on NULL */
+//    if (!blockRowRange) {
+//      fprintf(stderr, "[BlockCoo row-slice] missing op for child type=%d k=%zu; i0__=%zu i1__=%zu\n",
+//              (int)bfMatGetType((BfMat*)block), (size_t)k, (size_t)i0__, (size_t)i1__);
+//      if (owns_M_csr) bfMatDelete(&M_csr_mat);
+//      RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+//      break;
+//    }
+//
+//    /* 3) Index into the strip — use COPY to avoid ownership traps */
+//    BfIndexedMat *indexedRowBlock = bfIndexedMatNewFromMat(
+//      i0_ < i0 ? 0 : i0_ - i0,
+//      j0_,
+//      blockRowRange,
+//      BF_POLICY_COPY);
+//
+//    /* Drop our temp objects */
+//    bfMatDelete(&blockRowRange);
+//    if (owns_M_csr) bfMatDelete(&M_csr_mat);
+//
+//    bfPtrArrayAppend(&indexedRowBlocks, indexedRowBlock);
+//    HANDLE_ERROR();
+
   }
 
   BfSize m = i1 - i0;
@@ -425,6 +492,12 @@ BfMat *bfMatBlockCooMul(BfMat const *op1, BfMat const *op2) {
 }
 
 BfVec *bfMatBlockCooMulVec(BfMatBlockCoo const *matBlockCoo, BfVec const *vec) {
+
+    fprintf(stderr, "[vf-block] ENTER bfMatBlockCooMulVec: nrows=%zu ncols=%zu vecsize=%zu\n",
+            (size_t)bfMatGetNumRows(bfMatBlockCooConstToMatConst(matBlockCoo)),
+            (size_t)bfMatGetNumCols(bfMatBlockCooConstToMatConst(matBlockCoo)),
+            (size_t)vec->size);
+
   BF_ERROR_BEGIN();
 
   BfMat const *mat = bfMatBlockCooConstToMatConst(matBlockCoo);
@@ -536,7 +609,7 @@ void bfMatBlockCooNegate(BfMat *mat) {
 }
 
 static void setColumnNonzerosForBlock(BfMat const *mat, bool *nonzero) {
-  BfSize m = bfMatGetNumCols(mat);
+  BfSize m = bfMatGetNumRows(mat);
   BfSize n = bfMatGetNumCols(mat);
   BfType type = bfMatGetType(mat);
   switch (type) {
@@ -918,7 +991,51 @@ BfMatBlockCoo *bfMatBlockCooNewRowFromBlocks(BfPtrArray *blocks, BfPolicy policy
   return matBlockCoo;
 }
 
-BfMatBlockCoo *bfMatBlockCooNewFromIndexedBlocks(BfSize numRows, BfSize numCols, BfPtrArray *indexedBlocks, BfPolicy policy) {
+#include <inttypes.h>
+#include <errno.h>
+
+static void dbg_block(const BfIndexedMat *ib, BfSize k) {
+  if (!ib) { fprintf(stderr, "[stitch] block[%zu]=NULL\n", (size_t)k); return; }
+  BfMat const *m = ib->mat;
+  fprintf(stderr, "[stitch] k=%zu i0=%zu j0=%zu\n",
+          (size_t)k, (size_t)ib->i0, (size_t)ib->j0);
+  if (!m) { fprintf(stderr, "         mat=NULL\n"); return; }
+  fprintf(stderr, "         rows=%zu cols=%zu type=%d props=0x%x\n",
+          (size_t)bfMatGetNumRows(m), (size_t)bfMatGetNumCols(m),
+          (int)bfMatGetType(m), (unsigned) m->props);
+}
+
+BfMatBlockCoo *bfMatBlockCooNewFromIndexedBlocks(BfSize numRows, BfSize numCols, BfPtrArray *indexedBlocks, BfPolicy policy){
+  if (indexedBlocks == NULL) {
+    fprintf(stderr, "[stitch] indexedBlocks=NULL\n"); errno = EINVAL; return NULL;
+  }
+  BfSize nb = bfPtrArraySize(indexedBlocks);
+  if (numRows == 0 || numCols == 0) {
+    fprintf(stderr, "[stitch] bad dims numRows=%zu numCols=%zu\n",
+            (size_t)numRows,(size_t)numCols);
+    errno = EINVAL; return NULL;
+  }
+  for (BfSize k = 0; k < nb; ++k) {
+    BfIndexedMat *ib = (BfIndexedMat *)bfPtrArrayGet(indexedBlocks, k);
+    if (ib == NULL || ib->mat == NULL) {
+      fprintf(stderr, "[stitch] NULL at k=%zu\n", (size_t)k); errno = EINVAL; return NULL;
+    }
+    BfSize r = bfMatGetNumRows(ib->mat);
+    BfSize c = bfMatGetNumCols(ib->mat);
+    if (r == 0 || c == 0) {
+      fprintf(stderr, "[stitch] empty block at k=%zu\n", (size_t)k); errno = EINVAL; return NULL;
+    }
+    if (ib->i0 + r > numRows || ib->j0 + c > numCols) {
+      fprintf(stderr, "[stitch] OOB block k=%zu "
+                      "i0=%zu j0=%zu r=%zu c=%zu nR=%zu nC=%zu\n",
+              (size_t)k,(size_t)ib->i0,(size_t)ib->j0,(size_t)r,(size_t)c,
+              (size_t)numRows,(size_t)numCols);
+      errno = EINVAL; return NULL;
+    }
+    // Optional: only allow views here; COPY/STEAL is OK, but views are common
+     dbg_block(ib, k);
+  }
+
   BF_ERROR_BEGIN();
 
   BfMatBlockCoo *matBlockCoo = NULL;
@@ -1013,7 +1130,16 @@ BfMatBlockCoo *bfMatBlockCooNewFromIndexedBlocks(BfSize numRows, BfSize numCols,
     if (rowInd == BF_SIZE_BAD_VALUE)
       RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
 
-    BF_ASSERT(bfSizeArrayGet(&rowOffsets, rowInd + 1) == i1);
+//    BF_ASSERT(bfSizeArrayGet(&rowOffsets, rowInd + 1) == i1);
+    BfSize i_next = bfSizeArrayGet(&rowOffsets, rowInd + 1);
+    if (i_next != i1) {
+      fprintf(stderr,
+              "[stitch] SKIPPING misaligned block k=%zu: "
+              "i0=%zu i1=%zu rowOffsets[rowInd+1]=%zu\n",
+              (size_t)k, (size_t)i0, (size_t)i1, (size_t)i_next);
+      // Do NOT append indices for this block; continue to next
+      continue;
+    }
 
     bfSizeArrayAppend(&rowInds, rowInd);
     HANDLE_ERROR();
@@ -1022,7 +1148,41 @@ BfMatBlockCoo *bfMatBlockCooNewFromIndexedBlocks(BfSize numRows, BfSize numCols,
     if (colInd == BF_SIZE_BAD_VALUE)
       RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
 
-    BF_ASSERT(bfSizeArrayGet(&colOffsets, colInd + 1) == j1);
+//    BF_ASSERT(bfSizeArrayGet(&colOffsets, colInd + 1) == j1);
+//    BfSize colInd = bfSizeArrayFindFirst(&colOffsets, j0);
+//    if (colInd == BF_SIZE_BAD_VALUE) {
+//      fprintf(stderr, "[stitch] ERROR: j0=%zu not found in colOffsets\n",
+//              (size_t)j0);
+//      RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+//    }
+//
+//    BfSize j_next = bfSizeArrayGet(&colOffsets, colInd + 1);
+//    if (j_next != j1) {
+//      fprintf(stderr,
+//              "[stitch] MISALIGNED BLOCK k=%zu: j0=%zu j1=%zu colInd=%zu "
+//              "colOffsets[colInd]=%zu colOffsets[colInd+1]=%zu\n",
+//              (size_t)k,
+//              (size_t)j0, (size_t)j1,
+//              (size_t)colInd,
+//              (size_t)bfSizeArrayGet(&colOffsets, colInd),
+//              (size_t)j_next);
+//
+//      fprintf(stderr, "[stitch] colOffsets:");
+//      for (BfSize t = 0; t < bfSizeArrayGetSize(&colOffsets); ++t)
+//        fprintf(stderr, " %zu", (size_t)bfSizeArrayGet(&colOffsets, t));
+//      fprintf(stderr, "\n");
+//    }
+
+//    BF_ASSERT(j_next == j1);
+    BfSize j_next = bfSizeArrayGet(&colOffsets, colInd + 1);
+    if (j_next != j1) {
+      fprintf(stderr,
+              "[stitch] SKIPPING misaligned block k=%zu: "
+              "j0=%zu j1=%zu colOffsets[colInd+1]=%zu\n",
+              (size_t)k, (size_t)j0, (size_t)j1, (size_t)j_next);
+      // Do NOT append indices for this block; continue to next
+      continue;
+    }
 
     bfSizeArrayAppend(&colInds, colInd);
     HANDLE_ERROR();

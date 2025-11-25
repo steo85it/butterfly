@@ -185,6 +185,8 @@ BfMat *bfMatMul(BfMat const *lhs, BfMat const *rhs) {
 }
 
 BfVec *bfMatMulVec(BfMat const *mat, BfVec const *vec) {
+//    fprintf(stderr, "[bfMatMulVec] mat=%p type=%d vec=%p size=%zu\n",
+//            (void*)mat, (int)bfMatGetType(mat), (void*)vec, (size_t)vec->size);
   return mat->vtbl->MulVec(mat, vec);
 }
 

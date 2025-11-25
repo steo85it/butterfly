@@ -16,3 +16,5 @@ cdef extern from "bf/trimesh.h":
     void bfTrimeshComputeFaceNormalsMatchingVertexNormals(BfTrimesh *trimesh)
     void *bfTrimeshGetRTCSceneHandle(const BfTrimesh *trimesh)
 
+    void bfTrimeshEnsureFaceNormals(BfTrimesh *)
+

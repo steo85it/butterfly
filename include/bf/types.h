@@ -32,6 +32,7 @@ typedef struct BfMatProduct BfMatProduct;
 typedef struct BfMatPython BfMatPython;
 typedef struct BfMatSum BfMatSum;
 typedef struct BfMatZero BfMatZero;
+typedef struct BfMatVfHier BfMatVfHier;
 
 typedef struct BfVec BfVec;
 typedef struct BfVecComplex BfVecComplex;
@@ -91,6 +92,7 @@ typedef enum BfTypes {
   BF_TYPE_MAT_PYTHON,
   BF_TYPE_MAT_SUM,
   BF_TYPE_MAT_ZERO,
+  BF_TYPE_MAT_VF_HIER,
 
   /* MatBlock hierarchy: */
   BF_TYPE_MAT_BLOCK,

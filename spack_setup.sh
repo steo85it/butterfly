@@ -52,7 +52,7 @@ pip install matplotlib cached_property
 
 # add deps
 cd ~/nobackup/illumrad/python-flux
-pip install -e .
+pip install .
 
 source ~/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
 cd ~/nobackup/illumrad/python-embree
@@ -63,7 +63,7 @@ cd ~/nobackup/butterfly
 
 # (1) Load everything you need:
 # if you use clang+OpenMP, also: spack load llvm-openmp
-
+### from here also fine if env already loaded
 # 0) Vars
 INC="$PWD/include"
 SS=$(spack location -i suite-sparse)

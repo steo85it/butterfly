@@ -16,12 +16,21 @@
 #include <bf/timer.h>
 #include <bf/util.h>
 #include <bf/vec_real.h>
+#include <bf/mat_csr_real.h>
 
 #if BF_DEBUG
 #include <bf/vec_complex.h>
 #endif
 
 #include <arpack.h>
+
+/* Forward declaration for CSR+ARPACK SVD helper */
+static bool bfMatCsrRealSparseTruncatedSvd(BfMatCsrReal const *Acsr,
+                                           BfSize              maxRank,
+                                           BfTruncSpec const  *truncSpec,
+                                           BfMat             **UPtr,
+                                           BfMatDiagReal     **SPtr,
+                                           BfMat             **VTPtr);
 
 BfSize bfTruncSpecGetNumTerms(BfTruncSpec const *truncSpec, BfMatDiagReal const *S) {
   BfSize k = 0;
@@ -1043,78 +1052,783 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
 
   bool truncated = true;
 
-  if (backend != BF_BACKEND_LAPACK)
-    RAISE_ERROR(BF_ERROR_NOT_IMPLEMENTED);
+  if (backend == BF_BACKEND_LAPACK) {
+    /* Existing dense LAPACK path (unchanged) */
 
-  /* Cast to `MatDenseReal` if we can, otherwise we'll need to convert
-   * and allocate later. */
-  BfMatDenseReal const *matDenseReal = NULL;
-  bool shouldDeleteMatDenseReal = false;
-  if (bfMatGetType(mat) == BF_TYPE_MAT_DENSE_REAL) {
-    matDenseReal = bfMatConstToMatDenseRealConst(mat);
-  } else {
-    matDenseReal = bfMatDenseRealNewFromMatrix(mat);
+    /* Cast to `MatDenseReal` if we can, otherwise we'll need to convert
+     * and allocate later. */
+    BfMatDenseReal const *matDenseReal = NULL;
+    bool shouldDeleteMatDenseReal = false;
+    if (bfMatGetType(mat) == BF_TYPE_MAT_DENSE_REAL) {
+      matDenseReal = bfMatConstToMatDenseRealConst(mat);
+    } else {
+      matDenseReal = bfMatDenseRealNewFromMatrix(mat);
+      HANDLE_ERROR();
+
+      shouldDeleteMatDenseReal = true;
+    }
+
+    BfMatDenseReal *U = NULL;
+    BfMatDiagReal *S = NULL;
+    BfMatDenseReal *VT = NULL;
+    bfMatDenseRealSvd(matDenseReal, &U, &S, &VT);
     HANDLE_ERROR();
 
-    shouldDeleteMatDenseReal = true;
+    /* Find the number of terms in the truncated SVD: */
+    BfSize k = bfTruncSpecGetNumTerms(truncSpec, S);
+
+    /* Should actually truncate? If so, do it: */
+    truncated = k < S->numElts;
+    if (truncated) {
+      /** Truncate U: */
+
+      BfMatDenseReal *Uk = bfMatToMatDenseReal(bfMatDenseRealGetColRangeCopy(U, 0, k));
+      HANDLE_ERROR();
+
+      bfMatDenseRealDeinitAndDealloc(&U);
+
+      U = Uk;
+
+      /** Truncate S: */
+
+      BfMatDiagReal *Sk = bfMatDiagRealNew();
+      HANDLE_ERROR();
+
+      bfMatDiagRealInit(Sk, k, k);
+      HANDLE_ERROR();
+
+      for (BfSize i = 0; i < k; ++i)
+        Sk->data[i] = S->data[i];
+
+      bfMatDiagRealDeinitAndDealloc(&S);
+
+      S = Sk;
+
+      /** Truncate VT: */
+
+      BfMatDenseReal *VkT = bfMatToMatDenseReal(bfMatDenseRealGetRowRangeCopy(VT, 0, k));
+      HANDLE_ERROR();
+
+      bfMatDenseRealDeinitAndDealloc(&VT);
+
+      VT = VkT;
+    }
+
+    if (shouldDeleteMatDenseReal)
+      bfMatDenseRealDeinitAndDealloc((BfMatDenseReal **)&matDenseReal);
+
+    *UPtr  = bfMatDenseRealToMat(U);
+    *SPtr  = S;
+    *VTPtr = bfMatDenseRealToMat(VT);
   }
 
-  BfMatDenseReal *U = NULL;
-  BfMatDiagReal *S = NULL;
-  BfMatDenseReal *VT = NULL;
-  bfMatDenseRealSvd(matDenseReal, &U, &S, &VT);
-  HANDLE_ERROR();
+  else if (backend == BF_BACKEND_ARPACK) {
+    /* New sparse CSR+ARPACK backend */
 
-  /* Find the number of terms in the truncated SVD: */
-  BfSize k = bfTruncSpecGetNumTerms(truncSpec, S);
+    if (bfMatGetType(mat) != BF_TYPE_MAT_CSR_REAL)
+      RAISE_ERROR(BF_ERROR_TYPE_ERROR);
 
-  /* Should actually truncate? If so, do it: */
-  truncated = k < S->numElts;
-  if (truncated) {
-    /** Truncate U: */
+    BfSize m = bfMatGetNumRows(mat);
+    BfSize n = bfMatGetNumCols(mat);
+//    fprintf(stderr,
+//            "[bf] bfGetTruncatedSvd ARPACK: m=%lu n=%lu usingTol=%d\n",
+//            (unsigned long)m, (unsigned long)n,
+//            (int)truncSpec->usingTol);
 
-    BfMatDenseReal *Uk = bfMatToMatDenseReal(bfMatDenseRealGetColRangeCopy(U, 0, k));
+    BfMatCsrReal const *Acsr = bfMatConstToMatCsrRealConst(mat);
     HANDLE_ERROR();
 
-    bfMatDenseRealDeinitAndDealloc(&U);
+//    fprintf(stderr,
+//        "[bf] bfGetTruncatedSvd ARPACK: mat=%p type=%d Acsr=%p\n",
+//        (void *)mat, (int)bfMatGetType(mat), (void *)Acsr);
 
-    U = Uk;
+    BfSize maxRank = n;
+//    fprintf(stderr,
+//            "[bf] bfGetTruncatedSvd ARPACK: initial maxRank=%lu\n",
+//            (unsigned long)maxRank);
 
-    /** Truncate S: */
+    truncated = bfMatCsrRealSparseTruncatedSvd(Acsr, maxRank, truncSpec,
+                                               UPtr, SPtr, VTPtr);
 
-    BfMatDiagReal *Sk = bfMatDiagRealNew();
-    HANDLE_ERROR();
-
-    bfMatDiagRealInit(Sk, k, k);
-    HANDLE_ERROR();
-
-    for (BfSize i = 0; i < k; ++i)
-      Sk->data[i] = S->data[i];
-
-    bfMatDiagRealDeinitAndDealloc(&S);
-
-    S = Sk;
-
-    /** Truncate VT: */
-
-    BfMatDenseReal *VkT = bfMatToMatDenseReal(bfMatDenseRealGetRowRangeCopy(VT, 0, k));
-    HANDLE_ERROR();
-
-    bfMatDenseRealDeinitAndDealloc(&VT);
-
-    VT = VkT;
+//    fprintf(stderr,
+//            "[bf] bfGetTruncatedSvd ARPACK: bfMatCsrRealSparseTruncatedSvd done, truncated=%d\n",
+//            (int)truncated);
+  }
+  else {
+    RAISE_ERROR(BF_ERROR_NOT_IMPLEMENTED);
   }
 
   BF_ERROR_END() {
     BF_DIE();
   }
 
-  if (shouldDeleteMatDenseReal)
-    bfMatDenseRealDeinitAndDealloc((BfMatDenseReal **)&matDenseReal);
+//  fprintf(stderr, "[bf] bfGetTruncatedSvd: returning (backend=%d)\n",
+//          (int)backend);
 
-  *UPtr = bfMatDenseRealToMat(U);
-  *SPtr = S;
+  return truncated;
+
+}
+
+/* ---- NEW: CSR transpose MVP and ARPACK-based top-k SVD ---- */
+
+/* y <- A^T * x  (A is m×n CSR, x is length m, y length n)
+ *
+ * NOTE: We do NOT reimplement A*x here: that is already provided by
+ * bfMatCsrRealMulVec via bfMatMulVec. This kernel only covers A^T*x,
+ * for which there is no high-level BF API yet.
+ */
+static void csrMulVecTransOnly(BfMatCsrReal const *A,
+                               BfReal const *x,
+                               BfReal       *y)
+{
+  BF_ERROR_BEGIN();
+
+  BfMat const *Amat = bfMatCsrRealConstToMatConst(A);
+  HANDLE_ERROR();
+
+  BfSize m = bfMatGetNumRows(Amat);
+  BfSize n = bfMatGetNumCols(Amat);
+
+  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(A);
+  BfSize const *colind = bfMatCsrRealGetColindConstPtr(A);
+  BfReal const *data   = bfMatCsrRealGetDataConstPtr(A);
+
+  BF_ASSERT(rowptr != NULL);
+  BF_ASSERT(colind != NULL);
+  BF_ASSERT(data   != NULL);
+
+  /* zero output */
+  for (BfSize j = 0; j < n; ++j)
+    y[j] = 0;
+
+  /* classic CSR transpose MVP */
+  for (BfSize i = 0; i < m; ++i) {
+    BfReal xi = x[i];
+    if (xi == 0)
+      continue;
+    for (BfSize k = rowptr[i]; k < rowptr[i + 1]; ++k) {
+      BfSize j = colind[k];
+      y[j] += data[k]*xi;
+    }
+  }
+
+  BF_ERROR_END() {
+    /* Should never happen in practice; just defensive. */
+    BF_DIE();
+  }
+}
+
+/* Internal ARPACK driver: compute top 'nev' eigenpairs of B = A^T A,
+ * where A is m×n CSR, without forming B explicitly.
+ *
+ * - On exit, dr[0..nev-1] hold eigenvalues (lambda_i >= 0),
+ *   and z is an N×nev matrix (column-major as ARPACK's "z", but we
+ *   treat it as row-major block of size N*(nev) since we only wrap it
+ *   in views when building BF matrices).
+ *
+ * N is the dimension of B, i.e. N = n = number of columns of A.
+ */
+static int csrAtA_top_eigs_arpack(BfMatCsrReal const *Acsr,
+                                  BfSize               nev,
+                                  BfReal              *dr_out,
+                                  BfReal              *z_out)
+{
+  int status = 0; /* 0 = success, nonzero = failure */
+
+  BfMat const *Amat = bfMatCsrRealConstToMatConst(Acsr);
+  if (Amat == NULL)
+    return -1;
+
+  a_int const N   = (a_int)bfMatGetNumCols(Amat);  /* dimension of A^T A */
+  a_int const NEV = (a_int)nev;
+
+//  fprintf(stderr,
+//          "[bf] csrAtA_top_eigs_arpack: N=%d NEV=%d\n",
+//          (int)N, (int)NEV);
+
+  /* ARPACK in this configuration effectively assumes NEV <= N-2.
+   * For very small N (N <= 2) this is impossible (N-2 <= 0), and
+   * there's no point in using an iterative method anyway.
+   * Signal failure so the caller can fall back to a sparse leaf or
+   * another backend.
+   */
+  if (N <= 2) {
+    fprintf(stderr,
+            "[bf] csrAtA_top_eigs_arpack: N=%d too small for ARPACK; "
+            "skipping and falling back\n",
+            (int)N);
+    return 1;  /* nonzero = failure */
+  }
+
+  BF_ASSERT(NEV >= 1);
+  BF_ASSERT(NEV <= N - 2);
+
+  char const which[] = "LM";
+  char       bmat    = 'I';
+  BfReal     tol     = 0;
+  a_int      ncv     = (a_int)estimateNcv(NEV, N);
+  a_int      ldv     = N;
+  a_int      lworkl  = 3*ncv*ncv + 6*ncv;
+  a_int      rvec    = 1;
+  char const howmny[] = "A";
+
+//  fprintf(stderr,
+//          "[bf] csrAtA_top_eigs_arpack: ncv=%d lworkl=%d\n",
+//          (int)ncv, (int)lworkl);
+
+  double *resid = NULL;
+  double *V     = NULL;
+  a_int  *select = NULL;
+  double *workd = NULL;
+  double *workl = NULL;
+  BfReal *workev = NULL;
+  BfReal *dr  = NULL;
+  BfReal *di  = NULL;
+  BfReal *z   = NULL;
+
+  a_int iparam[11] = {
+    [0] = 1,
+    [2] = 10*N,
+    [6] = 1
+  };
+
+  a_int ipntr[11];
+  a_int ido  = 0;
+  a_int info = 0;
+
+  /* allocate workspace; on failure, set status and goto cleanup */
+  resid = bfMemAlloc(N, sizeof(BfReal));
+  if (resid == NULL) { status = -1; goto cleanup; }
+
+  V = bfMemAlloc((BfSize)N*(BfSize)ncv, sizeof(BfReal));
+  if (V == NULL) { status = -1; goto cleanup; }
+
+  select = bfMemAllocAndZero(ncv, sizeof(a_int));
+  if (select == NULL) { status = -1; goto cleanup; }
+
+  workd = bfMemAlloc(3*N, sizeof(BfReal));
+  if (workd == NULL) { status = -1; goto cleanup; }
+
+  workl = bfMemAlloc(lworkl, sizeof(BfReal));
+  if (workl == NULL) { status = -1; goto cleanup; }
+
+  workev = bfMemAlloc(3*ncv, sizeof(BfReal));
+  if (workev == NULL) { status = -1; goto cleanup; }
+
+dnaupd_loop:
+  dnaupd_c(&ido, &bmat, N, which, NEV, tol, resid,
+           ncv, V, ldv, iparam, ipntr, workd, workl, lworkl, &info);
+
+  if (ido == 1 || ido == -1) {
+    BF_ASSERT(ipntr[0] > 0);
+    BF_ASSERT(ipntr[1] > 0);
+
+    BfReal *x = &workd[ipntr[0] - 1];
+    BfReal *y = &workd[ipntr[1] - 1];
+
+    BfVecReal x_view;
+    bfVecRealInitView(&x_view, (BfSize)N, BF_DEFAULT_STRIDE, x);
+
+    BfVecReal *tmp_real =
+      bfVecToVecReal(bfMatMulVec(Amat, bfVecRealToVec(&x_view)));
+
+    csrMulVecTransOnly(Acsr, tmp_real->data, y);
+
+    bfVecRealDeinitAndDealloc(&tmp_real);
+
+    goto dnaupd_loop;
+  }
+
+//  fprintf(stderr,
+//          "[bf] csrAtA_top_eigs_arpack: dnaupd done, info=%d, iparam[4]=%d, ido=%d\n",
+//          (int)info, (int)iparam[4], (int)ido);
+
+  /* If ARPACK signals an error or insufficient convergence, bail out
+   * and let caller fall back to sparse.
+   */
+  if (info != 0 || iparam[4] < NEV) {
+    #if BF_DEBUG
+      fprintf(stderr,
+            "[bf] csrAtA_top_eigs_arpack: ARPACK failed (info=%d, nconv=%d, NEV=%d)\n",
+            (int)info, (int)iparam[4], (int)NEV);
+    #endif
+    status = (info != 0) ? (int)info : 1;
+    goto cleanup;
+  }
+
+  /* Now extract eigenpairs */
+  dr = bfMemAlloc(NEV + 1, sizeof(BfReal));
+  if (dr == NULL) { status = -1; goto cleanup; }
+
+  di = bfMemAlloc(NEV + 1, sizeof(BfReal));
+  if (di == NULL) { status = -1; goto cleanup; }
+
+  z = bfMemAlloc((BfSize)N*(BfSize)(NEV + 1), sizeof(BfReal));
+  if (z == NULL) { status = -1; goto cleanup; }
+
+  BfSize ldz = (BfSize)N;
+
+  BfReal sigmar = 0.0;
+  BfReal sigmai = 0.0;
+
+//  fprintf(stderr, "[bf] csrAtA_top_eigs_arpack: calling dneupd\n");
+
+  dneupd_c(
+    rvec,
+    howmny,
+    select,
+    dr,
+    di,
+    z,
+    (a_int)ldz,
+    sigmar,
+    sigmai,
+    workev,
+    &bmat,
+    N,
+    which,
+    NEV,
+    tol,
+    resid,
+    ncv,
+    V,
+    ldv,
+    iparam,
+    ipntr,
+    workd,
+    workl,
+    lworkl,
+    &info);
+
+//  fprintf(stderr,
+//          "[bf] csrAtA_top_eigs_arpack: dneupd returned info=%d\n",
+//          (int)info);
+
+  if (info != 0) {
+    fprintf(stderr,
+            "[bf] csrAtA_top_eigs_arpack: dneupd error, info=%d\n",
+            (int)info);
+    status = (int)info;
+    goto cleanup;
+  }
+
+  /* Copy eigenvalues and eigenvectors to outputs, ensuring they are real */
+  for (BfSize i = 0; i < (BfSize)NEV; ++i) {
+    if (fabs(di[i]) > 1e-12) {
+      fprintf(stderr,
+              "[bf] csrAtA_top_eigs_arpack: complex eigenvalue di[%lu]=%g\n",
+              (unsigned long)i, (double)di[i]);
+      status = 2;
+      goto cleanup;
+    }
+    dr_out[i] = dr[i];
+  }
+
+  for (BfSize j = 0; j < (BfSize)NEV; ++j) {
+    for (BfSize i = 0; i < (BfSize)N; ++i) {
+      z_out[j*(BfSize)N + i] = z[i + j*(BfSize)N];
+    }
+  }
+
+cleanup:
+  bfMemFree(resid);
+  bfMemFree(V);
+  bfMemFree(select);
+  bfMemFree(workd);
+  bfMemFree(workl);
+  bfMemFree(workev);
+  bfMemFree(dr);
+  bfMemFree(di);
+  bfMemFree(z);
+
+  return status;
+}
+
+
+/* Compute a truncated SVD of a CSR real matrix A using ARPACK on A^T A.
+ *
+ * Inputs:
+ *   Acsr      : m×n CSR (BF_TYPE_MAT_CSR_REAL)
+ *   maxRank   : number of largest singular values to attempt (nev)
+ *   truncSpec : tolerance / rank selection (same semantics as dense SVD)
+ *
+ * Outputs:
+ *   UPtr, SPtr, VTPtr: filled with U, S, V^T where:
+ *     - U is m×k, V^T is k×n, S is k×k diag, with k determined from
+ *       truncSpec and the computed singular values (k <= maxRank).
+ *
+ * Return:
+ *   true if the SVD was actually truncated (k < maxRank),
+ *   false otherwise.
+ */
+static bool bfMatCsrRealSparseTruncatedSvd(BfMatCsrReal const *Acsr,
+                                           BfSize              maxRank,
+                                           BfTruncSpec const  *truncSpec,
+                                           BfMat             **UPtr,
+                                           BfMatDiagReal     **SPtr,
+                                           BfMat             **VTPtr)
+{
+  BF_ERROR_BEGIN();
+
+  bool truncated = false;
+
+//  fprintf(stderr,
+//          "[bf] bfMatCsrRealSparseTruncatedSvd: enter, maxRank(in)=%lu\n",
+//          (unsigned long)maxRank);
+
+//  fprintf(stderr,
+//          "[bf] bfMatCsrRealSparseTruncatedSvd: Acsr=%p, UPtr=%p, SPtr=%p, VTPtr=%p\n",
+//          (void *)Acsr, (void *)UPtr, (void *)SPtr, (void *)VTPtr);
+
+  if (UPtr == NULL || SPtr == NULL || VTPtr == NULL) {
+//    fprintf(stderr,
+//            "[bf] bfMatCsrRealSparseTruncatedSvd: null output pointers!\n");
+    RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
+  }
+
+//  if (*UPtr != NULL || *SPtr != NULL || *VTPtr != NULL) {
+//    fprintf(stderr,
+//            "[bf] bfMatCsrRealSparseTruncatedSvd: non-null output slots!\n");
+//    RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
+//  }
+
+  BfMat const *Amat = bfMatCsrRealConstToMatConst(Acsr);
+//  fprintf(stderr, "[bf] bfMatCsrRealSparseTruncatedSvd: Amat=%p type=%d\n",
+//          (void *)Amat, (int)bfMatGetType(Amat));
+  HANDLE_ERROR();
+
+  BfSize m = bfMatGetNumRows(Amat);
+  BfSize n = bfMatGetNumCols(Amat);
+
+  /* NEW: cheap nnz check – skip SVD entirely for truly empty blocks.
+   *
+   * This prevents ARPACK from ever seeing A^T A = 0, which is exactly
+   * the situation that leads to dnaupd info = -9 ("starting vector is zero")
+   * for these leaves. Callers (vf_hier) already treat "no SVD" =
+   * U,S,VT left NULL + return false as "keep sparse leaf".
+   */
+  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(Acsr);
+  BF_ASSERT(rowptr != NULL);
+  BfSize nnz = rowptr[m];
+
+  if (nnz == 0) {
+    /* Zero block: nothing to compress. Let caller keep the sparse/zero
+     * representation by signalling "no SVD" via false and NULL outputs.
+     */
+    return false;
+  }
+
+  /* SVD rank is at most min(m, n) */
+  BfSize maxPossibleRank = m < n ? m : n;
+
+  /* If caller didn’t specify maxRank (or asked for something larger
+   * than possible), start from the full rank bound.
+   */
+  if (maxRank == 0 || maxRank > maxPossibleRank)
+    maxRank = maxPossibleRank;
+
+  /* NEW: flux-style memory budget on maxRank.
+   *
+   * In compressed_form_factor.py:
+   *   estimate_rank(spmat, tol, max_nbytes=nbytes(spmat))
+   * was called with max_nbytes ~ spmat.data.nbytes (8 * nnz).
+   *
+   * Here we mimic that by limiting the ARPACK rank so that the *dense*
+   * SVD representation U (m×k), S (k), VT (k×n) fits within roughly
+   * the same memory budget as the CSR data array.
+   *
+   *   max_nbytes      ≈ 8 * nnz
+   *   bytes_per_rank  ≈ 8 * (m + n + 1)
+   *   => k_mem_cap    ≈ floor(max_nbytes / bytes_per_rank)
+   */
+  {
+    double maxNbytes    = (double)nnz * (double)sizeof(BfReal);             /* ~ nbytes(spmat.data) */
+    double bytesPerRank = (double)(m + n + 1) * (double)sizeof(BfReal);     /* U+S+VT per rank */
+
+    if (bytesPerRank > 0) {
+      BfSize maxRankByBytes = (BfSize)(maxNbytes / bytesPerRank);
+
+      /* If we have at least one nonzero entry, but the budget gives 0,
+       * clamp to 1 so we can still try to capture a single singular
+       * value/vector if it’s beneficial.
+       */
+      if (maxRankByBytes == 0 && nnz > 0)
+        maxRankByBytes = 1;
+
+      if (maxRank > maxRankByBytes)
+        maxRank = maxRankByBytes;
+    }
+  }
+
+  /* ARPACK constraints (standard symmetric mode 1, using ncv <= n):
+   * effectively ensure nev <= n - 2 when n > 2.
+   */
+  if (n > 2 && maxRank > n - 2)
+    maxRank = n - 2;
+
+  if (maxRank == 0)
+    maxRank = 1;
+
+  /* Step 1: ARPACK to get top 'maxRank' eigenpairs of A^T A. */
+
+  BfReal *lambda = bfMemAlloc(maxRank, sizeof(BfReal));
+  if (lambda == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+  BfReal *Z = bfMemAlloc((BfSize)n*maxRank, sizeof(BfReal)); /* right eigvecs */
+  if (Z == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+//  fprintf(stderr,
+//          "[bf] bfMatCsrRealSparseTruncatedSvd: calling csrAtA_top_eigs_arpack, nev=%lu\n",
+//          (unsigned long)maxRank);
+
+  int arpack_info = csrAtA_top_eigs_arpack(Acsr, maxRank, lambda, Z);
+  if (arpack_info != 0) {
+//    fprintf(stderr,
+//            "[bf] bfMatCsrRealSparseTruncatedSvd: csrAtA_top_eigs_arpack failed (info=%d); "
+//            "falling back to sparse leaf\n",
+//            arpack_info);
+
+    bfMemFree(lambda);
+    bfMemFree(Z);
+
+    /* Do NOT touch *UPtr / *SPtr / *VTPtr.
+     * Callers (vf_hier) already treat NULL outputs as "no SVD".
+     */
+    return false;
+  }
+
+//  fprintf(stderr,
+//          "[bf] bfMatCsrRealSparseTruncatedSvd: csrAtA_top_eigs_arpack finished\n");
+
+  /* Step 2: singular values = sqrt(lambda_i); build S and V^T. */
+
+  /* Build S (diag) and V^T (dense). For now we assume ARPACK returned
+   * eigenvalues roughly sorted by magnitude ("LM"), but we formalize
+   * sorting using bfRealArgsort to be consistent with other code.
+   */
+
+  /* Build temporary array of singular values */
+  BfReal *sigma = bfMemAlloc(maxRank, sizeof(BfReal));
+  if (sigma == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+  for (BfSize i = 0; i < maxRank; ++i) {
+    BfReal lam = lambda[i];
+    if (lam < 0 && fabs(lam) < 1e-14)
+      lam = 0; /* clamp tiny negative due to roundoff */
+    BF_ASSERT(lam >= 0);
+    sigma[i] = sqrt(lam);
+  }
+
+  /* Sort in descending order of sigma (like "largest singular values first").
+   * bfRealArgsort returns an ascending permutation; we’ll reverse it.
+   */
+  BfRealArray *sigmaArray = bfRealArrayNewWithDefaultCapacity();
+  HANDLE_ERROR();
+
+  for (BfSize i = 0; i < maxRank; ++i) {
+    bfRealArrayAppend(sigmaArray, sigma[i]);
+    HANDLE_ERROR();
+  }
+
+  BfPerm *permAsc = bfRealArrayArgsort(sigmaArray);
+  HANDLE_ERROR();
+
+  /* Create descending permutation indices into [0..maxRank-1]. */
+  BfSize *permDesc = bfMemAlloc(maxRank, sizeof(BfSize));
+  if (permDesc == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+  for (BfSize i = 0; i < maxRank; ++i)
+    permDesc[i] = permAsc->index[maxRank - 1 - i];
+
+  /* Now reorder sigma and eigenvectors accordingly. */
+  BfReal *sigmaSorted = bfMemAlloc(maxRank, sizeof(BfReal));
+  if (sigmaSorted == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+  BfReal *ZSorted = bfMemAlloc((BfSize)n*maxRank, sizeof(BfReal));
+  if (ZSorted == NULL)
+    RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
+
+  for (BfSize j = 0; j < maxRank; ++j) {
+    BfSize src_j = permDesc[j];
+    sigmaSorted[j] = sigma[src_j];
+    for (BfSize i = 0; i < n; ++i) {
+      /* Z is stored as column-major in our flat layout: column src_j */
+      ZSorted[j*n + i] = Z[src_j*n + i];
+    }
+  }
+
+  /* Step 3: decide rank k from truncSpec (relative to largest sigma). */
+
+  BfMatDiagReal *Sfull = bfMatDiagRealNew();
+  HANDLE_ERROR();
+
+  bfMatDiagRealInit(Sfull, maxRank, maxRank);
+  HANDLE_ERROR();
+
+  for (BfSize i = 0; i < maxRank; ++i)
+    Sfull->data[i] = sigmaSorted[i];
+
+  /* If the largest singular value is numerically zero, skip SVD entirely.
+   * This block is effectively 0, so we can just fall back to the sparse leaf
+   * (or treat it as zero elsewhere).
+   */
+  if (Sfull->data[0] <= 0) {
+    bfMatDiagRealDeinitAndDealloc(&Sfull);
+    bfRealArrayDeinitAndDealloc(&sigmaArray);
+    bfPermDeinitAndDealloc(&permAsc);
+    bfMemFree(lambda);
+    bfMemFree(Z);
+    bfMemFree(sigma);
+    bfMemFree(permDesc);
+    bfMemFree(sigmaSorted);
+    bfMemFree(ZSorted);
+
+    /* Signal “no SVD” to caller */
+    return false;
+  }
+
+  #if BF_DEBUG
+    /* Debug diagnostics: how aggressive is the truncation? */
+    if (truncSpec->usingTol) {
+      BfSize k_dbg = bfTruncSpecGetNumTerms(truncSpec, Sfull);
+
+      double s0 = (double)Sfull->data[0];
+      double totalFrob2 = 0.0, tailFrob2 = 0.0;
+
+      for (BfSize i = 0; i < maxRank; ++i) {
+        double si = (double)Sfull->data[i];
+        totalFrob2 += si*si;
+        if (i >= k_dbg)
+          tailFrob2 += si*si;
+      }
+
+      double relTail = (totalFrob2 > 0.0)
+        ? sqrt(tailFrob2/totalFrob2)
+        : 0.0;
+
+      double skm1_rel = (k_dbg > 0)
+        ? (double)Sfull->data[k_dbg - 1] / s0
+        : 0.0;
+
+      double sk_rel = (k_dbg < maxRank)
+        ? (double)Sfull->data[k_dbg] / s0
+        : 0.0;
+
+      fprintf(stderr,
+        "[bf] sparse SVD: m=%lu n=%lu maxRank=%lu tol=%.3e "
+        "k=%lu sigma[k-1]/sigma[0]=%.3e sigma[k]/sigma[0]=%.3e "
+        "tail_frob_rel=%.3e\n",
+        (unsigned long)m,
+        (unsigned long)n,
+        (unsigned long)maxRank,
+        (double)truncSpec->tol,
+        (unsigned long)k_dbg,
+        skm1_rel,
+        sk_rel,
+        relTail);
+    }
+  #endif
+
+  /* Use existing truncation logic:
+   *
+   * - If usingTol: keep all i such that S[i] >= tol * S[0].
+   * - Else: truncSpec->k is desired rank (we'll enforce k <= maxRank).
+   */
+  BfSize k = 0;
+  if (truncSpec->usingTol) {
+    k = bfTruncSpecGetNumTerms(truncSpec, Sfull);
+  } else {
+    k = truncSpec->k <= maxRank ? truncSpec->k : maxRank;
+  }
+
+  if (k == 0)
+    k = 1; /* defensive: always keep at least one singular value */
+
+  truncated = (k < maxRank);
+
+  /* Step 4: build final S (k×k), V^T (k×n), and U (m×k). */
+
+  /* S */
+  BfMatDiagReal *S = bfMatDiagRealNew();
+  HANDLE_ERROR();
+  bfMatDiagRealInit(S, k, k);
+  HANDLE_ERROR();
+
+  for (BfSize i = 0; i < k; ++i)
+    S->data[i] = Sfull->data[i];
+
+  /* V^T: k×n dense, rows are right singular vectors^T */
+  BfMatDenseReal *VT = bfMatDenseRealNew();
+  HANDLE_ERROR();
+  bfMatDenseRealInit(VT, k, n);
+  HANDLE_ERROR();
+
+  for (BfSize j = 0; j < k; ++j) {
+    BfVecReal vj_view;
+    bfVecRealInitView(&vj_view, n, BF_DEFAULT_STRIDE, &ZSorted[j*n]);
+    HANDLE_ERROR();
+    bfMatDenseRealSetRow(bfMatDenseRealToMat(VT), j, bfVecRealToVec(&vj_view));
+  }
+
+  /* U: m×k dense, columns = A*v_j / sigma_j */
+  BfMatDenseReal *U = bfMatDenseRealNew();
+  /* Use zeros init, not plain init, so any unused columns are clean. */
+  bfMatDenseRealInitZeros(U, m, k);
+  HANDLE_ERROR();
+
+  for (BfSize j = 0; j < k; ++j) {
+    BfReal sj = S->data[j];
+
+    BfVecReal vj_view;
+    bfVecRealInitView(&vj_view, n, BF_DEFAULT_STRIDE, &ZSorted[j*n]);
+    HANDLE_ERROR();
+
+    BfVecReal *tmpReal =
+      bfVecToVecReal(bfMatMulVec(Amat, bfVecRealToVec(&vj_view)));
+    HANDLE_ERROR();
+
+    if (sj > 0) {
+      /* scale tmpReal by 1/sj */
+      BfReal invSj = 1.0/sj;
+      for (BfSize i = 0; i < m; ++i)
+        tmpReal->data[i*tmpReal->stride] *= invSj;
+    } else {
+      /* sj == 0: set column explicitly to zero so U S V^T is well-defined */
+      for (BfSize i = 0; i < m; ++i)
+        tmpReal->data[i*tmpReal->stride] = 0;
+    }
+
+    bfMatDenseRealSetCol(bfMatDenseRealToMat(U), j, bfVecRealToVec(tmpReal));
+    HANDLE_ERROR();
+
+    bfVecRealDeinitAndDealloc(&tmpReal);
+  }
+
+  /* Outputs */
+  *UPtr  = bfMatDenseRealToMat(U);
+  *SPtr  = S;
   *VTPtr = bfMatDenseRealToMat(VT);
+
+  BF_ERROR_END() {
+    BF_DIE();
+  }
+
+  /* Cleanup */
+  bfMatDiagRealDeinitAndDealloc(&Sfull);
+  bfRealArrayDeinitAndDealloc(&sigmaArray);
+  bfPermDeinitAndDealloc(&permAsc);
+
+  bfMemFree(lambda);
+  bfMemFree(Z);
+  bfMemFree(sigma);
+  bfMemFree(permDesc);
+  bfMemFree(sigmaSorted);
+  bfMemFree(ZSorted);
 
   return truncated;
 }
