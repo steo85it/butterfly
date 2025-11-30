@@ -2464,6 +2464,35 @@ cdef class VfHier:
         H.n = tm.num_faces
         return H
 
+    def get_stats(self):
+        """
+        Return C-side VfHier statistics as a Python dict.
+
+        Keys:
+          - num_sparse_leaves
+          - num_svd_leaves
+          - num_nodes
+          - nnz_sparse_total
+          - mem_bytes_sparse
+          - mem_bytes_svd
+          - mem_bytes_total
+          - rank_total
+        """
+        cdef BfVfHierStats s
+        bfVfHierCollectStats(self.vfHier, &s)
+
+        return {
+            "num_sparse_leaves": int(s.numSparseLeaves),
+            "num_svd_leaves":    int(s.numSvdLeaves),
+            "num_nodes":         int(s.numNodeBlocks),
+            "nnz_sparse_total":  int(s.nnzSparseTotal),
+            "mem_bytes_sparse":  int(s.memBytesSparseEst),
+            "mem_bytes_svd":     int(s.memBytesSvdEst),
+            "mem_bytes_total":   int(s.memBytesSparseEst + s.memBytesSvdEst),
+            "rank_total":        int(s.rankTotal),
+        }
+
+
     cpdef cnp.ndarray apply(self, cnp.ndarray x):
         cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:

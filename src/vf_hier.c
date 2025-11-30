@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>  /* for timing instrumentation */
+#include <string.h>         /* for memset */
+#include <bf/real_array.h>  /* for BfRealArray, bfRealArrayNewWithDefaultCapacity, etc */
 
 #ifndef BF_UNUSED
 #  define BF_UNUSED(x) (void)(x)
@@ -875,24 +877,53 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
 {
   BF_ASSERT(vfHier && Afull && quadtree);
 
+  BfMat *A_base = bfMatCsrRealToMat(Afull);
+  BfSize nRows  = bfMatGetNumRows(A_base);
+  BfSize nCols  = bfMatGetNumCols(A_base);
+
+  /* Basic consistency: FF should be square and compatible with quadtree */
+  if (nRows != nCols) {
+    fprintf(stderr,
+            "[vf_hier] bfVfHierInitFromCsrAndQuadtree: Afull not square (%lu x %lu)\n",
+            (unsigned long)nRows, (unsigned long)nCols);
+  }
+
   vfHier->trimesh = NULL;  /* no geometry in this path */
-  vfHier->n = bfMatGetNumRows(bfMatCsrRealToMat(Afull));
+  vfHier->n       = nRows;
 
   BfTree *tree = bfQuadtreeToTree(quadtree);
   BfTreeNode *rootNode = bfTreeGetRootNode(tree);
   BfQuadtreeNode *rootQt = bfTreeNodeToQuadtreeNode(rootNode);
 
+  /* Optional debug: print root index range */
+#if 1
+  {
+    BfVfBlockMeta rootMeta = getBlockMeta(rootQt, rootQt, leafMax);
+    fprintf(stderr,
+            "[vf_hier] CSR init: nRows=%lu, root i=[%lu,%lu), j=[%lu,%lu)\n",
+            (unsigned long)nRows,
+            (unsigned long)rootMeta.i0, (unsigned long)rootMeta.i1,
+            (unsigned long)rootMeta.j0, (unsigned long)rootMeta.j1);
+  }
+#endif
+
   vfHier->root = buildBlockFromCsr(Afull, rootQt, rootQt,
                                    eta, leafMax, leafMin,
                                    tol, minSvdSize, maxSvdRankFrac);
 
-  #if BF_VF_HIER_TIME_SVD
+  if (vfHier->root == NULL) {
     fprintf(stderr,
+            "[vf_hier] bfVfHierInitFromCsrAndQuadtree: root block is NULL "
+            "(maybe all leaves too small or CSR submatrix failed)\n");
+  }
+
+#if BF_VF_HIER_TIME_SVD
+  fprintf(stderr,
           "[vf_hier] total CSR->dense time: %.6f s, SVD time: %.6f s\n",
           g_vf_csr_to_dense_time, g_vf_svd_time);
-    g_vf_csr_to_dense_time = 0.0;
-    g_vf_svd_time          = 0.0;
-  #endif
+  g_vf_csr_to_dense_time = 0.0;
+  g_vf_svd_time          = 0.0;
+#endif
 }
 
 /* Convenience constructor */
@@ -1408,18 +1439,48 @@ bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
 
   /* Parent matrix info */
   BfMat *A_base = bfMatCsrRealToMat((BfMatCsrReal *)A_par);
-  BfSize nFaces = bfMatGetNumCols(A_base);  /* assume square */
+  BfSize nRows  = bfMatGetNumRows(A_base);
+  BfSize nCols  = bfMatGetNumCols(A_base);  /* assume square FF */
 
-  /* Build global->local column map: size = nFaces, init to BAD */
-  BfSize *globalToLocal = bfMemAlloc(nFaces, sizeof(BfSize));
-  BF_ASSERT(globalToLocal != NULL);
+  /* Trivial empty block */
+  if (m == 0 || n == 0)
+    return bfMatCsrRealNewFromArrays(0, 0,
+                                     bfSizeArrayNewWithDefaultCapacity(),
+                                     bfSizeArrayNewWithDefaultCapacity(),
+                                     bfRealArrayNewWithDefaultCapacity(),
+                                     BF_POLICY_STEAL);
 
-  for (BfSize i = 0; i < nFaces; ++i)
+  /* Quick sanity: faces indices must be < dims */
+  for (BfSize i = 0; i < m; ++i) {
+    BfSize gRow = bfSizeArrayGet((BfSizeArray *)rowFaces, i);
+    if (gRow >= nRows) {
+      fprintf(stderr,
+              "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD row index %lu >= %lu\n",
+              (unsigned long)gRow, (unsigned long)nRows);
+      return NULL;
+    }
+  }
+  for (BfSize j = 0; j < n; ++j) {
+    BfSize gCol = bfSizeArrayGet((BfSizeArray *)colFaces, j);
+    if (gCol >= nCols) {
+      fprintf(stderr,
+              "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD col index %lu >= %lu\n",
+              (unsigned long)gCol, (unsigned long)nCols);
+      return NULL;
+    }
+  }
+
+  /* Build global->local column map: size = nCols, init to BAD */
+  BfSize *globalToLocal = bfMemAlloc(nCols, sizeof(BfSize));
+  if (globalToLocal == NULL)
+    return NULL;
+
+  for (BfSize i = 0; i < nCols; ++i)
     globalToLocal[i] = BF_SIZE_BAD_VALUE;
 
   for (BfSize j = 0; j < n; ++j) {
     BfSize g = bfSizeArrayGet((BfSizeArray *)colFaces, j);
-    BF_ASSERT(g < nFaces);
+    BF_ASSERT(g < nCols);
     globalToLocal[g] = j;  /* global col index -> local col index */
   }
 
@@ -1446,14 +1507,32 @@ bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
   for (BfSize i = 0; i < m; ++i) {
     /* Global row index in parent CSR */
     BfSize gRow = bfSizeArrayGet((BfSizeArray *)rowFaces, i);
-    BF_ASSERT(gRow + 1 <= bfMatGetNumRows(A_base));
+    if (gRow + 1 > nRows) {
+      fprintf(stderr,
+              "[bf] bfMatCsrRealNewSubmatrixFromFaces: gRow %lu + 1 > nRows %lu\n",
+              (unsigned long)gRow, (unsigned long)nRows);
+      bfMemFree(globalToLocal);
+      bfSizeArrayDeinitAndDealloc(&rowptr);
+      bfSizeArrayDeinitAndDealloc(&colind);
+      bfRealArrayDeinitAndDealloc(&data);
+      return NULL;
+    }
 
     BfSize r0 = rp_par[gRow];
     BfSize r1 = rp_par[gRow + 1];
 
     for (BfSize k = r0; k < r1; ++k) {
       BfSize gCol = ci_par[k];
-      BF_ASSERT(gCol < nFaces);
+      if (gCol >= nCols) {
+        fprintf(stderr,
+                "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD gCol %lu >= %lu\n",
+                (unsigned long)gCol, (unsigned long)nCols);
+        bfMemFree(globalToLocal);
+        bfSizeArrayDeinitAndDealloc(&rowptr);
+        bfSizeArrayDeinitAndDealloc(&colind);
+        bfRealArrayDeinitAndDealloc(&data);
+        return NULL;
+      }
 
       BfSize lCol = globalToLocal[gCol];
       if (lCol == BF_SIZE_BAD_VALUE)
@@ -1471,14 +1550,13 @@ bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
 
   bfMemFree(globalToLocal);
 
-  /* Convert dynamic arrays to a proper CSR matrix.
-   * BF_POLICY_STEAL: matCsrReal takes ownership of the underlying buffers.
-   */
+  /* Convert dynamic arrays to a proper CSR matrix (takes ownership) */
   BfMatCsrReal *A_sub =
     bfMatCsrRealNewFromArrays(m, n, rowptr, colind, data, BF_POLICY_STEAL);
 
   return A_sub;
 }
+
 
 
 
