@@ -24,3 +24,15 @@ option('examples', type : 'feature', value : 'disabled',
        description : 'Build C examples (may require extra libs)')
 option('tests', type : 'feature', value : 'disabled',
        description : 'Build C tests (requires cmocka)')
+option(
+  'primme',
+  type : 'feature',
+  value : 'disabled',
+  description : 'Enable PRIMME (primme_svds) in butterfly'
+)
+option(
+  'primme_root',
+  type : 'string',
+  value : '',
+  description : 'Root directory of PRIMME source/build tree (with include/ and lib/)'
+)

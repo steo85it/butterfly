@@ -8,7 +8,7 @@
 #include <bf/ptr_array.h>
 #include <bf/quadtree.h>
 #include <bf/trimesh.h>
-#include <bf/mat.h>          /* <-- ADD THIS */
+#include <bf/mat.h>
 #include <bf/mat_csr_real.h>
 #include <bf/vec_real.h>
 
@@ -99,6 +99,7 @@ void bfVfHierInitFromQuadtree(BfVfHier        *vfHier,
                               BfReal           eta,
                               BfSize           leafMax,
                               BfSize           leafMin,
+                              BfReal        minArea,
                               BfReal           tol,
                               BfSize           minSvdSize,
                               BfReal           maxSvdRankFrac);
@@ -108,6 +109,7 @@ BfVfHier *bfVfHierNewFromQuadtree(BfTrimesh const *trimesh,
                                   BfReal           eta,
                                   BfSize           leafMax,
                                   BfSize           leafMin,
+                                  BfReal        minArea,
                                   BfReal           tol,
                                   BfSize           minSvdSize,
                                   BfReal           maxSvdRankFrac);
@@ -120,6 +122,7 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier        *vfHier,
                                     BfReal           eta,
                                     BfSize           leafMax,
                                     BfSize           leafMin,
+                                    BfReal        minArea,
                                     BfReal           tol,
                                     BfSize           minSvdSize,
                                     BfReal           maxSvdRankFrac);
@@ -129,6 +132,7 @@ BfVfHier *bfVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
                                          BfReal        eta,
                                          BfSize        leafMax,
                                          BfSize        leafMin,
+                                         BfReal        minArea,
                                          BfReal        tol,
                                          BfSize        minSvdSize,
                                          BfReal        maxSvdRankFrac);

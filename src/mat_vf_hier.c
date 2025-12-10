@@ -45,6 +45,7 @@ void bfMatVfHierInitFromQuadtree(BfMatVfHier   *matVfHier,
                                  BfReal           eta,
                                  BfSize           leafMax,
                                  BfSize           leafMin,
+                                 BfReal           minArea,
                               BfReal           tol,
                               BfSize           minSvdSize,
                               BfReal           maxSvdRankFrac)
@@ -53,7 +54,7 @@ void bfMatVfHierInitFromQuadtree(BfMatVfHier   *matVfHier,
 
   /* Build the hierarchical VF operator */
   BfVfHier *vf = bfVfHierNew();
-  bfVfHierInitFromQuadtree(vf, trimesh, quadtree, eta, leafMax, leafMin, tol, minSvdSize, maxSvdRankFrac);
+  bfVfHierInitFromQuadtree(vf, trimesh, quadtree, eta, leafMax, leafMin, minArea, tol, minSvdSize, maxSvdRankFrac);
 
   matVfHier->vfHier = vf;
 
@@ -68,13 +69,14 @@ BfMat *bfMatVfHierNewFromQuadtree(BfTrimesh const *trimesh,
                                   BfReal           eta,
                                   BfSize           leafMax,
                                   BfSize           leafMin,
+                                 BfReal           minArea,
                               BfReal           tol,
                               BfSize           minSvdSize,
                               BfReal           maxSvdRankFrac)
 {
   BfMatVfHier *matVfHier = bfMatVfHierNew();
   bfMatVfHierInitFromQuadtree(matVfHier, trimesh, quadtree,
-                              eta, leafMax, leafMin, tol, minSvdSize, maxSvdRankFrac);
+                              eta, leafMax, leafMin, minArea, tol, minSvdSize, maxSvdRankFrac);
   return bfMatVfHierToMat(matVfHier);
 }
 
@@ -84,6 +86,7 @@ void bfMatVfHierInitFromCsrAndQuadtree(BfMatVfHier  *matVfHier,
                                        BfReal        eta,
                                        BfSize        leafMax,
                                        BfSize        leafMin,
+                                       BfReal           minArea,
                                        BfReal        tol,
                                        BfSize        minSvdSize,
                                        BfReal        maxSvdRankFrac)
@@ -93,7 +96,7 @@ void bfMatVfHierInitFromCsrAndQuadtree(BfMatVfHier  *matVfHier,
 
   BfVfHier *vf = bfVfHierNew();
   bfVfHierInitFromCsrAndQuadtree(vf, Afull, quadtree,
-                                 eta, leafMax, leafMin,
+                                 eta, leafMax, leafMin, minArea,
                                  tol, minSvdSize, maxSvdRankFrac);
 
   matVfHier->vfHier = vf;
@@ -107,13 +110,14 @@ BfMat *bfMatVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
                                         BfReal        eta,
                                         BfSize        leafMax,
                                         BfSize        leafMin,
+                                        BfReal           minArea,
                                         BfReal        tol,
                                         BfSize        minSvdSize,
                                         BfReal        maxSvdRankFrac)
 {
   BfMatVfHier *matVfHier = bfMatVfHierNew();
   bfMatVfHierInitFromCsrAndQuadtree(matVfHier, Afull, quadtree,
-                                    eta, leafMax, leafMin,
+                                    eta, leafMax, leafMin, minArea,
                                     tol, minSvdSize, maxSvdRankFrac);
   return bfMatVfHierToMat(matVfHier);
 }

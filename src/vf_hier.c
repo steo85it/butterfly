@@ -44,17 +44,118 @@
 #  define BfBool bool
 #endif
 
-/* Enable/disable SVD timing (set to 0 to compile out) */
-#define BF_VF_HIER_TIME_SVD 1
+#ifndef BF_VF_HIER_ENABLE_LEGACY_BUILD
+#  define BF_VF_HIER_ENABLE_LEGACY_BUILD 0
+#endif
+
+/* Enable/disable SVD/timing (set to 0 to compile out).
+ * If defined on the compiler command line, don't override it here.
+ */
+#ifndef BF_VF_HIER_TIME_SVD
+#  define BF_VF_HIER_TIME_SVD 1
+#endif
 
 #if BF_VF_HIER_TIME_SVD
+#  ifdef _OPENMP
+#    include <omp.h>
+#  endif
+#  include <sys/time.h>  /* gettimeofday for wall-clock timing */
+#endif
+
+#if BF_VF_HIER_TIME_SVD
+/* Return wall-clock time in seconds.
+ *
+ * - With OpenMP: use omp_get_wtime().
+ * - Without OpenMP: fall back to gettimeofday().
+ *
+ * NOTE: we still accumulate per-leaf timings over all threads, so the
+ * totals are "sum of leaf wall-times", which can exceed the overall
+ * wall-clock build time when parallelism is used.
+ */
 static double bfVfHierNowSecs(void) {
-  return (double)clock() / (double)CLOCKS_PER_SEC;
+#  ifdef _OPENMP
+  return omp_get_wtime();
+#  else
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)tv.tv_sec + 1e-6*(double)tv.tv_usec;
+#  endif
 }
 
-/* Accumulate total CSR->dense and SVD times over one hierarchy build */
+/* Accumulate total CSR->dense and SVD times over one hierarchy build
+ * (sum of per-leaf wall-times, not global wall time).
+ */
 static double g_vf_csr_to_dense_time = 0.0;
 static double g_vf_svd_time          = 0.0;
+static double g_vf_csr_slice_time    = 0.0;  /* bfMatCsrRealNewSubmatrixFromIndices */
+static double g_vf_leaf_map_time     = 0.0;  /* build childRowFaces + global→parent maps */
+#endif
+
+/* Approximate max nnz (= mi*mj) for a block we are willing to
+ * raytrace in one shot and then reuse via CSR slicing.
+ *
+ * You can override at compile time with -DBF_VF_HIER_MIDLEVEL_MAX_NNZ=...
+ */
+#ifndef BF_VF_HIER_MIDLEVEL_MAX_NNZ
+#  define BF_VF_HIER_MIDLEVEL_MAX_NNZ (10000000ull)
+#endif
+
+/* NEW: enable a cheap heuristic to keep the parent CSR block
+ * as a single leaf instead of building a whole subtree.
+ * 1 = enabled (default), 0 = disabled.
+ */
+#ifndef BF_VF_HIER_ENABLE_PARENT_CSR_HEURISTIC
+#  define BF_VF_HIER_ENABLE_PARENT_CSR_HEURISTIC 1
+#endif
+
+/* NEW: “how much more expensive” children are allowed to be before
+ * we decide to keep the parent as a single CSR leaf.
+ * E.g. 1.5 means “if approx(children_bytes) ≥ 1.5 * parent_bytes,
+ * keep parent as a single leaf”.
+ */
+#ifndef BF_VF_HIER_PARENT_CSR_FACTOR
+#  define BF_VF_HIER_PARENT_CSR_FACTOR 1.5
+#endif
+
+/* Enable/disable post-build flattening of homogeneous CSR subtrees.
+ * 1 = enabled (default), 0 = disabled.
+ */
+#ifndef BF_VF_HIER_ENABLE_FLATTEN_CSR_SUBTREES
+#  define BF_VF_HIER_ENABLE_FLATTEN_CSR_SUBTREES 1
+#endif
+
+/* How much cheaper the flat block must be (in estimated bytes)
+ * than the current subtree for us to flatten.
+ * 1.0 = flatten whenever the flat CSR uses <= current bytes.
+ */
+#ifndef BF_VF_HIER_FLATTEN_FACTOR
+#  define BF_VF_HIER_FLATTEN_FACTOR 1.0
+#endif
+
+/* Enable/disable debug logging for CSR subtree flattening */
+#ifndef BF_VF_HIER_DEBUG_FLATTEN
+#  define BF_VF_HIER_DEBUG_FLATTEN 0
+#endif
+
+#if BF_VF_HIER_DEBUG_FLATTEN
+static unsigned long long g_vf_flatten_attempts      = 0ull;
+static unsigned long long g_vf_flatten_success      = 0ull;
+static unsigned long long g_vf_flatten_bytes_before = 0ull;
+static unsigned long long g_vf_flatten_bytes_after  = 0ull;
+#endif
+
+#ifndef BF_VF_HIER_DEBUG_SVD_FILTER
+#  define BF_VF_HIER_DEBUG_SVD_FILTER 0
+#endif
+
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+static unsigned long long g_svd_near_or_disabled    = 0;
+static unsigned long long g_svd_too_small          = 0;
+static unsigned long long g_svd_fail               = 0;
+static unsigned long long g_svd_rank_reject        = 0;
+static unsigned long long g_svd_mem_pre_reject     = 0;  /* NEW: pre-SVD heuristic */
+static unsigned long long g_svd_mem_reject         = 0;  /* post-SVD bytesSvd >= bytesCsr */
+static unsigned long long g_svd_accept             = 0;
 #endif
 
 /* Local helpers to avoid BF's max/sqrt macros */
@@ -65,6 +166,114 @@ static BfReal bf_local_max(BfReal a, BfReal b) {
 static BfReal bf_local_sqrt(BfReal x) {
   if (x <= 0) return 0;
   return (BfReal)sqrt((double)x);
+}
+
+typedef struct {
+  BfQuadtreeNode *row;
+  BfQuadtreeNode *col;
+} ChildPair;
+
+typedef struct {
+  BfSize *globalToRow;  /* size = mapSize, maps global face -> parent row index */
+  BfSize *globalToCol;  /* size = mapSize, maps global face -> parent col index */
+  BfSize  mapSize;      /* == maxFace + 1 in parent block */
+} BfVfFaceMap;
+
+/* Return true iff every leaf in this subtree is a sparse (CSR) leaf.
+ * Any SVD leaf, or unexpected kind, disables flattening.
+ */
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
+static BfBool
+bfVfHierBlockAllSparseLeaves(BfVfHierBlock const *block)
+{
+  if (block == NULL)
+    return BF_TRUE; /* you can also choose FALSE; we only call on non-NULL roots */
+
+  switch (block->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE:
+    return BF_TRUE;
+
+  case BF_VF_HIER_BLOCK_SVD:
+    return BF_FALSE;
+
+  case BF_VF_HIER_BLOCK_NODE: {
+    BfPtrArray const *children = &block->data.node.children;
+    for (BfSize i = 0; i < bfPtrArraySize(children); ++i) {
+      BfVfHierBlock *child = bfPtrArrayGet(children, i);
+      if (!bfVfHierBlockAllSparseLeaves(child))
+        return BF_FALSE;
+    }
+    return BF_TRUE;
+  }
+
+  case BF_VF_HIER_BLOCK_NONE:
+  default:
+    return BF_FALSE;
+  }
+}
+#endif
+
+static void bfVfFaceMapInitFromParentFaces(
+    BfVfFaceMap      *map,
+    BfSizeArray const *rowFaces_par,
+    BfSizeArray const *colFaces_par)
+{
+  BF_ASSERT(map != NULL);
+  memset(map, 0, sizeof(*map));
+
+  BfSize mPar = bfSizeArrayGetSize((BfSizeArray *)rowFaces_par);
+  BfSize nPar = bfSizeArrayGetSize((BfSizeArray *)colFaces_par);
+
+  /* Find max global face id used by this midlevel block */
+  BfSize maxFace = 0;
+  for (BfSize i = 0; i < mPar; ++i) {
+    BfSize g = bfSizeArrayGet((BfSizeArray *)rowFaces_par, i);
+    if (g > maxFace) maxFace = g;
+  }
+  for (BfSize j = 0; j < nPar; ++j) {
+    BfSize g = bfSizeArrayGet((BfSizeArray *)colFaces_par, j);
+    if (g > maxFace) maxFace = g;
+  }
+
+  map->mapSize = maxFace + 1;
+
+  map->globalToRow = bfMemAlloc(map->mapSize, sizeof(BfSize));
+  map->globalToCol = bfMemAlloc(map->mapSize, sizeof(BfSize));
+
+  if (map->globalToRow == NULL || map->globalToCol == NULL) {
+    if (map->globalToRow) bfMemFree(map->globalToRow);
+    if (map->globalToCol) bfMemFree(map->globalToCol);
+    map->globalToRow = map->globalToCol = NULL;
+    map->mapSize = 0;
+    return;
+  }
+
+  /* Initialize to BAD and fill from parent face lists */
+  for (BfSize t = 0; t < map->mapSize; ++t) {
+    map->globalToRow[t] = BF_SIZE_BAD_VALUE;
+    map->globalToCol[t] = BF_SIZE_BAD_VALUE;
+  }
+
+  for (BfSize i = 0; i < mPar; ++i) {
+    BfSize g = bfSizeArrayGet((BfSizeArray *)rowFaces_par, i);
+    BF_ASSERT(g < map->mapSize);
+    map->globalToRow[g] = i;
+  }
+
+  for (BfSize j = 0; j < nPar; ++j) {
+    BfSize g = bfSizeArrayGet((BfSizeArray *)colFaces_par, j);
+    BF_ASSERT(g < map->mapSize);
+    map->globalToCol[g] = j;
+  }
+}
+
+static void bfVfFaceMapDeinit(BfVfFaceMap *map)
+{
+  if (map == NULL) return;
+  if (map->globalToRow) bfMemFree(map->globalToRow);
+  if (map->globalToCol) bfMemFree(map->globalToCol);
+  map->globalToRow = map->globalToCol = NULL;
+  map->mapSize = 0;
 }
 
 typedef struct {
@@ -88,6 +297,75 @@ static void           bfVfHierBlockApply(BfVfHierBlock const *block,
                                          BfReal const        *x,
                                          BfReal              *y,
                                          BfSize               n);
+
+/* NEW: build CSR submatrix from local row/col indices in A_par */
+static BfMatCsrReal *
+bfMatCsrRealNewSubmatrixFromIndices(BfMatCsrReal const *A_par,
+                                    BfSizeArray  const *rowIdx,
+                                    BfSizeArray  const *colIdx);
+
+
+/* NEW: unified CSR leaf policy, using parent face lists.
+ *
+ * Geometry (leafMin/leafMax) is handled by the caller. This function
+ * only decides:
+ *   - near (CSR) vs far (eligible for SVD) via eta,
+ *   - whether SVD is attempted (minSvdSize),
+ *   - whether SVD is accepted (rank fraction, memory vs CSR).
+ */
+static BfVfHierBlock *makeLeafFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfSizeArray  const *rowFaces_par,
+    BfSizeArray  const *colFaces_par,
+    BfVfFaceMap  const *faceMap,          /* NEW */
+    BfQuadtreeNode const *rowNode,
+    BfQuadtreeNode const *colNode,
+    BfVfBlockMeta const *meta,
+    BfReal eta,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac);
+
+/* NEW: mid-level CSR recursive builder (keeps using same A_par + face lists) */
+static BfVfHierBlock *buildBlockFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfSizeArray  const *rowFaces_par,
+    BfSizeArray  const *colFaces_par,
+    BfVfFaceMap  const *faceMap,          /* NEW */
+    BfQuadtreeNode *rowNode,
+    BfQuadtreeNode *colNode,
+    BfReal eta,
+    BfSize leafMax,
+    BfSize leafMin,
+    BfSize minArea,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac,
+    int depth);
+
+static BfVfHierBlock *buildBlockHybrid(
+    BfTrimesh const *tm,
+    BfQuadtreeNode  *rowNode,
+    BfQuadtreeNode  *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac);
+
+static BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
+    BfTrimesh const *tm,
+    BfQuadtreeNode  *rowNode,
+    BfQuadtreeNode  *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac);
 
 /* --- Utilities --------------------------------------------------------- */
 static void bfVfHierStatsInit(BfVfHierStats *stats) {
@@ -147,6 +425,20 @@ static void bfVfHierBlockCollectStats(BfVfHierBlock const *block,
   }
 }
 
+
+static double bfVfHierBlockMemBytes(BfVfHierBlock const *block) {
+  if (block == NULL)
+    return 0.0;
+
+  BfVfHierStats stats;
+  bfVfHierStatsInit(&stats);
+  bfVfHierBlockCollectStats(block, &stats);
+
+  /* Same model you use for stats: sparse bytes + SVD bytes */
+  return (double)stats.memBytesSparseEst + (double)stats.memBytesSvdEst;
+}
+
+
 void bfVfHierCollectStats(BfVfHier const *vfHier,
                           BfVfHierStats *stats) {
   BF_ASSERT(vfHier != NULL);
@@ -158,6 +450,7 @@ void bfVfHierCollectStats(BfVfHier const *vfHier,
     bfVfHierBlockCollectStats(vfHier->root, stats);
 }
 
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
 static BfVfSparseLeaf *bfVfSparseLeafNew(void) {
   BfVfSparseLeaf *leaf = bfMemAlloc(1, sizeof(BfVfSparseLeaf));
   bfSizeArrayInitWithDefaultCapacity(&leaf->rowInds);
@@ -165,6 +458,7 @@ static BfVfSparseLeaf *bfVfSparseLeafNew(void) {
   leaf->mat = NULL;
   return leaf;
 }
+#endif
 
 static void bfVfSparseLeafDeinit(BfVfSparseLeaf *leaf) {
   if (leaf == NULL) return;
@@ -261,6 +555,9 @@ static void bfVfSvdLeafApply(BfVfSvdLeaf const *leaf,
 static BfBool isFar(BfQuadtreeNode const *rowNode,
                     BfQuadtreeNode const *colNode,
                     BfReal                eta) {
+
+  if (eta < 0) return BF_TRUE;    /* flux-like: ignore geometry for SVD */
+
   BfBbox2 br = bfQuadtreeNodeGetBbox(rowNode);
   BfBbox2 bc = bfQuadtreeNodeGetBbox(colNode);
 
@@ -302,7 +599,7 @@ static void getNodeInds(BfQuadtreeNode *node,
   BfSize i1 = bfTreeNodeGetLastIndex(bfQuadtreeNodeToTreeNode(node));
 
   /* Perm lives in the underlying tree */
-  BfPerm const *perm = bfTreeGetPerm(bfQuadtreeToTree(qt));
+  BfPerm const *perm = bfTreeGetPerm(bfQuadtreeToTree((BfQuadtree *)qt));
 
   for (BfSize i = i0; i < i1; ++i) {
     BfSize idx = bfPermGetIndex(perm, i);
@@ -323,8 +620,8 @@ static BfVfBlockMeta getBlockMeta(BfQuadtreeNode *rowNode,
 {
   BfVfBlockMeta meta;
 
-  BfTreeNode const *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode const *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
+  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
 
   meta.i0 = bfTreeNodeGetFirstIndex(ni);
   meta.i1 = bfTreeNodeGetLastIndex(ni);
@@ -351,6 +648,7 @@ static BfVfBlockMeta getBlockMeta(BfQuadtreeNode *rowNode,
   return meta;
 }
 
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
 static BfVfHierBlock *makeSparseLeaf(BfTrimesh const *tm,
                                      BfQuadtreeNode const *rowNode,
                                      BfQuadtreeNode const *colNode) {
@@ -364,8 +662,8 @@ static BfVfHierBlock *makeSparseLeaf(BfTrimesh const *tm,
   bfSizeArrayInitWithDefaultCapacity(&leaf->colInds);
 
   /* Fill row/col index sets */
-  getNodeInds(rowNode, qt, &leaf->rowInds);
-  getNodeInds(colNode, qt, &leaf->colInds);
+  getNodeInds((BfQuadtreeNode *)rowNode, qt, &leaf->rowInds);
+  getNodeInds((BfQuadtreeNode *)colNode, qt, &leaf->colInds);
 
   /* Build sub-block via existing BF builder */
   leaf->mat = bfMatCsrRealNewViewFactorMatrixFromTrimesh(
@@ -398,9 +696,14 @@ static BfVfHierBlock *makeSparseLeaf(BfTrimesh const *tm,
 
   return block;
 }
+#endif
 
-/* Recursive builder */
-static BfVfHierBlock *buildBlock(BfTrimesh const *tm,
+/* LEGACY: geometric builder using direct trimesh leaves.
+ * Public API paths now use buildBlockHybrid + makeLeafFromCsrMidlevel.
+ * Kept for debugging / comparison.
+ */
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
+ static BfVfHierBlock *buildBlock(BfTrimesh const *tm,
                                  BfQuadtreeNode *rowNode,
                                  BfQuadtreeNode *colNode,
                                  BfReal          eta,
@@ -433,8 +736,8 @@ static BfVfHierBlock *buildBlock(BfTrimesh const *tm,
   nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
   bfInitPtrArray(&nodeBlock->data.node.children, 4);
 
-  BfTreeNode const *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode const *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
+  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
 
   if (!leafI && !leafJ) {
     for (BfSize a = 0; a < bfTreeNodeGetMaxNumChildren(ni); ++a) {
@@ -489,6 +792,7 @@ static BfVfHierBlock *buildBlock(BfTrimesh const *tm,
 
   return nodeBlock;
 }
+#endif
 
 /* --- BfVfHier API ------------------------------------------------------ */
 
@@ -538,6 +842,7 @@ void bfVfHierInitFromQuadtree(BfVfHier        *vfHier,
                               BfReal           eta,
                               BfSize           leafMax,
                               BfSize           leafMin,
+                              BfReal           minArea,
                               BfReal           tol,
                               BfSize           minSvdSize,
                               BfReal           maxSvdRankFrac)
@@ -553,19 +858,63 @@ void bfVfHierInitFromQuadtree(BfVfHier        *vfHier,
   BfTreeNode     *rootNode = bfTreeGetRootNode(tree);
   BfQuadtreeNode *rootQt   = bfTreeNodeToQuadtreeNode(rootNode);
 
-  vfHier->root = buildBlock(trimesh, rootQt, rootQt,
-                            eta, leafMax, leafMin,
-                            tol, minSvdSize, maxSvdRankFrac);
+  vfHier->root = buildBlockHybrid(trimesh, rootQt, rootQt,
+                                  eta, leafMax, leafMin, minArea,
+                                  tol, minSvdSize, maxSvdRankFrac);
 
   #if BF_VF_HIER_TIME_SVD
-    fprintf(stderr,
-          "[vf_hier] total CSR->dense time: %.6f s, SVD time: %.6f s\n",
-          g_vf_csr_to_dense_time, g_vf_svd_time);
+fprintf(stderr,
+        "[vf_hier] timing (sum over leaves): CSR->dense=%.6f s, SVD=%.6f s\n",
+        g_vf_csr_to_dense_time, g_vf_svd_time);
+fprintf(stderr,
+        "[vf_hier] timing (sum over leaves): CSR slice=%.6f s, leaf map=%.6f s\n",
+        g_vf_csr_slice_time, g_vf_leaf_map_time);
+
 
     /* reset accumulators so multiple builds don't add up across runs */
     g_vf_csr_to_dense_time = 0.0;
     g_vf_svd_time          = 0.0;
+    g_vf_csr_slice_time    = 0.0;
+    g_vf_leaf_map_time     = 0.0;
   #endif
+
+#if BF_VF_HIER_DEBUG_FLATTEN
+  fprintf(stderr,
+          "[vf_hier] flatten stats: attempts=%llu success=%llu "
+          "bytes_children=%.3e bytes_flat=%.3e\n",
+          g_vf_flatten_attempts,
+          g_vf_flatten_success,
+          (double)g_vf_flatten_bytes_before,
+          (double)g_vf_flatten_bytes_after);
+
+  g_vf_flatten_attempts      = 0ull;
+  g_vf_flatten_success      = 0ull;
+  g_vf_flatten_bytes_before = 0ull;
+  g_vf_flatten_bytes_after  = 0ull;
+#endif
+
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  fprintf(stderr,
+          "[vf_hier] svd stats: near_or_disabled=%llu too_small=%llu "
+          "fail=%llu rank_reject=%llu "
+          "mem_pre_reject=%llu mem_reject=%llu accept=%llu\n",
+          g_svd_near_or_disabled,
+          g_svd_too_small,
+          g_svd_fail,
+          g_svd_rank_reject,
+          g_svd_mem_pre_reject,
+          g_svd_mem_reject,
+          g_svd_accept);
+
+  g_svd_near_or_disabled = 0ull;
+  g_svd_too_small        = 0ull;
+  g_svd_fail             = 0ull;
+  g_svd_rank_reject      = 0ull;
+  g_svd_mem_pre_reject   = 0ull;
+  g_svd_mem_reject       = 0ull;
+  g_svd_accept           = 0ull;
+#endif
+
 }
 
 BfVfHier *bfVfHierNewFromQuadtree(BfTrimesh const *trimesh,
@@ -573,13 +922,14 @@ BfVfHier *bfVfHierNewFromQuadtree(BfTrimesh const *trimesh,
                         BfReal           eta,
                         BfSize           leafMax,
                         BfSize           leafMin,
+                        BfReal           minArea,
                         BfReal           tol,
                         BfSize           minSvdSize,
                         BfReal           maxSvdRankFrac)
 {
   BfVfHier *vfHier = bfVfHierNew();
   bfVfHierInitFromQuadtree(vfHier, trimesh, quadtree,
-                           eta, leafMax, leafMin, tol, minSvdSize, maxSvdRankFrac);
+                           eta, leafMax, leafMin, minArea, tol, minSvdSize, maxSvdRankFrac);
   return vfHier;
 }
 
@@ -587,13 +937,17 @@ BfVfHier *bfVfHierNewFromQuadtree(BfTrimesh const *trimesh,
  * CSR-based hierarchical view-factor hierarchy
  * ============================================================ */
 
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
 /* Forward declaration for local CSR submatrix builder */
 static BfMatCsrReal *
 bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
                                   BfSizeArray  const *rowFaces,
                                   BfSizeArray  const *colFaces);
 
-/* Leaf builder using CSR submatrix instead of geometry */
+/* LEGACY: CSR leaf builder (pre-midlevel).
+ * Not used by current public APIs; unified leaf policy lives in
+ * makeLeafFromCsrMidlevel.
+ */
 static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
     BfMatCsrReal const *A_par,
     BfQuadtreeNode const *rowNode,
@@ -695,12 +1049,15 @@ static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
   BfMatDiagReal *S = NULL;
 
   BfBackend backend = BF_BACKEND_ARPACK;
-  BfBool truncated =
+  BfBool truncated;
+
+  truncated =
     bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
-                      &truncSpec, backend);
+                        &truncSpec, backend);
 
   #if BF_VF_HIER_TIME_SVD
     double t_svd_end = bfVfHierNowSecs();
+    #pragma omp atomic
     g_vf_svd_time += t_svd_end - t_svd_start;
   #endif
 
@@ -774,7 +1131,9 @@ static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
 
   return block;
 }
+#endif
 
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
 /* Recursive builder from parent CSR */
 static BfVfHierBlock *buildBlockFromCsr(
     BfMatCsrReal const *A_par,
@@ -804,8 +1163,8 @@ static BfVfHierBlock *buildBlockFromCsr(
   nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
   bfInitPtrArray(&nodeBlock->data.node.children, 4);
 
-  BfTreeNode const *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode const *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
+  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
 
   if (!leafI && !leafJ) {
     for (BfSize a = 0; a < bfTreeNodeGetMaxNumChildren(ni); ++a) {
@@ -863,6 +1222,7 @@ static BfVfHierBlock *buildBlockFromCsr(
 
   return nodeBlock;
 }
+#endif
 
 /* Top-level initializer from CSR + quadtree */
 void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
@@ -871,6 +1231,7 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
                                     BfReal        eta,
                                     BfSize        leafMax,
                                     BfSize        leafMin,
+                                    BfReal        minArea,
                                     BfReal        tol,
                                     BfSize        minSvdSize,
                                     BfReal        maxSvdRankFrac)
@@ -895,21 +1256,51 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
   BfTreeNode *rootNode = bfTreeGetRootNode(tree);
   BfQuadtreeNode *rootQt = bfTreeNodeToQuadtreeNode(rootNode);
 
-  /* Optional debug: print root index range */
+  /* Parent face lists: here rows/cols of Afull already index global faces
+   * 0..nRows-1, so we just build identity mappings.
+   */
+  BfSizeArray rowFaces_par;
+  BfSizeArray colFaces_par;
+  bfSizeArrayInitWithDefaultCapacity(&rowFaces_par);
+  bfSizeArrayInitWithDefaultCapacity(&colFaces_par);
+
+  for (BfSize i = 0; i < nRows; ++i)
+    bfSizeArrayAppend(&rowFaces_par, i);
+  for (BfSize j = 0; j < nCols; ++j)
+    bfSizeArrayAppend(&colFaces_par, j);
+
+  BfVfFaceMap faceMap;
+  bfVfFaceMapInitFromParentFaces(&faceMap,
+                                 (BfSizeArray const *)&rowFaces_par,
+                                 (BfSizeArray const *)&colFaces_par);
+
 #if 1
   {
     BfVfBlockMeta rootMeta = getBlockMeta(rootQt, rootQt, leafMax);
     fprintf(stderr,
-            "[vf_hier] CSR init: nRows=%lu, root i=[%lu,%lu), j=[%lu,%lu)\n",
+            "[vf_hier] CSR init (midlevel): nRows=%lu, root i=[%lu,%lu), j=[%lu,%lu)\n",
             (unsigned long)nRows,
             (unsigned long)rootMeta.i0, (unsigned long)rootMeta.i1,
             (unsigned long)rootMeta.j0, (unsigned long)rootMeta.j1);
   }
 #endif
 
-  vfHier->root = buildBlockFromCsr(Afull, rootQt, rootQt,
-                                   eta, leafMax, leafMin,
-                                   tol, minSvdSize, maxSvdRankFrac);
+  /* Use the same mid-level CSR + unified leaf policy as the hybrid path. */
+  vfHier->root = buildBlockFromCsrMidlevel(
+      (BfMatCsrReal const *)Afull,
+      (BfSizeArray  const *)&rowFaces_par,
+      (BfSizeArray  const *)&colFaces_par,
+      (BfVfFaceMap  const *)&faceMap,   /* NEW */
+      rootQt,
+      rootQt,
+      eta,
+      leafMax,
+      leafMin,
+      minArea,
+      tol,
+      minSvdSize,
+      maxSvdRankFrac,
+      0);  /* depth = 0 */
 
   if (vfHier->root == NULL) {
     fprintf(stderr,
@@ -917,12 +1308,22 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
             "(maybe all leaves too small or CSR submatrix failed)\n");
   }
 
+  bfVfFaceMapDeinit(&faceMap);          /* NEW */
+  bfSizeArrayDeinit(&rowFaces_par);
+  bfSizeArrayDeinit(&colFaces_par);
+
 #if BF_VF_HIER_TIME_SVD
-  fprintf(stderr,
-          "[vf_hier] total CSR->dense time: %.6f s, SVD time: %.6f s\n",
-          g_vf_csr_to_dense_time, g_vf_svd_time);
+fprintf(stderr,
+        "[vf_hier] timing (sum over leaves): CSR->dense=%.6f s, SVD=%.6f s\n",
+        g_vf_csr_to_dense_time, g_vf_svd_time);
+fprintf(stderr,
+        "[vf_hier] timing (sum over leaves): CSR slice=%.6f s, leaf map=%.6f s\n",
+        g_vf_csr_slice_time, g_vf_leaf_map_time);
+
   g_vf_csr_to_dense_time = 0.0;
   g_vf_svd_time          = 0.0;
+  g_vf_csr_slice_time    = 0.0;
+  g_vf_leaf_map_time     = 0.0;
 #endif
 }
 
@@ -932,13 +1333,14 @@ BfVfHier *bfVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
                                          BfReal        eta,
                                          BfSize        leafMax,
                                          BfSize        leafMin,
+                                         BfReal        minArea,
                                          BfReal        tol,
                                          BfSize        minSvdSize,
                                          BfReal        maxSvdRankFrac)
 {
   BfVfHier *vf = bfVfHierNew();
   bfVfHierInitFromCsrAndQuadtree(vf, Afull, quadtree,
-                                 eta, leafMax, leafMin,
+                                 eta, leafMax, leafMin, minArea,
                                  tol, minSvdSize, maxSvdRankFrac);
   return vf;
 }
@@ -1176,8 +1578,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     BfSize minSvdSize,
     BfReal maxSvdRankFrac)
 {
-  BfQuadtree const *qt = bfQuadtreeNodeGetQuadtree(rowNode);
-
+  BfQuadtree const *qt =
+    bfQuadtreeNodeGetQuadtree((BfQuadtreeNode *)rowNode);
 //  /* Compute index ranges and sizes exactly as getBlockMeta does */
 //  BfVfBlockMeta meta = getBlockMeta((BfQuadtreeNode *)rowNode,
 //                                    (BfQuadtreeNode *)colNode,
@@ -1260,6 +1662,27 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
 
   double bytesCsr = 8.0*nnz + 8.0*nnz + 8.0*(mA + 1);  /* data + colind + rowptr */
 
+  /* NEW: cheap early SVD rejection.
+   *
+   * If even a rank-1 SVD (U in R^{m×1}, VT in R^{1×n}, S in R^1) would
+   * use more bytes than CSR, there is no point calling ARPACK at all.
+   *
+   * bytesSvd_min = 8 * (mA*1 + nA*1 + 1)  [U + VT + S]
+   * If bytesSvd_min >= bytesCsr, skip SVD and keep CSR leaf.
+   */
+  double bytesSvd_min = 8.0 * ((double)mA + (double)nA + 1.0);
+  if (bytesSvd_min >= bytesCsr) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+    g_svd_mem_pre_reject++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = rowInds;
+    block->data.sparse.colInds = colInds;
+    block->data.sparse.mat     = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
 //  fprintf(stderr, "[makeLeaf] A=%p type=%d vtbl=%p ToType=%p\n",
 //          (void*)A, (int)bfMatGetType(A),
 //          (void*)A->vtbl,
@@ -1268,37 +1691,47 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
   /* 2) Dense + truncated SVD: explicitly convert CSR -> dense
    * (MatCsrReal does not implement ->ToType, so bfMatToType would segfault).
    */
-  #if BF_VF_HIER_TIME_SVD
-    double t_csr_start = bfVfHierNowSecs();
-  #endif
 
-  BfMatDenseReal *A_dense_real = bfMatDenseRealNew();
-  bfMatDenseRealInitZeros(A_dense_real, mA, nA);
+//  fprintf(stderr, "[makeLeaf] A=%p type=%d vtbl=%p ToType=%p\n",
+//          (void*)A, (int)bfMatGetType(A),
+//          (void*)A->vtbl,
+//          A->vtbl ? (void*)A->vtbl->ToType : NULL);
 
-  BfReal *denseData = A_dense_real->data;
+  /* 2) Dense + truncated SVD: explicitly convert CSR -> dense
+   * (MatCsrReal does not implement ->ToType, so bfMatToType would segfault).
+   */
+//  #if BF_VF_HIER_TIME_SVD
+//    double t_csr_start = bfVfHierNowSecs();
+//  #endif
 
-  BfSize const *colind  = bfMatCsrRealGetColindConstPtr(Acsr);
-  BfReal const *csrData = bfMatCsrRealGetDataConstPtr(Acsr);
-
-  BF_ASSERT(rp != NULL);
-  BF_ASSERT(colind != NULL);
-  BF_ASSERT(csrData != NULL);
-
-  /* Fill dense matrix in row-major, consistent with bfMatDenseRealInit */
-  for (BfSize i = 0; i < mA; ++i) {
-    for (BfSize k = rp[i]; k < rp[i + 1]; ++k) {
-      BfSize j = colind[k];
-      BF_ASSERT(j < nA);
-      denseData[i*nA + j] = csrData[k];
-    }
-  }
-
-  #if BF_VF_HIER_TIME_SVD
-    double t_csr_end = bfVfHierNowSecs();
-    g_vf_csr_to_dense_time += t_csr_end - t_csr_start;
-  #endif
-
-  BfMat *A_dense = bfMatDenseRealToMat(A_dense_real);
+//  BfMatDenseReal *A_dense_real = bfMatDenseRealNew();
+//  bfMatDenseRealInitZeros(A_dense_real, mA, nA);
+//
+//  BfReal *denseData = A_dense_real->data;
+//
+//  BfSize const *colind  = bfMatCsrRealGetColindConstPtr(Acsr);
+//  BfReal const *csrData = bfMatCsrRealGetDataConstPtr(Acsr);
+//
+//  BF_ASSERT(rp != NULL);
+//  BF_ASSERT(colind != NULL);
+//  BF_ASSERT(csrData != NULL);
+//
+//  /* Fill dense matrix in row-major, consistent with bfMatDenseRealInit */
+//  for (BfSize i = 0; i < mA; ++i) {
+//    for (BfSize k = rp[i]; k < rp[i + 1]; ++k) {
+//      BfSize j = colind[k];
+//      BF_ASSERT(j < nA);
+//      denseData[i*nA + j] = csrData[k];
+//    }
+//  }
+//
+//  #if BF_VF_HIER_TIME_SVD
+//    double t_csr_end = bfVfHierNowSecs();
+//    #pragma omp atomic
+//    g_vf_csr_to_dense_time += t_csr_end - t_csr_start;
+//  #endif
+//
+//  BfMat *A_dense = bfMatDenseRealToMat(A_dense_real);
 
   BfTruncSpec truncSpec;
   truncSpec.usingTol = 1;
@@ -1311,17 +1744,16 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     double t_svd_start = bfVfHierNowSecs();
   #endif
 
-//  BfBackend backend = BF_BACKEND_LAPACK;
-//  BfBool truncated =
-//    bfGetTruncatedSvd((BfMat const *)A_dense, &U, &S, &VT,
-//                      &truncSpec, backend);
   BfBackend backend = BF_BACKEND_ARPACK;
-  BfBool truncated =
-    bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
-                      &truncSpec, backend);
+  BfBool truncated;
+
+    truncated =
+      bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
+                        &truncSpec, backend);
 
   #if BF_VF_HIER_TIME_SVD
     double t_svd_end = bfVfHierNowSecs();
+    #pragma omp atomic
     g_vf_svd_time += t_svd_end - t_svd_start;
   #endif
 
@@ -1334,7 +1766,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     block->data.sparse.colInds = colInds;
     block->data.sparse.mat = Acsr;
     block->data.sparse.colsAreLocal = BF_TRUE;
-    bfMatDelete(&A_dense);
+//    bfMatDelete(&A_dense);
     return block;
   }
 
@@ -1355,7 +1787,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     bfMatDelete(&U);
     bfMatDiagRealDeinitAndDealloc(&S);
     bfMatDelete(&VT);
-    bfMatDelete(&A_dense);
+//    bfMatDelete(&A_dense);
     return block;
   }
 
@@ -1374,7 +1806,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     bfMatDelete(&U);
     bfMatDiagRealDeinitAndDealloc(&S);
     bfMatDelete(&VT);
-    bfMatDelete(&A_dense);
+//    bfMatDelete(&A_dense);
     return block;
   }
 
@@ -1399,7 +1831,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
   /* rowInds/colInds are now owned by the SVD leaf; don't deinit them here */
 
   bfMatCsrRealDeinitAndDealloc(&Acsr);
-  bfMatDelete(&A_dense);
+//  bfMatDelete(&A_dense);
 
   return block;
 }
@@ -1408,6 +1840,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
  * CSR SUBMATRIX BUILDER (from an existing parent CSR)
  * ============================================================ */
 
+#if BF_VF_HIER_ENABLE_LEGACY_BUILD
 /* Build a CSR submatrix A_sub = A_par[rowFaces, colFaces], with
  * LOCAL column indexing 0..|colFaces|-1.
  *
@@ -1555,6 +1988,1124 @@ bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
     bfMatCsrRealNewFromArrays(m, n, rowptr, colind, data, BF_POLICY_STEAL);
 
   return A_sub;
+}
+#endif
+
+/* ============================================================
+ * CSR SUBMATRIX BUILDER FROM LOCAL INDICES (A_par row/col indices)
+ * ============================================================ */
+
+/* Build CSR submatrix A_sub = A_par[rowIdx, colIdx], where
+ * rowIdx and colIdx contain LOCAL indices into A_par:
+ *
+ *   0 <= rowIdx[i] < nRows(A_par)
+ *   0 <= colIdx[j] < nCols(A_par)
+ *
+ * Columns of A_sub are LOCAL 0..|colIdx|-1 by construction.
+ */
+static BfMatCsrReal *
+bfMatCsrRealNewSubmatrixFromIndices(BfMatCsrReal const *A_par,
+                                    BfSizeArray  const *rowIdx,
+                                    BfSizeArray  const *colIdx)
+{
+  BF_ASSERT(A_par  != NULL);
+  BF_ASSERT(rowIdx != NULL);
+  BF_ASSERT(colIdx != NULL);
+
+  #if BF_VF_HIER_TIME_SVD
+    double t_slice_start = bfVfHierNowSecs();
+  #endif
+
+  BfMat *A_base = bfMatCsrRealToMat((BfMatCsrReal *)A_par);
+  BfSize nRows  = bfMatGetNumRows(A_base);
+  BfSize nCols  = bfMatGetNumCols(A_base);
+
+  BfSize m = bfSizeArrayGetSize((BfSizeArray *)rowIdx);
+  BfSize n = bfSizeArrayGetSize((BfSizeArray *)colIdx);
+
+  /* Trivial empty case */
+  if (m == 0 || n == 0) {
+    return bfMatCsrRealNewFromArrays(
+        0, 0,
+        bfSizeArrayNewWithDefaultCapacity(),
+        bfSizeArrayNewWithDefaultCapacity(),
+        bfRealArrayNewWithDefaultCapacity(),
+        BF_POLICY_STEAL);
+  }
+
+  /* Sanity checks: indices must be in range */
+  for (BfSize i = 0; i < m; ++i) {
+    BfSize r = bfSizeArrayGet((BfSizeArray *)rowIdx, i);
+    if (r >= nRows) {
+      fprintf(stderr,
+              "[bf] bfMatCsrRealNewSubmatrixFromIndices: BAD row index %lu >= %lu\n",
+              (unsigned long)r, (unsigned long)nRows);
+      return NULL;
+    }
+  }
+
+  for (BfSize j = 0; j < n; ++j) {
+    BfSize c = bfSizeArrayGet((BfSizeArray *)colIdx, j);
+    if (c >= nCols) {
+      fprintf(stderr,
+              "[bf] bfMatCsrRealNewSubmatrixFromIndices: BAD col index %lu >= %lu\n",
+              (unsigned long)c, (unsigned long)nCols);
+      return NULL;
+    }
+  }
+
+  /* Parent CSR data */
+  BfSize const *rp_par = bfMatCsrRealGetRowptrConstPtr(A_par);
+  BfSize const *ci_par = bfMatCsrRealGetColindConstPtr(A_par);
+  BfReal const *da_par = bfMatCsrRealGetDataConstPtr(A_par);
+
+  BF_ASSERT(rp_par != NULL);
+  BF_ASSERT(ci_par != NULL);
+  BF_ASSERT(da_par != NULL);
+
+  /* Build global->local column map over [0..nCols) */
+  BfSize *globalToLocalCol = bfMemAlloc(nCols, sizeof(BfSize));
+  if (globalToLocalCol == NULL)
+    return NULL;
+
+  for (BfSize i = 0; i < nCols; ++i)
+    globalToLocalCol[i] = BF_SIZE_BAD_VALUE;
+
+  for (BfSize j = 0; j < n; ++j) {
+    BfSize g = bfSizeArrayGet((BfSizeArray *)colIdx, j);
+    BF_ASSERT(g < nCols);
+    globalToLocalCol[g] = j;  /* col index in A_par -> local col in sub-block */
+  }
+
+  /* Dynamic CSR arrays for the submatrix */
+  BfSizeArray *rowptr = bfSizeArrayNewWithDefaultCapacity();
+  BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
+  BfRealArray *data   = bfRealArrayNewWithDefaultCapacity();
+
+  bfSizeArrayAppend(rowptr, 0); /* rowptr[0] = 0 */
+
+  BfSize nnz_so_far = 0;
+
+  for (BfSize i = 0; i < m; ++i) {
+    BfSize gRow = bfSizeArrayGet((BfSizeArray *)rowIdx, i);
+    BF_ASSERT(gRow < nRows);
+
+    BfSize r0 = rp_par[gRow];
+    BfSize r1 = rp_par[gRow + 1];
+
+    for (BfSize k = r0; k < r1; ++k) {
+      BfSize gCol = ci_par[k];
+      BF_ASSERT(gCol < nCols);
+
+      BfSize lCol = globalToLocalCol[gCol];
+      if (lCol == BF_SIZE_BAD_VALUE)
+        continue;  /* col not in selection: skip */
+
+      bfSizeArrayAppend(colind, lCol);
+      bfRealArrayAppend(data, da_par[k]);
+      ++nnz_so_far;
+    }
+
+    bfSizeArrayAppend(rowptr, nnz_so_far);
+  }
+
+  bfMemFree(globalToLocalCol);
+
+  /* Convert dynamic arrays into CSR (takes ownership) */
+  BfMatCsrReal *A_sub =
+    bfMatCsrRealNewFromArrays(m, n, rowptr, colind, data, BF_POLICY_STEAL);
+
+  #if BF_VF_HIER_TIME_SVD
+    double t_slice_end = bfVfHierNowSecs();
+    #pragma omp atomic
+    g_vf_csr_slice_time += (t_slice_end - t_slice_start);
+  #endif
+
+  return A_sub;
+}
+
+/* ============================================================
+ * MID-LEVEL CSR LEAF BUILDER (OLD + NEW hybrid)
+ * ============================================================ */
+
+static BfVfHierBlock *makeLeafFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfSizeArray  const *rowFaces_par,
+    BfSizeArray  const *colFaces_par,
+    BfVfFaceMap  const *faceMap,      /* NEW */
+    BfQuadtreeNode const *rowNode,
+    BfQuadtreeNode const *colNode,
+    BfVfBlockMeta const *meta,
+    BfReal eta,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac)
+{
+  if (meta->empty)
+    return NULL;
+
+#if BF_VF_HIER_TIME_SVD
+  double t_map_start = bfVfHierNowSecs();
+#endif
+
+  BfQuadtree const *qt =
+    bfQuadtreeNodeGetQuadtree((BfQuadtreeNode *)rowNode);
+
+  BfSizeArray childRowFaces;
+  BfSizeArray childColFaces;
+  bfSizeArrayInitWithDefaultCapacity(&childRowFaces);
+  bfSizeArrayInitWithDefaultCapacity(&childColFaces);
+
+  getNodeInds((BfQuadtreeNode *)rowNode, qt, &childRowFaces);
+  getNodeInds((BfQuadtreeNode *)colNode, qt, &childColFaces);
+
+  BfSize mChild = bfSizeArrayGetSize(&childRowFaces);
+  BfSize nChild = bfSizeArrayGetSize(&childColFaces);
+
+  if (mChild == 0 || nChild == 0) {
+    bfSizeArrayDeinit(&childRowFaces);
+    bfSizeArrayDeinit(&childColFaces);
+    return NULL;
+  }
+
+  /* Use cached global->parent-local maps */
+  BF_ASSERT(faceMap != NULL);
+  BfSize mapSize           = faceMap->mapSize;
+  BfSize const *globalToRow = faceMap->globalToRow;
+  BfSize const *globalToCol = faceMap->globalToCol;
+
+  BfSizeArray rowIdxPar;
+  BfSizeArray colIdxPar;
+  bfSizeArrayInitWithDefaultCapacity(&rowIdxPar);
+  bfSizeArrayInitWithDefaultCapacity(&colIdxPar);
+
+  for (BfSize i = 0; i < mChild; ++i) {
+    BfSize gRow = bfSizeArrayGet(&childRowFaces, i);
+    if (gRow >= mapSize)
+      continue;
+    BfSize rLoc = globalToRow[gRow];
+    if (rLoc == BF_SIZE_BAD_VALUE)
+      continue;
+    bfSizeArrayAppend(&rowIdxPar, rLoc);
+  }
+
+  for (BfSize j = 0; j < nChild; ++j) {
+    BfSize gCol = bfSizeArrayGet(&childColFaces, j);
+    if (gCol >= mapSize)
+      continue;
+    BfSize cLoc = globalToCol[gCol];
+    if (cLoc == BF_SIZE_BAD_VALUE)
+      continue;
+    bfSizeArrayAppend(&colIdxPar, cLoc);
+  }
+
+#if BF_VF_HIER_TIME_SVD
+  double t_map_end = bfVfHierNowSecs();
+  #pragma omp atomic
+  g_vf_leaf_map_time += (t_map_end - t_map_start);
+#endif
+
+  BfSize mSel = bfSizeArrayGetSize(&rowIdxPar);
+  BfSize nSel = bfSizeArrayGetSize(&colIdxPar);
+
+  if (mSel == 0 || nSel == 0) {
+    bfSizeArrayDeinit(&rowIdxPar);
+    bfSizeArrayDeinit(&colIdxPar);
+    bfSizeArrayDeinit(&childRowFaces);
+    bfSizeArrayDeinit(&childColFaces);
+    return NULL;
+  }
+
+  /* Build CSR sub-block from local indices in A_par */
+  BfMatCsrReal *Acsr =
+    bfMatCsrRealNewSubmatrixFromIndices(A_par, &rowIdxPar, &colIdxPar);
+
+  bfSizeArrayDeinit(&rowIdxPar);
+  bfSizeArrayDeinit(&colIdxPar);
+
+  if (Acsr == NULL) {
+    bfSizeArrayDeinit(&childRowFaces);
+    bfSizeArrayDeinit(&childColFaces);
+    return NULL;
+  }
+
+  BfMat *A = bfMatCsrRealToMat(Acsr);
+  BfSize mA = bfMatGetNumRows(A);
+  BfSize nA = bfMatGetNumCols(A);
+
+  {
+    BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(Acsr);
+    BfReal const *da = bfMatCsrRealGetDataConstPtr(Acsr);
+    BF_ASSERT(rp != NULL);
+    BF_ASSERT(da != NULL);
+
+    BfSize nnz = rp[mA];
+    BfReal maxAbs = 0;
+    for (BfSize k = 0; k < nnz; ++k) {
+      BfReal v = da[k];
+      if (v < 0) v = -v;
+      if (v > maxAbs) maxAbs = v;
+    }
+
+    if (nnz == 0 || maxAbs == 0) {
+      /* This (rowNode, colNode) block is identically zero.
+       * Represent it by *no block* in the hierarchy.
+       */
+      bfMatCsrRealDeinitAndDealloc(&Acsr);
+      bfSizeArrayDeinit(&childRowFaces);
+      bfSizeArrayDeinit(&childColFaces);
+      return NULL;
+    }
+  }
+
+  /* Far vs near test based on geometry, exactly like other paths */
+  BfBool far = isFar(rowNode, colNode, eta);
+
+  BfVfHierBlock *block = bfVfHierBlockNew();
+
+  /* NEAR or SVD disabled: keep CSR leaf (columns are LOCAL by construction) */
+  if (!far || minSvdSize == 0) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_near_or_disabled++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;  /* global faces */
+    block->data.sparse.colInds = childColFaces;  /* global faces */
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
+  /* FAR + SVD enabled: small blocks are kept as CSR */
+  unsigned long long blockSize =
+    (unsigned long long)mA * (unsigned long long)nA;
+
+  if (blockSize < (unsigned long long)minSvdSize) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_too_small++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;
+    block->data.sparse.colInds = childColFaces;
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
+    /* Also treat very small dimensions as “too small” for ARPACK SVD. */
+  if (mA < 3 || nA < 3) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+    g_svd_too_small++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;
+    block->data.sparse.colInds = childColFaces;
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
+  /* Memory estimate for CSR */
+  BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(Acsr);
+  BfSize const *ci = bfMatCsrRealGetColindConstPtr(Acsr);
+  BfReal const *da = bfMatCsrRealGetDataConstPtr(Acsr);
+
+  BF_ASSERT(rp && ci && da);
+
+  BfSize nnz = rp[mA];
+  double bytesCsr = 8.0*nnz          /* data */
+                  + 8.0*nnz          /* colind */
+                  + 8.0*(mA + 1);    /* rowptr */
+
+  /* NEW: cheap early SVD rejection (same logic as trimesh path).
+   * If even rank-1 SVD storage would exceed CSR storage,
+   * skip ARPACK and keep CSR leaf.
+   */
+  double bytesSvd_min = 8.0 * ((double)mA + (double)nA + 1.0);
+  if (bytesSvd_min >= bytesCsr) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+    g_svd_mem_pre_reject++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;  /* global faces */
+    block->data.sparse.colInds = childColFaces;  /* global faces */
+    block->data.sparse.mat     = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
+  /* Truncated SVD on CSR via ARPACK */
+  BfTruncSpec truncSpec;
+  truncSpec.usingTol = 1;
+  truncSpec.tol      = tol;
+
+#if BF_VF_HIER_TIME_SVD
+  double t_svd_start = bfVfHierNowSecs();
+#endif
+
+  BfMat *U  = NULL;
+  BfMat *VT = NULL;
+  BfMatDiagReal *S = NULL;
+
+
+  BfBackend backend = BF_BACKEND_ARPACK;
+  BfBool truncated;
+
+    truncated =
+      bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
+                        &truncSpec, backend);
+
+#if BF_VF_HIER_TIME_SVD
+  double t_svd_end = bfVfHierNowSecs();
+  #pragma omp atomic
+  g_vf_svd_time += t_svd_end - t_svd_start;
+#endif
+
+  (void)truncated;
+
+  if (U == NULL || S == NULL || VT == NULL) {
+    /* SVD failed: fall back to CSR leaf */
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_fail++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;
+    block->data.sparse.colInds = childColFaces;
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+    return block;
+  }
+
+  BfSize k = bfMatGetNumCols(U); /* rank */
+  BfSize minDim = mA < nA ? mA : nA;
+  double rankFrac = minDim > 0 ? (double)k / (double)minDim : 1.0;
+
+  /* Reject SVD if rank too high */
+  if (rankFrac > maxSvdRankFrac) {
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_rank_reject++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;
+    block->data.sparse.colInds = childColFaces;
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+
+    bfMatDelete(&U);
+    bfMatDiagRealDeinitAndDealloc(&S);
+    bfMatDelete(&VT);
+    return block;
+  }
+
+  /* Memory estimate for SVD representation */
+  double bytesSvd =
+    8.0*((double)mA*k + (double)nA*k + (double)k); /* U + VT + diag(S) */
+
+  if (bytesSvd >= bytesCsr) {
+    /* SVD not worth it; keep sparse leaf */
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_mem_reject++;
+#endif
+    block->kind = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = childRowFaces;
+    block->data.sparse.colInds = childColFaces;
+    block->data.sparse.mat = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+
+    bfMatDelete(&U);
+    bfMatDiagRealDeinitAndDealloc(&S);
+    bfMatDelete(&VT);
+    return block;
+  }
+
+  /* Build MatProduct P = U S VT */
+  BfMatProduct *Pprod = bfMatProductNew();
+  bfMatProductInit(Pprod);
+  bfMatProductPostMultiply(Pprod, U);
+  bfMatProductPostMultiply(Pprod, bfMatDiagRealToMat(S));
+  bfMatProductPostMultiply(Pprod, VT);
+
+  BfMat *P = bfMatProductToMat(Pprod);
+
+  /* SVD leaf: store global row/col faces + MatProduct */
+  block->kind = BF_VF_HIER_BLOCK_SVD;
+  block->data.svd.rowInds = childRowFaces;  /* global faces */
+  block->data.svd.colInds = childColFaces;  /* global faces */
+  block->data.svd.mat     = P;
+  block->data.svd.rank    = k;
+  block->data.svd.work    = NULL;
+  block->data.svd.workLen = 0;
+
+#if BF_VF_HIER_DEBUG_SVD_FILTER
+  g_svd_accept++;
+#endif
+
+  bfMatCsrRealDeinitAndDealloc(&Acsr);
+
+  return block;
+}
+
+/* ============================================================
+ * MID-LEVEL CSR RECURSIVE BUILDER (OLD + NEW hybrid)
+ * ============================================================ */
+static BfVfHierBlock *buildBlockFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfSizeArray  const *rowFaces_par,
+    BfSizeArray  const *colFaces_par,
+    BfVfFaceMap  const *faceMap,
+    BfQuadtreeNode *rowNode,
+    BfQuadtreeNode *colNode,
+    BfReal eta,
+    BfSize leafMax,
+    BfSize leafMin,
+    BfSize minArea,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac,
+    int depth)
+{
+  BfVfBlockMeta meta = getBlockMeta(rowNode, colNode, leafMax);
+  if (meta.empty)
+    return NULL;
+
+  BfSize mi = meta.mi;
+  BfSize mj = meta.mj;
+  bool leafI = meta.leafI;
+  bool leafJ = meta.leafJ;
+  bool small = meta.small;
+
+  unsigned long long area =
+    (unsigned long long)mi * (unsigned long long)mj;
+
+  /* --- 1) flat candidate for THIS block (CSR or SVD) --- */
+  BfVfHierBlock *flatBlock = makeLeafFromCsrMidlevel(
+      A_par,
+      rowFaces_par,
+      colFaces_par,
+      faceMap,
+      rowNode,
+      colNode,
+      &meta,
+      eta,
+      tol,
+      minSvdSize,
+      maxSvdRankFrac);
+
+  /* If we reached a geometric leaf or very small area, don't bother recursing:
+   * just return the best flat representation we have (or NULL if the block is zero).
+   */
+  bool forceLeaf =
+      (leafI && leafJ) ||
+      (small && mi >= leafMin && mj >= leafMin) ||
+      (area <= (unsigned long long)minArea);
+
+  if (forceLeaf) {
+    return flatBlock;  /* may be NULL for exactly-zero block */
+  }
+
+  /* --- 2) build hierarchical children as before --- */
+
+  BfVfHierBlock *nodeBlock = bfVfHierBlockNew();
+  nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
+  bfInitPtrArray(&nodeBlock->data.node.children, 4);
+
+  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
+  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+
+  if (!leafI && !leafJ) {
+    /* --- case 1: split both row and col sides --- */
+
+    BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
+    BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenI * maxChildrenJ, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    /* 1) collect all (rowChild, colChild) pairs serially */
+    for (BfSize a = 0; a < maxChildrenI; ++a) {
+      if (!bfTreeNodeHasChild(ni, a)) continue;
+      BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
+      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
+
+      for (BfSize b = 0; b < maxChildrenJ; ++b) {
+        if (!bfTreeNodeHasChild(nj, b)) continue;
+        BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
+        BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
+
+        pairs[numPairs].row = nai;
+        pairs[numPairs].col = nbj;
+        ++numPairs;
+      }
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return flatBlock;  /* may be NULL */
+    }
+
+    /* 2) allocate per-pair result slots */
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    /* 3) parallel recursion over pairs */
+    int childDepth = depth + 1;
+
+    #pragma omp parallel for schedule(dynamic) if (depth < 4)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockFromCsrMidlevel(
+            A_par,
+            rowFaces_par,
+            colFaces_par,
+            faceMap,
+            pairs[idx].row,
+            pairs[idx].col,
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac,
+            childDepth);
+    }
+
+    /* 4) serial append into nodeBlock children */
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+
+  } else if (!leafI) {
+    /* --- case 2: split row side only --- */
+
+    BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenI, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    for (BfSize a = 0; a < maxChildrenI; ++a) {
+      if (!bfTreeNodeHasChild(ni, a)) continue;
+      BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
+      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
+
+      pairs[numPairs].row = nai;
+      pairs[numPairs].col = colNode;
+      ++numPairs;
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return flatBlock;
+    }
+
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    int childDepth = depth + 1;
+
+    #pragma omp parallel for schedule(dynamic) if (depth < 4)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockFromCsrMidlevel(
+            A_par,
+            rowFaces_par,
+            colFaces_par,
+            faceMap,
+            pairs[idx].row,
+            pairs[idx].col,  /* == colNode */
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac,
+            childDepth);
+    }
+
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+
+  } else { /* !leafJ */
+    /* --- case 3: split col side only --- */
+
+    BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenJ, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    for (BfSize b = 0; b < maxChildrenJ; ++b) {
+      if (!bfTreeNodeHasChild(nj, b)) continue;
+      BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
+      BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
+
+      pairs[numPairs].row = rowNode;
+      pairs[numPairs].col = nbj;
+      ++numPairs;
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return flatBlock;
+    }
+
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    int childDepth = depth + 1;
+
+    #pragma omp parallel for schedule(dynamic) if (depth < 4)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockFromCsrMidlevel(
+            A_par,
+            rowFaces_par,
+            colFaces_par,
+            faceMap,
+            pairs[idx].row,  /* == rowNode */
+            pairs[idx].col,
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac,
+            childDepth);
+    }
+
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+  }
+
+  /* If recursion produced nothing, fall back to flat candidate (could be NULL) */
+  if (bfPtrArraySize(&nodeBlock->data.node.children) == 0) {
+    bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+    return flatBlock;
+  }
+
+  /* --- 3) choose cheaper: flat vs hierarchy --- */
+
+  if (flatBlock == NULL) {
+    /* No flat representation (probably identically-zero); keep hierarchy */
+    return nodeBlock;
+  }
+
+  double bytesFlat = bfVfHierBlockMemBytes(flatBlock);
+  double bytesHier = bfVfHierBlockMemBytes(nodeBlock);
+
+  if (bytesFlat <= bytesHier) {
+    /* Flat leaf wins: discard hierarchy */
+    bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+    return flatBlock;
+  } else {
+    /* Hierarchy wins: discard flat leaf */
+    bfVfHierBlockDeinitAndDealloc(&flatBlock);
+    return nodeBlock;
+  }
+}
+
+
+/* ============================================================
+ * HYBRID BUILDER: geometric recursion + mid-level OLD+NEW
+ * ============================================================ */
+
+/* For large blocks: only split geometrically (no FF).
+ * Once mi*mj is small enough, we raytrace that block ONCE
+ * from the trimesh, then build the whole subtree below it
+ * using CSR slicing (buildBlockFromCsrMidlevel).
+ */
+static BfVfHierBlock *buildBlockHybrid(
+    BfTrimesh const *tm,
+    BfQuadtreeNode  *rowNode,
+    BfQuadtreeNode  *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,      /* NEW */
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac)
+{
+  BfVfBlockMeta meta = getBlockMeta(rowNode, colNode, leafMax);
+  if (meta.empty)
+    return NULL;
+
+  BfSize mi = meta.mi;
+  BfSize mj = meta.mj;
+
+  unsigned long long area =
+    (unsigned long long)mi * (unsigned long long)mj;
+
+  /* NEW: stop recursion early for small blocks (flux-like _min_size).
+   * If the block is small enough by area, treat it as a single leaf,
+   * letting the leaf policy decide CSR vs SVD.
+   */
+  if (area <= (unsigned long long)minArea) {
+    BfVfHierBlock *leaf =
+      makeLeafWithOptionalSvd(tm,
+                              rowNode,
+                              colNode,
+                              &meta,
+                              eta,
+                              tol,
+                              leafMax,
+                              leafMin,
+                              minSvdSize,
+                              maxSvdRankFrac);
+    if (leaf != NULL)
+      return leaf;
+    /* If leaf creation fails (e.g. dimensions < leafMin),
+     * fall back to the usual logic below.
+     */
+  }
+
+  /* Approximate nnz as if the block were dense.
+   * This is only a safety cap to avoid raytracing
+   * blocks that are too large to hold in memory.
+   */
+  unsigned long long approxNnz = area;
+
+  if (approxNnz <= BF_VF_HIER_MIDLEVEL_MAX_NNZ) {
+    /* Block is small enough: raytrace once from tm (OLD)
+     * and then use CSR slicing for all descendants (NEW).
+     */
+    return buildSubtreeFromTrimeshUsingCsr(
+        tm, rowNode, colNode,
+        eta, leafMax, leafMin, minArea,
+        tol, minSvdSize, maxSvdRankFrac);
+  }
+
+  /* Too large to realize as one CSR block: only split geometrically. */
+  BfVfHierBlock *nodeBlock = bfVfHierBlockNew();
+  nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
+  bfInitPtrArray(&nodeBlock->data.node.children, 4);
+
+  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
+  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+
+  bool leafI = meta.leafI;
+  bool leafJ = meta.leafJ;
+
+  if (!leafI && !leafJ) {
+    BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
+    BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenI * maxChildrenJ, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    for (BfSize a = 0; a < maxChildrenI; ++a) {
+      if (!bfTreeNodeHasChild(ni, a)) continue;
+      BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
+      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
+
+      for (BfSize b = 0; b < maxChildrenJ; ++b) {
+        if (!bfTreeNodeHasChild(nj, b)) continue;
+        BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
+        BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
+
+        pairs[numPairs].row = nai;
+        pairs[numPairs].col = nbj;
+        ++numPairs;
+      }
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return NULL;
+    }
+
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    #pragma omp parallel for schedule(dynamic)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockHybrid(
+            tm,
+            pairs[idx].row,
+            pairs[idx].col,
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac);
+    }
+
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+
+  } else if (!leafI) {
+    BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenI, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    for (BfSize a = 0; a < maxChildrenI; ++a) {
+      if (!bfTreeNodeHasChild(ni, a)) continue;
+      BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
+      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
+
+      pairs[numPairs].row = nai;
+      pairs[numPairs].col = colNode;
+      ++numPairs;
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return NULL;
+    }
+
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    #pragma omp parallel for schedule(dynamic)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockHybrid(
+            tm,
+            pairs[idx].row,
+            pairs[idx].col,  /* colNode */
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac);
+    }
+
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+
+  } else { /* !leafJ */
+    BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
+
+    ChildPair *pairs = bfMemAlloc(maxChildrenJ, sizeof(ChildPair));
+    BfSize numPairs = 0;
+
+    for (BfSize b = 0; b < maxChildrenJ; ++b) {
+      if (!bfTreeNodeHasChild(nj, b)) continue;
+      BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
+      BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
+
+      pairs[numPairs].row = rowNode;
+      pairs[numPairs].col = nbj;
+      ++numPairs;
+    }
+
+    if (numPairs == 0) {
+      bfMemFree(pairs);
+      bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+      return NULL;
+    }
+
+    BfVfHierBlock **childBlocks =
+      bfMemAlloc(numPairs, sizeof(BfVfHierBlock *));
+
+    #pragma omp parallel for schedule(dynamic)
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      childBlocks[idx] =
+        buildBlockHybrid(
+            tm,
+            pairs[idx].row,  /* rowNode */
+            pairs[idx].col,
+            eta,
+            leafMax,
+            leafMin,
+            minArea,
+            tol,
+            minSvdSize,
+            maxSvdRankFrac);
+    }
+
+    for (BfSize idx = 0; idx < numPairs; ++idx) {
+      if (childBlocks[idx] != NULL)
+        bfPtrArrayAppend(&nodeBlock->data.node.children, childBlocks[idx]);
+    }
+
+    bfMemFree(childBlocks);
+    bfMemFree(pairs);
+  }
+
+  if (bfPtrArraySize(&nodeBlock->data.node.children) == 0) {
+    bfVfHierBlockDeinitAndDealloc(&nodeBlock);
+    return NULL;
+  }
+
+  return nodeBlock;
+}
+
+/* Build a whole subtree for (rowNode, colNode) by:
+ *
+ *  1) Raytracing the FULL block from trimesh into a CSR A_par
+ *     using bfMatCsrRealNewViewFactorMatrixFromTrimesh (OLD),
+ *  2) Using buildBlockFromCsrMidlevel (NEW) to build all
+ *     children/leaf blocks by CSR slicing (no more raytracing),
+ *  3) Freeing A_par and the parent face lists afterwards.
+ */
+static BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
+    BfTrimesh const *tm,
+    BfQuadtreeNode  *rowNode,
+    BfQuadtreeNode  *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,          /* NEW */
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac)
+{
+  BfQuadtree const *qt =
+    bfQuadtreeNodeGetQuadtree(rowNode);
+
+  /* Parent face lists: global faces for all rows/cols
+   * of this (rowNode, colNode) block.
+   */
+  BfSizeArray rowFaces_par;
+  BfSizeArray colFaces_par;
+  bfSizeArrayInitWithDefaultCapacity(&rowFaces_par);
+  bfSizeArrayInitWithDefaultCapacity(&colFaces_par);
+
+  getNodeInds(rowNode, qt, &rowFaces_par);
+  getNodeInds(colNode, qt, &colFaces_par);
+
+  BfSize mPar = bfSizeArrayGetSize(&rowFaces_par);
+  BfSize nPar = bfSizeArrayGetSize(&colFaces_par);
+
+  if (mPar == 0 || nPar == 0) {
+    bfSizeArrayDeinit(&rowFaces_par);
+    bfSizeArrayDeinit(&colFaces_par);
+    return NULL;
+  }
+
+  /* OLD: raytrace this block once from the trimesh. */
+  BfMatCsrReal *A_par =
+    bfMatCsrRealNewViewFactorMatrixFromTrimesh(
+        tm, &rowFaces_par, &colFaces_par);
+
+  if (A_par == NULL) {
+    bfSizeArrayDeinit(&rowFaces_par);
+    bfSizeArrayDeinit(&colFaces_par);
+    return NULL;
+  }
+
+  /* Reindex to fit bfMatCsrRealNewSubmatrixFromIndices’s assumption (gCol < nCols) */
+  {
+    BfSize nFaces = bfTrimeshGetNumFaces(tm);
+    reindexCsrColsToLocal(A_par, &colFaces_par, nFaces);
+  }
+
+  /* NEW: optional heuristic — keep parent CSR as a single leaf
+   * if we expect a hierarchy to be more expensive than the full block.
+   */
+#if BF_VF_HIER_ENABLE_PARENT_CSR_HEURISTIC
+  {
+    BfMat *A_base = bfMatCsrRealToMat(A_par);
+    (void)A_base; /* not used except for sanity */
+
+    BfSize const *rp_par = bfMatCsrRealGetRowptrConstPtr(A_par);
+    BF_ASSERT(rp_par != NULL);
+    BfSize nnz = rp_par[mPar];
+
+    /* Parent CSR memory: data + colind + rowptr */
+    double parentBytes =
+      8.0 * (double)nnz +        /* data */
+      8.0 * (double)nnz +        /* colind */
+      8.0 * (double)(mPar + 1);  /* rowptr */
+
+    /* Very crude upper bound on hierarchy cost: tile by leafMax */
+    BfSize numBlocksRows = (mPar + leafMax - 1) / leafMax;
+    BfSize numBlocksCols = (nPar + leafMax - 1) / leafMax;
+    unsigned long long approxNumBlocks =
+      (unsigned long long)numBlocksRows *
+      (unsigned long long)numBlocksCols;
+
+    /* Approximate child rowptr overhead: each block has ~leafMax rows */
+    double approxChildBytes =
+      8.0 * (double)nnz +                 /* data */
+      8.0 * (double)nnz +                 /* colind */
+      8.0 * (double)(approxNumBlocks * (unsigned long long)leafMax);
+
+    if (approxChildBytes >= BF_VF_HIER_PARENT_CSR_FACTOR * parentBytes) {
+      /* Keep parent as a single sparse leaf: move ownership of
+       * rowFaces_par, colFaces_par, and A_par into the leaf.
+       */
+      BfVfHierBlock *block = bfVfHierBlockNew();
+      block->kind = BF_VF_HIER_BLOCK_SPARSE;
+      block->data.sparse.rowInds = rowFaces_par;
+      block->data.sparse.colInds = colFaces_par;
+      block->data.sparse.mat     = A_par;
+      block->data.sparse.colsAreLocal = BF_TRUE;
+
+      return block;  /* NOTE: no deinit of rowFaces_par/colFaces_par/A_par here */
+    }
+  }
+#endif /* BF_VF_HIER_ENABLE_PARENT_CSR_HEURISTIC */
+
+  BfVfFaceMap faceMap;
+  bfVfFaceMapInitFromParentFaces(&faceMap,
+                                 (BfSizeArray const *)&rowFaces_par,
+                                 (BfSizeArray const *)&colFaces_par);
+
+  /* NEW: build the subtree purely from CSR slicing + SVD decisions. */
+  BfVfHierBlock *subtree =
+    buildBlockFromCsrMidlevel(
+        (BfMatCsrReal const *)A_par,
+        (BfSizeArray  const *)&rowFaces_par,
+        (BfSizeArray  const *)&colFaces_par,
+        (BfVfFaceMap  const *)&faceMap,
+        rowNode,
+        colNode,
+        eta,
+        leafMax,
+        leafMin,
+        minArea,              /* NEW */
+        tol,
+        minSvdSize,
+        maxSvdRankFrac,
+        0);  /* depth = 0 */
+
+  /* A_par and parent face arrays are no longer needed:
+   * all leaves now own their own CSR or SVD MatProduct blocks.
+   */
+  bfVfFaceMapDeinit(&faceMap);
+  bfMatCsrRealDeinitAndDealloc(&A_par);
+  bfSizeArrayDeinit(&rowFaces_par);
+  bfSizeArrayDeinit(&colFaces_par);
+
+  return subtree;
 }
 
 

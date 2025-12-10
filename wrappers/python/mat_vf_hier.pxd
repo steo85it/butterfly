@@ -10,6 +10,7 @@ cdef extern from "bf/mat_vf_hier.h":
         BfReal           eta,
         BfSize           leafMax,
         BfSize           leafMin,
+        BfReal           minArea,
         BfReal           tol,
         BfSize           minSvdSize,
         BfReal           maxSvdRankFrac)

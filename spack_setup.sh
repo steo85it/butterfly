@@ -71,6 +71,17 @@ LAP=$(spack location -i netlib-lapack)
 OB=$(spack location -i openblas)
 for d in "$SS/lib64" "$SS/lib"; do [ -d "$d" ] && LIBDIR="$d" && break; done
 
+# PRIMME (built in-tree under primme/)
+PRIMME_ROOT="$PWD/../primme"
+
+# headers (adjust if you copied them into include/ already)
+PRIMME_INC="$PRIMME_ROOT/include"
+
+# prefer lib64 if present, otherwise lib
+for d in "$PRIMME_ROOT/lib64" "$PRIMME_ROOT/lib"; do
+  [ -d "$d" ] && PRIMME_LIB="$d" && break
+done
+
 # 1) Clean
 ninja -C build -t clean || true
 rm -rf build
@@ -103,6 +114,7 @@ meson setup build \
       -L$OBLIB    -Wl,-rpath,$OBLIB \
       ${VENV_LIB64:+-L$VENV_LIB64 -Wl,-rpath,$VENV_LIB64} \
       ${VENV_LIB:+-L$VENV_LIB   -Wl,-rpath,$VENV_LIB} \
+      -L$PRIMME_LIB -Wl,-rpath,$PRIMME_LIB -lprimme \
       -Wl,-rpath,'\$ORIGIN/../../lib64' \
       -Wl,-rpath,'\$ORIGIN/../../lib'"
 

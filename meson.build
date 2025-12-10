@@ -134,6 +134,41 @@ if openmp_dep.found()
   butterfly_dependencies += [openmp_dep]
 endif
 
+# --- PRIMME (optional) ----------------------------------------------------
+primme_dep = dependency('', required : false)  # dummy init
+
+if get_option('primme').enabled()
+  primme_root = get_option('primme_root')
+
+  if primme_root != ''
+    primme_incdir = include_directories(join_paths(primme_root, 'include'))
+    primme_libdir = join_paths(primme_root, 'lib')
+
+    primme_lib = cc.find_library(
+      'primme',
+      dirs : [primme_libdir],
+      required : true
+    )
+
+    primme_dep = declare_dependency(
+      include_directories : primme_incdir,
+      dependencies        : [primme_lib]
+    )
+  else
+    # If you ever install primme system-wide and/or add a .pc file:
+    primme_dep = dependency('primme', required : false)
+  endif
+
+  if primme_dep.found()
+    message('PRIMME found — enabling primme_svds backend')
+    add_project_arguments('-DBF_HAVE_PRIMME_SVDS', language : 'c')
+    butterfly_dependencies += [primme_dep]
+  else
+    message('PRIMME requested but not found — building without primme_svds')
+  endif
+endif
+# --------------------------------------------------------------------------
+
 butterfly_lib_src = [
   'src/array.c',
   'src/bbox.c',

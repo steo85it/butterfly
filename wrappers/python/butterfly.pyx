@@ -263,7 +263,7 @@ cdef class FacStreamer:
         if isinstance(mat, np.ndarray):
             self._feed_ndarray(mat)
         elif isinstance(mat, Mat):
-            self._feed_mat(mat)
+            self._feed_Mat(mat)
         else:
             raise NotImplementedError()
 
@@ -660,10 +660,15 @@ cdef class MatCsrReal(Mat):
             row_start = rp[i]
             row_end = rp[i + 1]
             for k in range(row_start, row_end):
-                if ff_debug:
-                    printf("[ff-debug] i=%zu / k=%zu index out of range: %zu, %zu, %zu)\n",
-                           i, k, m, row_start, row_end)
                 j = ci[k]
+                if j >= n:
+                    if ff_debug:
+                        printf("[ff-debug] MatCsrReal.to_dense_ndarray: "
+                               "col index %zu out of range for shape (%zu, %zu) "
+                               "(row i=%zu, k=%zu, row_start=%zu, row_end=%zu)\n",
+                               j, m, n, i, k, row_start, row_end)
+                        fflush(stdout)
+                    continue
                 dense[i, j] = da[k]
 
         return dense
@@ -2398,6 +2403,7 @@ cdef class VfHier:
                      double eta=2.0,
                      BfSize leaf_max=128,
                      BfSize leaf_min=1,
+                     BfReal min_area=0.0,
                      double tol=1e-2,
                      BfSize min_svd_size=16384,
                      double max_svd_rank_frac=0.9,
@@ -2421,7 +2427,7 @@ cdef class VfHier:
         qt = _quadtree_from_trimesh_xy(tm)       # returns a Quadtree
         H.vfHier = bfVfHierNewFromQuadtree(tm.trimesh,
                                            qt.quadtree,
-                                           eta, leaf_max, leaf_min,
+                                           eta, leaf_max, leaf_min, min_area,
                                            tol, min_svd_size, max_svd_rank_frac)
         if H.vfHier == NULL:
             raise RuntimeError("bfVfHierNewFromQuadtree failed")
@@ -2435,6 +2441,7 @@ cdef class VfHier:
                              double eta=2.0,
                              BfSize leaf_max=128,
                              BfSize leaf_min=1,
+                             BfReal min_area=0.0,
                              double tol=1e-2,
                              BfSize min_svd_size=16384,
                              double max_svd_rank_frac=0.9):
@@ -2454,6 +2461,7 @@ cdef class VfHier:
             eta,
             leaf_max,
             leaf_min,
+            min_area,
             tol,
             min_svd_size,
             max_svd_rank_frac)
@@ -2500,6 +2508,27 @@ cdef class VfHier:
 
         cdef cnp.ndarray y = np.zeros_like(x_flat)
         bfVfHierApply(self.vfHier, <BfReal*>x_flat.data, <BfReal*>y.data)
+        return y
+
+    cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y):
+        """
+        Apply the hierarchical FF operator y = F @ x into a preallocated y.
+
+        - x: 1D ndarray of length n (will be coerced to float64 view)
+        - y: 1D ndarray of length n, float64 (output is written in-place)
+
+        This avoids repeated allocations in tight loops (thermal time stepping).
+        """
+        cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
+        if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
+            raise ValueError(f"x must be 1D of length {self.n}")
+
+        if y.ndim != 1 or y.shape[0] != self.n:
+            raise ValueError(f"y must be 1D of length {self.n}")
+
+        bfVfHierApply(self.vfHier,
+                      <BfReal*>x_flat.data,
+                      <BfReal*>y.data)
         return y
 
     def __dealloc__(self):
@@ -2881,7 +2910,8 @@ def benchmark_form_factor(path="examples/radiosity/67p.obj",
 def build_vf_block_no_svd(Trimesh tm,
                           double eta=2.0,
                           BfSize leaf_max=128,
-                          BfSize leaf_min=1):
+                          BfSize leaf_min=1,
+                          BfReal min_area=0.0):
     """
     Build a CSR-only block view-factor operator using BF's BfMatBlockCoo.
 
@@ -2897,6 +2927,7 @@ def build_vf_block_no_svd(Trimesh tm,
         eta,
         leaf_max,
         leaf_min,
+        min_area,
         0.0,   # tol (unused when minSvdSize == 0)
         0,     # minSvdSize == 0 => disable SVD
         0.0)   # maxSvdRankFrac (ignored when SVD disabled)
@@ -3223,6 +3254,7 @@ def compare_vf_compressions(path=None,
                             double eta=2.0,
                             BfSize leaf_max=128,
                             BfSize leaf_min=1,
+                            BfReal min_area=0.0,
                             double tol=1e-2,
                             BfSize min_svd_size=16384,
                             double max_svd_rank_frac=0.9,
@@ -3257,21 +3289,21 @@ def compare_vf_compressions(path=None,
 
     cdef BfSize n_faces = tm.num_faces
 
-    # -----------------------------
-    # Full FF (CSR) build + memory
-    # -----------------------------
-    t0 = time.perf_counter()
-    F_csr = MatCsrReal.new_view_factor_matrix_from_trimesh(tm)
-    t_full_build = time.perf_counter() - t0
-    print(f"[cmp] full FF (CSR) build: {t_full_build:.3f} s")
-
-    F_sp = F_csr.to_scipy_csr()
-    mem_full = (
-        F_sp.data.nbytes +
-        F_sp.indices.nbytes +
-        F_sp.indptr.nbytes
-    )
-    print(f"[cmp] full FF memory: {mem_full/1e6:.3f} MB")
+    # # -----------------------------
+    # # Full FF (CSR) build + memory
+    # # -----------------------------
+    # t0 = time.perf_counter()
+    # F_csr = MatCsrReal.new_view_factor_matrix_from_trimesh(tm)
+    # t_full_build = time.perf_counter() - t0
+    # print(f"[cmp] full FF (CSR) build: {t_full_build:.3f} s")
+    #
+    # F_sp = F_csr.to_scipy_csr()
+    # mem_full = (
+    #     F_sp.data.nbytes +
+    #     F_sp.indices.nbytes +
+    #     F_sp.indptr.nbytes
+    # )
+    # print(f"[cmp] full FF memory: {mem_full/1e6:.3f} MB")
 
     # -----------------------------
     # Old compression: trimesh-based VfHier
@@ -3284,6 +3316,7 @@ def compare_vf_compressions(path=None,
                                 eta=eta,
                                 leaf_max=leaf_max,
                                 leaf_min=leaf_min,
+                                min_area=min_area,
                                 tol=tol,
                                 min_svd_size=min_svd_size,
                                 max_svd_rank_frac=max_svd_rank_frac,
@@ -3306,37 +3339,37 @@ def compare_vf_compressions(path=None,
           f"svd={stats_old.numSvdLeaves} nodes={stats_old.numNodeBlocks} "
           f"rank_total={stats_old.rankTotal}")
 
-    # -----------------------------
-    # New compression: CSR + quadtree
-    # -----------------------------
-    t0 = time.perf_counter()
-    H_new = VfHier.from_csr_and_trimesh(F_csr,
-                                        tm,
-                                        eta=eta,
-                                        leaf_max=leaf_max,
-                                        leaf_min=leaf_min,
-                                        tol=tol,
-                                        min_svd_size=min_svd_size,
-                                        max_svd_rank_frac=max_svd_rank_frac)
-    t_new_build = time.perf_counter() - t0
-    print(f"[cmp] NEW VfHier (CSR+quadtree) build: {t_new_build:.3f} s")
-
-    cdef BfVfHierStats stats_new
-    bfVfHierCollectStats(H_new.vfHier, &stats_new)
-
-    mem_new_sparse = stats_new.memBytesSparseEst
-    mem_new_svd    = stats_new.memBytesSvdEst
-    mem_new_total  = mem_new_sparse + mem_new_svd
-
-    print(f"[cmp] NEW VfHier memory: total={mem_new_total/1e6:.3f} MB "
-          f"(sparse={mem_new_sparse/1e6:.3f} MB, "
-          f"SVD={mem_new_svd/1e6:.3f} MB)")
-    print(f"[cmp] NEW blocks: sparse={stats_new.numSparseLeaves} "
-          f"svd={stats_new.numSvdLeaves} nodes={stats_new.numNodeBlocks} "
-          f"rank_total={stats_new.rankTotal}")
-
-    print(f"[cmp] combined FULL+NEW build (for flux-style pipeline): "
-          f"{(t_full_build + t_new_build):.3f} s")
+    # # -----------------------------
+    # # New compression: CSR + quadtree
+    # # -----------------------------
+    # t0 = time.perf_counter()
+    # H_new = VfHier.from_csr_and_trimesh(F_csr,
+    #                                     tm,
+    #                                     eta=eta,
+    #                                     leaf_max=leaf_max,
+    #                                     leaf_min=leaf_min,
+    #                                     tol=tol,
+    #                                     min_svd_size=min_svd_size,
+    #                                     max_svd_rank_frac=max_svd_rank_frac)
+    # t_new_build = time.perf_counter() - t0
+    # print(f"[cmp] NEW VfHier (CSR+quadtree) build: {t_new_build:.3f} s")
+    #
+    # cdef BfVfHierStats stats_new
+    # bfVfHierCollectStats(H_new.vfHier, &stats_new)
+    #
+    # mem_new_sparse = stats_new.memBytesSparseEst
+    # mem_new_svd    = stats_new.memBytesSvdEst
+    # mem_new_total  = mem_new_sparse + mem_new_svd
+    #
+    # print(f"[cmp] NEW VfHier memory: total={mem_new_total/1e6:.3f} MB "
+    #       f"(sparse={mem_new_sparse/1e6:.3f} MB, "
+    #       f"SVD={mem_new_svd/1e6:.3f} MB)")
+    # print(f"[cmp] NEW blocks: sparse={stats_new.numSparseLeaves} "
+    #       f"svd={stats_new.numSvdLeaves} nodes={stats_new.numNodeBlocks} "
+    #       f"rank_total={stats_new.rankTotal}")
+    #
+    # print(f"[cmp] combined FULL+NEW build (for flux-style pipeline): "
+    #       f"{(t_full_build + t_new_build):.3f} s")
 
     # -----------------------------
     # MVP timings and accuracy
@@ -3345,17 +3378,17 @@ def compare_vf_compressions(path=None,
     x = _np.random.rand(n_faces)
 
     # warm-up
-    _ = (F_csr @ x).to_array()
+    # _ = (F_csr @ x).to_array()
     _ = H_old.apply(x)
-    _ = H_new.apply(x)
+    # _ = H_new.apply(x)
 
-    # full MVP
-    t0 = time.perf_counter()
-    for _i in range(mvp_repeats):
-        y_ref_vec = F_csr @ x
-        y_ref = y_ref_vec.to_array()
-    t_full_mvp = (time.perf_counter() - t0) / mvp_repeats
-    print(f"[cmp] full FF MVP: {t_full_mvp*1e3:.2f} ms (avg over {mvp_repeats})")
+    # # full MVP
+    # t0 = time.perf_counter()
+    # for _i in range(mvp_repeats):
+    #     y_ref_vec = F_csr @ x
+    #     y_ref = y_ref_vec.to_array()
+    # t_full_mvp = (time.perf_counter() - t0) / mvp_repeats
+    # print(f"[cmp] full FF MVP: {t_full_mvp*1e3:.2f} ms (avg over {mvp_repeats})")
 
     # old MVP
     t0 = time.perf_counter()
@@ -3364,71 +3397,71 @@ def compare_vf_compressions(path=None,
     t_old_mvp = (time.perf_counter() - t0) / mvp_repeats
     print(f"[cmp] OLD VfHier MVP: {t_old_mvp*1e3:.2f} ms (avg over {mvp_repeats})")
 
-    # new MVP
-    t0 = time.perf_counter()
-    for _i in range(mvp_repeats):
-        y_new = H_new.apply(x)
-    t_new_mvp = (time.perf_counter() - t0) / mvp_repeats
-    print(f"[cmp] NEW VfHier MVP: {t_new_mvp*1e3:.2f} ms (avg over {mvp_repeats})")
+    # # new MVP
+    # t0 = time.perf_counter()
+    # for _i in range(mvp_repeats):
+    #     y_new = H_new.apply(x)
+    # t_new_mvp = (time.perf_counter() - t0) / mvp_repeats
+    # print(f"[cmp] NEW VfHier MVP: {t_new_mvp*1e3:.2f} ms (avg over {mvp_repeats})")
 
-    # diagnostics & relative errors
-    print("[cmp] y_ref: nan?", _np.isnan(y_ref).any(),
-          "inf?", _np.isinf(y_ref).any(),
-          "||y_ref||", float(_np.linalg.norm(y_ref)))
-    print("[cmp] y_old: nan?", _np.isnan(y_old).any(),
-          "inf?", _np.isinf(y_old).any(),
-          "||y_old||", float(_np.linalg.norm(y_old)))
-    print("[cmp] y_new: nan?", _np.isnan(y_new).any(),
-          "inf?", _np.isinf(y_new).any(),
-          "||y_new||", float(_np.linalg.norm(y_new)))
-
-    diff_old = y_ref - y_old
-    diff_new = y_ref - y_new
-
-    denom = float(_np.linalg.norm(y_ref))
-    if denom == 0.0:
-        print("[cmp] WARNING: ||y_ref|| == 0, rel_err ill-defined")
-        rel_err_old = _np.nan
-        rel_err_new = _np.nan
-    else:
-        rel_err_old = float(_np.linalg.norm(diff_old) / denom)
-        rel_err_new = float(_np.linalg.norm(diff_new) / denom)
-
-    print(f"[cmp] relative error OLD  = {rel_err_old:.3e}")
-    print(f"[cmp] relative error NEW  = {rel_err_new:.3e}")
-
-    return {
-        "n_faces": int(n_faces),
-
-        "t_full_build": t_full_build,
-        "t_old_build": t_old_build,
-        "t_new_build": t_new_build,
-        "t_full_plus_new_build": t_full_build + t_new_build,
-
-        "mem_full_bytes": int(mem_full),
-
-        "mem_old_sparse_bytes": int(mem_old_sparse),
-        "mem_old_svd_bytes": int(mem_old_svd),
-        "mem_old_total_bytes": int(mem_old_total),
-
-        "mem_new_sparse_bytes": int(mem_new_sparse),
-        "mem_new_svd_bytes": int(mem_new_svd),
-        "mem_new_total_bytes": int(mem_new_total),
-
-        "num_sparse_leaves_old": int(stats_old.numSparseLeaves),
-        "num_svd_leaves_old": int(stats_old.numSvdLeaves),
-        "num_nodes_old": int(stats_old.numNodeBlocks),
-        "rank_total_old": int(stats_old.rankTotal),
-
-        "num_sparse_leaves_new": int(stats_new.numSparseLeaves),
-        "num_svd_leaves_new": int(stats_new.numSvdLeaves),
-        "num_nodes_new": int(stats_new.numNodeBlocks),
-        "rank_total_new": int(stats_new.rankTotal),
-
-        "t_full_mvp": t_full_mvp,
-        "t_old_mvp": t_old_mvp,
-        "t_new_mvp": t_new_mvp,
-
-        "rel_err_old": rel_err_old,
-        "rel_err_new": rel_err_new,
-    }
+    # # diagnostics & relative errors
+    # print("[cmp] y_ref: nan?", _np.isnan(y_ref).any(),
+    #       "inf?", _np.isinf(y_ref).any(),
+    #       "||y_ref||", float(_np.linalg.norm(y_ref)))
+    # print("[cmp] y_old: nan?", _np.isnan(y_old).any(),
+    #       "inf?", _np.isinf(y_old).any(),
+    #       "||y_old||", float(_np.linalg.norm(y_old)))
+    # print("[cmp] y_new: nan?", _np.isnan(y_new).any(),
+    #       "inf?", _np.isinf(y_new).any(),
+    #       "||y_new||", float(_np.linalg.norm(y_new)))
+    #
+    # diff_old = y_ref - y_old
+    # diff_new = y_ref - y_new
+    #
+    # denom = float(_np.linalg.norm(y_ref))
+    # if denom == 0.0:
+    #     print("[cmp] WARNING: ||y_ref|| == 0, rel_err ill-defined")
+    #     rel_err_old = _np.nan
+    #     rel_err_new = _np.nan
+    # else:
+    #     rel_err_old = float(_np.linalg.norm(diff_old) / denom)
+    #     rel_err_new = float(_np.linalg.norm(diff_new) / denom)
+    #
+    # print(f"[cmp] relative error OLD  = {rel_err_old:.3e}")
+    # print(f"[cmp] relative error NEW  = {rel_err_new:.3e}")
+    #
+    # return {
+    #     "n_faces": int(n_faces),
+    #
+    #     "t_full_build": t_full_build,
+    #     "t_old_build": t_old_build,
+    #     "t_new_build": t_new_build,
+    #     "t_full_plus_new_build": t_full_build + t_new_build,
+    #
+    #     "mem_full_bytes": int(mem_full),
+    #
+    #     "mem_old_sparse_bytes": int(mem_old_sparse),
+    #     "mem_old_svd_bytes": int(mem_old_svd),
+    #     "mem_old_total_bytes": int(mem_old_total),
+    #
+    #     "mem_new_sparse_bytes": int(mem_new_sparse),
+    #     "mem_new_svd_bytes": int(mem_new_svd),
+    #     "mem_new_total_bytes": int(mem_new_total),
+    #
+    #     "num_sparse_leaves_old": int(stats_old.numSparseLeaves),
+    #     "num_svd_leaves_old": int(stats_old.numSvdLeaves),
+    #     "num_nodes_old": int(stats_old.numNodeBlocks),
+    #     "rank_total_old": int(stats_old.rankTotal),
+    #
+    #     "num_sparse_leaves_new": int(stats_new.numSparseLeaves),
+    #     "num_svd_leaves_new": int(stats_new.numSvdLeaves),
+    #     "num_nodes_new": int(stats_new.numNodeBlocks),
+    #     "rank_total_new": int(stats_new.rankTotal),
+    #
+    #     "t_full_mvp": t_full_mvp,
+    #     "t_old_mvp": t_old_mvp,
+    #     "t_new_mvp": t_new_mvp,
+    #
+    #     "rel_err_old": rel_err_old,
+    #     "rel_err_new": rel_err_new,
+    # }

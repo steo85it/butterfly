@@ -28,6 +28,7 @@ cdef extern from "bf/vf_hier.h":
                                       BfReal eta,
                                       BfSize leafMax,
                                       BfSize leafMin,
+                                      BfReal        minArea,
                                       BfReal tol,
                                       BfSize minSvdSize,
                                       BfReal maxSvdRankFrac)
@@ -38,6 +39,7 @@ cdef extern from "bf/vf_hier.h":
                                         BfReal eta,
                                         BfSize leafMax,
                                         BfSize leafMin,
+                                        BfReal        minArea,
                                         BfReal tol,
                                         BfSize minSvdSize,
                                         BfReal maxSvdRankFrac)
@@ -47,6 +49,7 @@ cdef extern from "bf/vf_hier.h":
                                             BfReal eta,
                                             BfSize leafMax,
                                             BfSize leafMin,
+                                            BfReal        minArea,
                                             BfReal tol,
                                             BfSize minSvdSize,
                                             BfReal maxSvdRankFrac)
