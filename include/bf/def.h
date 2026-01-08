@@ -62,3 +62,9 @@ typedef enum BfPolicy {
   BF_POLICY_COPY,
   BF_POLICY_STEAL
 } BfPolicy;
+
+#ifndef BF_BOOL_DEFINED
+#define BF_BOOL_DEFINED
+#include <stdbool.h>
+typedef bool BfBool;
+#endif

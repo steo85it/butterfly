@@ -1661,6 +1661,11 @@ def _build_csr_block(Trimesh tm,
     Returns:
         MatCsrReal block
     """
+    if row_idx.shape[0] == 0 or col_idx.shape[0] == 0:
+        # return an explicit empty CSR with correct shape if you have a constructor,
+        # otherwise raise cleanly
+        raise ValueError("cannot build CSR block with empty row/col index set")
+
     if row_idx.ndim != 1 or col_idx.ndim != 1:
         raise ValueError("row_idx and col_idx must be 1D arrays")
 
@@ -2502,7 +2507,7 @@ cdef class VfHier:
 
 
     cpdef cnp.ndarray apply(self, cnp.ndarray x):
-        cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
+        cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
             raise ValueError(f"x must be 1D of length {self.n}")
 
@@ -2519,10 +2524,12 @@ cdef class VfHier:
 
         This avoids repeated allocations in tight loops (thermal time stepping).
         """
-        cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
+        cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
             raise ValueError(f"x must be 1D of length {self.n}")
 
+        if y.dtype != np.float64 or not y.flags.c_contiguous:
+            raise ValueError("y must be float64 and C-contiguous")
         if y.ndim != 1 or y.shape[0] != self.n:
             raise ValueError(f"y must be 1D of length {self.n}")
 
@@ -2531,9 +2538,49 @@ cdef class VfHier:
                       <BfReal*>y.data)
         return y
 
+    @staticmethod
+    cdef VfHier from_ptr(BfVfHier *ptr):
+        cdef VfHier obj = VfHier.__new__(VfHier)
+        obj.vfHier = ptr
+        obj.n = bfVfHierGetNumFaces(ptr)
+        return obj
+
     def __dealloc__(self):
         if self.vfHier != NULL:
             bfVfHierDeinitAndDealloc(&self.vfHier)
+            self.vfHier = NULL
+
+    def save(self, path):
+        """
+        Save hierarchy to a single binary file.
+        """
+        if self.vfHier == NULL:
+            raise ValueError("VfHier is NULL")
+
+        cdef bytes bpath = str(path).encode("utf-8")
+        cdef const char *cpath = bpath
+
+        if not bfVfHierSave(self.vfHier, cpath):
+            raise OSError(f"bfVfHierSave failed for {path}")
+
+    @staticmethod
+    def load(path):
+        """
+        Load hierarchy from a single binary file.
+        """
+        cdef bytes bpath = str(path).encode("utf-8")
+        cdef const char *cpath = bpath
+
+        cdef BfVfHier *ptr = bfVfHierLoad(cpath)
+        if ptr == NULL:
+            raise OSError(f"bfVfHierLoad failed for {path}")
+        return VfHier.from_ptr(ptr)
+
+    @property
+    def n(self):
+        if self.vfHier == NULL:
+            return 0
+        return <Py_ssize_t> bfVfHierGetNumFaces(self.vfHier)
 
 ### tests
 

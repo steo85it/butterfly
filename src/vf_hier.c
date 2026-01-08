@@ -22,6 +22,9 @@
 #include <bf/mat_diag_real.h>
 #include <bf/linalg.h>  /* for bfGetTruncatedSvd, BfTruncSpec, BfBackend */
 
+#include <stdint.h>
+#include <errno.h>
+
 #include <stdio.h>
 #include <math.h>
 #include <time.h>  /* for timing instrumentation */
@@ -38,10 +41,6 @@
 
 #ifndef BF_FALSE
 #  define BF_FALSE false
-#endif
-
-#ifndef BfBool
-#  define BfBool bool
 #endif
 
 #ifndef BF_VF_HIER_ENABLE_LEGACY_BUILD
@@ -3109,5 +3108,416 @@ static BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
 }
 
 
+/* ============================================================
+ * VfHier binary serialization
+ * ============================================================ */
 
+#define BF_VFHIER_MAGIC "BFVFHIER"
+#define BF_VFHIER_MAGIC_LEN 7
+#define BF_VFHIER_VERSION 1u
 
+static BfBool write_bytes(FILE *fp, void const *buf, size_t n) {
+  return fwrite(buf, 1, n, fp) == n;
+}
+static BfBool read_bytes(FILE *fp, void *buf, size_t n) {
+  return fread(buf, 1, n, fp) == n;
+}
+
+static BfBool write_u8(FILE *fp, uint8_t v)   { return write_bytes(fp, &v, sizeof(v)); }
+static BfBool write_u32(FILE *fp, uint32_t v) { return write_bytes(fp, &v, sizeof(v)); }
+static BfBool write_u64(FILE *fp, uint64_t v) { return write_bytes(fp, &v, sizeof(v)); }
+
+static BfBool read_u8(FILE *fp, uint8_t *v)   { return read_bytes(fp, v, sizeof(*v)); }
+static BfBool read_u32(FILE *fp, uint32_t *v) { return read_bytes(fp, v, sizeof(*v)); }
+static BfBool read_u64(FILE *fp, uint64_t *v) { return read_bytes(fp, v, sizeof(*v)); }
+
+static BfBool write_size_array(FILE *fp, BfSizeArray const *a) {
+  BfSize n = bfSizeArrayGetSize((BfSizeArray *)a);
+  if (!write_u64(fp, (uint64_t)n)) return BF_FALSE;
+  for (BfSize i = 0; i < n; ++i) {
+    uint64_t v = (uint64_t)bfSizeArrayGet((BfSizeArray *)a, i);
+    if (!write_u64(fp, v)) return BF_FALSE;
+  }
+  return BF_TRUE;
+}
+
+static BfBool read_size_array(FILE *fp, BfSizeArray *a) {
+  uint64_t n64;
+  if (!read_u64(fp, &n64)) return BF_FALSE;
+
+  bfSizeArrayInitWithDefaultCapacity(a);
+  for (uint64_t i = 0; i < n64; ++i) {
+    uint64_t v64;
+    if (!read_u64(fp, &v64)) return BF_FALSE;
+    bfSizeArrayAppend(a, (BfSize)v64);
+  }
+  return BF_TRUE;
+}
+
+/* ---- CSR leaf I/O ---- */
+
+static BfBool write_csr(FILE *fp, BfMatCsrReal const *Acsr) {
+  BfMat const *A = bfMatCsrRealToMat((BfMatCsrReal *)Acsr);
+  BfSize m = bfMatGetNumRows(A);
+  BfSize n = bfMatGetNumCols(A);
+
+  BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(Acsr);
+  BfSize const *ci = bfMatCsrRealGetColindConstPtr(Acsr);
+  BfReal const *da = bfMatCsrRealGetDataConstPtr(Acsr);
+  if (rp == NULL || ci == NULL || da == NULL) return BF_FALSE;
+
+  BfSize nnz = rp[m];
+
+  if (!write_u64(fp, (uint64_t)m)) return BF_FALSE;
+  if (!write_u64(fp, (uint64_t)n)) return BF_FALSE;
+  if (!write_u64(fp, (uint64_t)nnz)) return BF_FALSE;
+
+  /* rowptr: m+1 */
+  for (BfSize i = 0; i < m + 1; ++i) {
+    if (!write_u64(fp, (uint64_t)rp[i])) return BF_FALSE;
+  }
+  /* colind: nnz */
+  for (BfSize k = 0; k < nnz; ++k) {
+    if (!write_u64(fp, (uint64_t)ci[k])) return BF_FALSE;
+  }
+  /* data: nnz */
+  if (!write_bytes(fp, da, (size_t)nnz * sizeof(BfReal))) return BF_FALSE;
+
+  return BF_TRUE;
+}
+
+static BfMatCsrReal *read_csr(FILE *fp) {
+  uint64_t m64, n64, nnz64;
+  if (!read_u64(fp, &m64)) return NULL;
+  if (!read_u64(fp, &n64)) return NULL;
+  if (!read_u64(fp, &nnz64)) return NULL;
+
+  BfSize m = (BfSize)m64;
+  BfSize n = (BfSize)n64;
+  BfSize nnz = (BfSize)nnz64;
+
+  /* Build arrays (STEAL) */
+  BfSizeArray *rowptr = bfSizeArrayNewWithDefaultCapacity();
+  BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
+  BfRealArray *data   = bfRealArrayNewWithDefaultCapacity();
+
+  /* rowptr */
+  for (BfSize i = 0; i < m + 1; ++i) {
+    uint64_t v64;
+    if (!read_u64(fp, &v64)) goto fail;
+    bfSizeArrayAppend(rowptr, (BfSize)v64);
+  }
+
+  /* colind */
+  for (BfSize k = 0; k < nnz; ++k) {
+    uint64_t v64;
+    if (!read_u64(fp, &v64)) goto fail;
+    bfSizeArrayAppend(colind, (BfSize)v64);
+  }
+
+  /* data */
+  for (BfSize k = 0; k < nnz; ++k) {
+    BfReal v;
+    if (!read_bytes(fp, &v, sizeof(BfReal))) goto fail;
+    bfRealArrayAppend(data, v);
+  }
+
+  return bfMatCsrRealNewFromArrays(m, n, rowptr, colind, data, BF_POLICY_STEAL);
+
+fail:
+  bfSizeArrayDeinitAndDealloc(&rowptr);
+  bfSizeArrayDeinitAndDealloc(&colind);
+  bfRealArrayDeinitAndDealloc(&data);
+  return NULL;
+}
+
+/* ---- SVD leaf I/O (assumes leaf->mat is MatProduct with 3 factors: U, S(diag), VT) ---- */
+
+static BfBool unpack_matproduct_usvt(BfMat *P,
+                                    BfMatDenseReal **U,
+                                    BfMatDiagReal **S,
+                                    BfMatDenseReal **VT)
+{
+  *U = NULL; *S = NULL; *VT = NULL;
+
+  BfMatProduct *prod = bfMatToMatProduct(P);
+  if (prod == NULL) return BF_FALSE;
+
+  if (bfMatProductNumFactors(prod) != 3) return BF_FALSE;
+
+  BfMat *f0 = bfMatProductGetFactor(prod, 0);
+  BfMat *f1 = bfMatProductGetFactor(prod, 1);
+  BfMat *f2 = bfMatProductGetFactor(prod, 2);
+
+  BfMatDenseReal *Udr  = bfMatToMatDenseReal(f0);
+  BfMatDiagReal  *Sdg  = bfMatToMatDiagReal(f1);
+  BfMatDenseReal *VTdr = bfMatToMatDenseReal(f2);
+
+  if (Udr == NULL || Sdg == NULL || VTdr == NULL) return BF_FALSE;
+
+  *U = Udr; *S = Sdg; *VT = VTdr;
+  return BF_TRUE;
+}
+
+static BfBool write_dense(FILE *fp, BfMatDenseReal const *M) {
+  BfMat const *A = bfMatDenseRealToMat((BfMatDenseReal *)M);
+  BfSize m = bfMatGetNumRows(A);
+  BfSize n = bfMatGetNumCols(A);
+
+  if (!write_u64(fp, (uint64_t)m)) return BF_FALSE;
+  if (!write_u64(fp, (uint64_t)n)) return BF_FALSE;
+
+  /* Assume contiguous storage in M->data as used elsewhere in your codebase */
+  if (!write_bytes(fp, M->data, (size_t)m * (size_t)n * sizeof(BfReal))) return BF_FALSE;
+
+  return BF_TRUE;
+}
+
+static BfMatDenseReal *read_dense(FILE *fp) {
+  uint64_t m64, n64;
+  if (!read_u64(fp, &m64)) return NULL;
+  if (!read_u64(fp, &n64)) return NULL;
+
+  BfSize m = (BfSize)m64;
+  BfSize n = (BfSize)n64;
+
+  BfMatDenseReal *M = bfMatDenseRealNew();
+  if (M == NULL) return NULL;
+  bfMatDenseRealInitZeros(M, m, n);
+
+  if (!read_bytes(fp, M->data, (size_t)m * (size_t)n * sizeof(BfReal))) {
+    bfMatDenseRealDeinitAndDealloc(&M);
+    return NULL;
+  }
+
+  return M;
+}
+
+static BfBool write_diag(FILE *fp, BfMatDiagReal const *D) {
+  BfMat const *A = bfMatDiagRealToMat((BfMatDiagReal *)D);
+  BfSize m = bfMatGetNumRows(A);
+  BfSize n = bfMatGetNumCols(A);
+  if (m != n) return BF_FALSE;
+
+  if (!write_u64(fp, (uint64_t)m)) return BF_FALSE;
+  if (!write_bytes(fp, D->data, (size_t)m * sizeof(BfReal))) return BF_FALSE;
+
+  return BF_TRUE;
+}
+
+static BfMatDiagReal *read_diag(FILE *fp) {
+  uint64_t n64;
+  if (!read_u64(fp, &n64)) return NULL;
+  BfSize n = (BfSize)n64;
+
+  BfMatDiagReal *D = bfMatDiagRealNew();
+  if (D == NULL) return NULL;
+
+  bfMatDiagRealInit(D, n, n);
+
+  if (!read_bytes(fp, D->data, (size_t)n * sizeof(BfReal))) {
+    bfMatDiagRealDeinitAndDealloc(&D);
+    return NULL;
+  }
+
+  return D;
+}
+
+/* ---- Block I/O (recursive) ---- */
+
+static BfBool write_block(FILE *fp, BfVfHierBlock const *block) {
+  if (block == NULL) return BF_FALSE;
+
+  if (!write_u8(fp, (uint8_t)block->kind)) return BF_FALSE;
+
+  switch (block->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE: {
+    BfVfSparseLeaf const *leaf = &block->data.sparse;
+
+    if (!write_u8(fp, (uint8_t)(leaf->colsAreLocal ? 1 : 0))) return BF_FALSE;
+
+    if (!write_size_array(fp, &leaf->rowInds)) return BF_FALSE;
+    if (!write_size_array(fp, &leaf->colInds)) return BF_FALSE;
+
+    if (!write_csr(fp, leaf->mat)) return BF_FALSE;
+
+    return BF_TRUE;
+  }
+
+  case BF_VF_HIER_BLOCK_SVD: {
+    BfVfSvdLeaf const *leaf = &block->data.svd;
+
+    if (!write_size_array(fp, &leaf->rowInds)) return BF_FALSE;
+    if (!write_size_array(fp, &leaf->colInds)) return BF_FALSE;
+
+    if (!write_u64(fp, (uint64_t)leaf->rank)) return BF_FALSE;
+
+    /* Decompose leaf->mat */
+    BfMatDenseReal *U = NULL, *VT = NULL;
+    BfMatDiagReal *S = NULL;
+    if (!unpack_matproduct_usvt(leaf->mat, &U, &S, &VT)) return BF_FALSE;
+
+    if (!write_dense(fp, U)) return BF_FALSE;
+    if (!write_diag(fp, S)) return BF_FALSE;
+    if (!write_dense(fp, VT)) return BF_FALSE;
+
+    return BF_TRUE;
+  }
+
+  case BF_VF_HIER_BLOCK_NODE: {
+    BfPtrArray const *children = &block->data.node.children;
+    BfSize n = bfPtrArraySize(children);
+
+    if (!write_u64(fp, (uint64_t)n)) return BF_FALSE;
+
+    for (BfSize i = 0; i < n; ++i) {
+      BfVfHierBlock *child = bfPtrArrayGet(children, i);
+      if (!write_block(fp, child)) return BF_FALSE;
+    }
+    return BF_TRUE;
+  }
+
+  case BF_VF_HIER_BLOCK_NONE:
+  default:
+    return BF_FALSE;
+  }
+}
+
+static BfVfHierBlock *read_block(FILE *fp) {
+  uint8_t kind8;
+  if (!read_u8(fp, &kind8)) return NULL;
+
+  BfVfHierBlock *block = bfVfHierBlockNew();
+  block->kind = (BfVfHierBlockKind)kind8;
+
+  switch (block->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE: {
+    uint8_t colsAreLocal8;
+    if (!read_u8(fp, &colsAreLocal8)) goto fail;
+    if (!read_size_array(fp, &block->data.sparse.rowInds)) goto fail;
+    if (!read_size_array(fp, &block->data.sparse.colInds)) goto fail;
+
+    block->data.sparse.colsAreLocal = (colsAreLocal8 != 0);
+
+    block->data.sparse.mat = read_csr(fp);
+    if (block->data.sparse.mat == NULL) goto fail;
+
+    return block;
+  }
+
+  case BF_VF_HIER_BLOCK_SVD: {
+    if (!read_size_array(fp, &block->data.svd.rowInds)) goto fail;
+    if (!read_size_array(fp, &block->data.svd.colInds)) goto fail;
+
+    uint64_t rank64;
+    if (!read_u64(fp, &rank64)) goto fail;
+    block->data.svd.rank = (BfSize)rank64;
+
+    BfMatDenseReal *U = read_dense(fp);
+    BfMatDiagReal  *S = read_diag(fp);
+    BfMatDenseReal *VT = read_dense(fp);
+    if (U == NULL || S == NULL || VT == NULL) {
+      if (U) bfMatDenseRealDeinitAndDealloc(&U);
+      if (S) bfMatDiagRealDeinitAndDealloc(&S);
+      if (VT) bfMatDenseRealDeinitAndDealloc(&VT);
+      goto fail;
+    }
+
+    /* Rebuild MatProduct P = U * S * VT */
+    BfMatProduct *Pprod = bfMatProductNew();
+    bfMatProductInit(Pprod);
+    bfMatProductPostMultiply(Pprod, bfMatDenseRealToMat(U));
+    bfMatProductPostMultiply(Pprod, bfMatDiagRealToMat(S));
+    bfMatProductPostMultiply(Pprod, bfMatDenseRealToMat(VT));
+
+    block->data.svd.mat = bfMatProductToMat(Pprod);
+    block->data.svd.work = NULL;
+    block->data.svd.workLen = 0;
+
+    return block;
+  }
+
+  case BF_VF_HIER_BLOCK_NODE: {
+    uint64_t nChildren64;
+    if (!read_u64(fp, &nChildren64)) goto fail;
+
+    bfInitPtrArray(&block->data.node.children, (BfSize)nChildren64);
+
+    for (uint64_t i = 0; i < nChildren64; ++i) {
+      BfVfHierBlock *child = read_block(fp);
+      if (child != NULL)
+        bfPtrArrayAppend(&block->data.node.children, child);
+      else
+        goto fail;
+    }
+    return block;
+  }
+
+  case BF_VF_HIER_BLOCK_NONE:
+  default:
+    goto fail;
+  }
+
+fail:
+  bfVfHierBlockDeinitAndDealloc(&block);
+  return NULL;
+}
+
+/* ---- Public API ---- */
+
+BfBool bfVfHierSave(BfVfHier const *vfHier, char const *path) {
+  if (vfHier == NULL || vfHier->root == NULL || path == NULL) return BF_FALSE;
+
+  FILE *fp = fopen(path, "wb");
+  if (fp == NULL) return BF_FALSE;
+
+  BfBool ok = BF_TRUE;
+
+  /* header */
+  ok = ok && write_bytes(fp, BF_VFHIER_MAGIC, BF_VFHIER_MAGIC_LEN);
+  ok = ok && write_u32(fp, (uint32_t)BF_VFHIER_VERSION);
+  ok = ok && write_u64(fp, (uint64_t)vfHier->n);
+
+  /* body */
+  ok = ok && write_block(fp, vfHier->root);
+
+  fclose(fp);
+  return ok;
+}
+
+BfVfHier *bfVfHierLoad(char const *path) {
+  if (path == NULL) return NULL;
+
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) return NULL;
+
+  char magic[BF_VFHIER_MAGIC_LEN];
+  uint32_t version;
+  uint64_t n64;
+
+  if (!read_bytes(fp, magic, BF_VFHIER_MAGIC_LEN)) { fclose(fp); return NULL; }
+  if (memcmp(magic, BF_VFHIER_MAGIC, BF_VFHIER_MAGIC_LEN) != 0) { fclose(fp); return NULL; }
+
+  if (!read_u32(fp, &version)) { fclose(fp); return NULL; }
+  if (version != BF_VFHIER_VERSION) { fclose(fp); return NULL; }
+
+  if (!read_u64(fp, &n64)) { fclose(fp); return NULL; }
+
+  BfVfHier *vf = bfVfHierNew();
+  vf->trimesh = NULL;
+  vf->n = (BfSize)n64;
+
+  vf->root = read_block(fp);
+  fclose(fp);
+
+  if (vf->root == NULL) {
+    bfVfHierDeinitAndDealloc(&vf);
+    return NULL;
+  }
+
+  return vf;
+}
+
+BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier) {
+  return vfHier->n;  // or whatever field stores the global size
+}

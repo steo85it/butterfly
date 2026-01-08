@@ -60,3 +60,6 @@ cdef extern from "bf/vf_hier.h":
 
     void bfVfHierDeinitAndDealloc(BfVfHier **vfHierPtr)
 
+    bint bfVfHierSave(const BfVfHier *vfHier, const char *path)
+    BfVfHier *bfVfHierLoad(const char *path)
+    BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier)

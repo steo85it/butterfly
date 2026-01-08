@@ -147,6 +147,19 @@ void bfVfHierDeinit(BfVfHier *vfHier);
 void bfVfHierDealloc(BfVfHier **vfHierPtr);
 void bfVfHierDeinitAndDealloc(BfVfHier **vfHierPtr);
 
+/* ============================================================
+ * I/O: save/load a VfHier to/from a single binary file.
+ *
+ * Notes:
+ *  - This stores ONLY the hierarchy (blocks, indices, matrices).
+ *  - trimesh/quadtree are NOT serialized.
+ *  - Loaded vfHier has vfHier->trimesh == NULL and vfHier->n set.
+ * ============================================================ */
+
+BfBool  bfVfHierSave(BfVfHier const *vfHier, char const *path);
+BfVfHier *bfVfHierLoad(char const *path);
+BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier);
+
 #ifdef __cplusplus
 }
 #endif

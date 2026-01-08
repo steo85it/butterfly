@@ -60,3 +60,4 @@ void bfVecRealDump(BfVecReal const *vecReal, char const *path);
 BfPerm *bfVecRealArgsort(BfVecReal const *vecReal);
 BfSize bfVecRealGetSize(BfVecReal const *vecReal);
 BfReal *bfVecRealGetDataPtr(BfVecReal *vecReal);
+BfReal const *bfVecRealGetDataConstPtr(BfVecReal const *vecReal);

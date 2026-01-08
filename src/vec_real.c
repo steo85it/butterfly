@@ -783,3 +783,7 @@ BfSize bfVecRealGetSize(BfVecReal const *vecReal) {
 BfReal *bfVecRealGetDataPtr(BfVecReal *vecReal) {
   return vecReal->data;
 }
+
+BfReal const *bfVecRealGetDataConstPtr(BfVecReal const *vecReal) {
+  return bfVecRealGetDataPtr((BfVecReal *)vecReal);
+}

@@ -279,14 +279,43 @@ butterfly_lib = library(
   install : true
 )
 
-install_subdir('include/bf', install_dir : 'include', install_tag : 'devel')
-
 butterfly_dep = declare_dependency(
   link_with : butterfly_lib,
   include_directories : butterfly_include_directories
 )
 
+install_subdir('include/bf', install_dir : 'include', install_tag : 'devel')
 pkg.generate(butterfly_lib)
+
+if get_option('python').enabled()
+  # PCC: absolute paths OK for now (but consider vendoring/copying later)
+  pcc_inc = include_directories('/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc')
+
+  pcc_src = files(
+    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/conductionQ.c',
+    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/conductionT.c',
+    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/tridag.c'
+  )
+
+  python3.extension_module(
+    'thermal_bf',
+    sources : [
+      'wrappers/python/thermal_bf.pyx',
+      pcc_src,
+    ],
+    include_directories : [
+      butterfly_inc,
+      pcc_inc,
+      # numpy include is already in numpy_dep, so not needed explicitly
+    ],
+    dependencies : [
+      butterfly_dep,
+      python3_dep,
+      numpy_dep,
+    ],
+    install : true,
+  )
+endif
 
 if get_option('examples').enabled()
   subdir('examples')
