@@ -29,6 +29,8 @@ typedef struct BfVfSparseLeaf {
   BfSizeArray  colInds;      /* global col indices */
   BfMatCsrReal *mat;         /* |rowInds| x |colInds| view-factor block */
   bool         colsAreLocal; /* true if mat->colind is 0..nA-1 (local) */
+  BfSize row_i0, row_i1;  /* perm-index interval (from meta.i0/meta.i1) */
+  BfSize col_j0, col_j1;  /* perm-index interval (optional, but handy) */
 } BfVfSparseLeaf;
 
 /* SVD leaf: explicit SVD sub-block with row/col index sets */
@@ -39,6 +41,12 @@ typedef struct BfVfSvdLeaf {
   BfSize      rank;          /* numerical rank */
   BfReal     *work;
   BfSize      workLen;
+  BfSize row_i0, row_i1;  /* perm-index interval (from meta.i0/meta.i1) */
+  BfSize col_j0, col_j1;  /* perm-index interval (optional, but handy) */
+  /* optional caches (do not own) */
+  BfMatDenseReal *U_cache;
+  BfMatDiagReal  *S_cache;
+  BfMatDenseReal *VT_cache;
 } BfVfSvdLeaf;
 
 /* Internal node: just a list of child blocks */
@@ -56,12 +64,20 @@ typedef struct BfVfHierBlock {
   } data;
 } BfVfHierBlock;
 
+/* Forward decl: apply plan is a private cache defined in vf_hier.c */
+typedef struct BfVfApplyPlan BfVfApplyPlan;
+
 /* Top-level hierarchical operator */
 typedef struct BfVfHier {
   BfTrimesh const *trimesh; /* mesh is owned externally */
   BfVfHierBlock   *root;    /* root block of the hierarchy */
   BfSize           n;       /* number of faces */
+
+  /* Cached apply plan (built lazily in vf_hier.c). */
+  BfVfApplyPlan   *applyPlan;
+  BfSize           applyTileSize;
 } BfVfHier;
+
 
 /* Stats for inspecting the hierarchy (for debugging / profiling) */
 typedef struct BfVfHierStats {
@@ -75,6 +91,9 @@ typedef struct BfVfHierStats {
   unsigned long long memBytesSvdEst;
   unsigned long long rankTotal;
 } BfVfHierStats;
+
+/* Forward decl: apply plan is a private cache defined in vf_hier.c */
+typedef struct BfVfApplyPlan BfVfApplyPlan;
 
 /* Construction */
 BfVfHier *bfVfHierNew(void);
@@ -141,6 +160,11 @@ BfVfHier *bfVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
 void bfVfHierApply(BfVfHier const *vfHier,
                    BfReal const   *x,
                    BfReal         *y);
+
+void bfVfHierApplyMany(BfVfHier const *vfHier,
+                       BfReal const   *X,   BfSize ldX,
+                       BfReal         *Y,   BfSize ldY,
+                       BfSize          nrhs);
 
 /* Destruction */
 void bfVfHierDeinit(BfVfHier *vfHier);

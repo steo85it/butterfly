@@ -808,15 +808,10 @@ cdef class MatDenseComplex(Mat):
 
 cdef class MatDenseReal(Mat):
     cdef BfMatDenseReal *matDenseReal
+    cdef object _owner   # keep NumPy array alive
 
     @staticmethod
     def from_ndarray(cnp.ndarray arr):
-        """
-        Wrap a 2D C-contiguous float64 NumPy array as a MatDenseReal
-        using bfMatDenseRealNewViewFromPtr.
-
-        The BF matrix *views* the NumPy data; it does not own it.
-        """
         assert arr.ndim == 2
         assert arr.flags.c_contiguous
         assert arr.dtype == np.float64
@@ -826,6 +821,7 @@ cdef class MatDenseReal(Mat):
         cdef BfReal[:, :] data = arr
 
         cdef MatDenseReal _ = MatDenseReal.__new__(MatDenseReal)
+        _._owner = arr                    # <<< critical
         _.matDenseReal = bfMatDenseRealNewViewFromPtr(m, n, &data[0, 0], n, 1)
         _.mat = bfMatDenseRealToMat(_.matDenseReal)
         return _
@@ -1415,18 +1411,19 @@ cdef class Vec:
 
 cdef class VecReal(Vec):
     cdef BfVecReal *vecReal
+    cdef object _owner
 
     @staticmethod
     def from_ndarray(arr):
-        # Make sure arr consists of packed 1D doubles
         assert arr.ndim == 1
         assert arr.flags.c_contiguous
-        assert arr.itemsize == 8
+        assert arr.dtype == np.float64
 
         cdef BfSize n = arr.shape[0]
         cdef BfReal[:] data = arr
 
         cdef VecReal _ = VecReal.__new__(VecReal)
+        _._owner = arr                   # <<< critical
         _.vecReal = bfVecRealNewViewFromPtr(n, &data[0], 1)
         _.vec = bfVecRealToVec(_.vecReal)
         return _
@@ -1516,6 +1513,10 @@ cdef class FormFactorMat(MatCsrReal):
         cdef FormFactorMat FF = FormFactorMat.__new__(FormFactorMat)
         FF.mat_csr_real = M.mat_csr_real
         FF.mat = M.mat
+
+        # STEAL: prevent M.__dealloc__ from freeing the pointers we just moved
+        M.mat_csr_real = NULL
+        M.mat = NULL
 
         return FF
 
@@ -1849,7 +1850,7 @@ cdef class FFSvdLeaf(FFBlock):
         """
         y[row_idx] += (U S V^T) @ x[col_idx]
         """
-        cdef cnp.ndarray xsub = x[self.col_idx]
+        cdef cnp.ndarray xsub = np.ascontiguousarray(x[self.col_idx], dtype=np.float64)
         cdef object ysub_vec = self.P @ xsub  # VecReal
         y[self.row_idx] += ysub_vec.to_array()
 
@@ -1972,7 +1973,7 @@ cdef FFBlock _build_ff_block(Trimesh tm,
             fflush(stdout)
         raise RuntimeError("hierarchical block size out of range")
 
-    cdef bint small = (mi <= leaf_max) or (mj <= leaf_max)
+    cdef bint small = (mi <= leaf_max) and (mj <= leaf_max)  # check if ok or restate OR
 
     cdef SizeArray I_inds
     cdef SizeArray J_inds
@@ -2209,34 +2210,8 @@ cdef class HierarchicalFormFactor:
         """Python-visible access to the root FFBlock."""
         return self.root
 
-    # cpdef cnp.ndarray apply(self, cnp.ndarray x):
-    #     cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
-    #     if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
-    #         raise ValueError(
-    #             f"x must be 1D of length {self.n}, got shape" # {x_flat.shape}"
-    #         )
-    #
-    #     cdef cnp.ndarray y = np.zeros_like(x_flat)
-    #     self.root.apply(x_flat, y)
-    #
-    #     if ff_debug:
-    #         import numpy as _np
-    #         nan_mask = _np.isnan(y)
-    #         inf_mask = _np.isinf(y)
-    #         num_nan = int(nan_mask.sum())
-    #         num_inf = int(inf_mask.sum())
-    #
-    #         if num_nan or num_inf:
-    #             nan_idx = _np.where(nan_mask)[0]
-    #             inf_idx = _np.where(inf_mask)[0]
-    #             print(f"[ff-debug] HierarchicalFormFactor.apply: "
-    #                   f"{num_nan} NaN, {num_inf} Inf entries in y")
-    #             print(f"[ff-debug] first NaN indices: {nan_idx[:20]}")
-    #             print(f"[ff-debug] first Inf indices: {inf_idx[:20]}")
-    #
-    #     return y
     cpdef cnp.ndarray apply(self, cnp.ndarray x):
-        cdef cnp.ndarray x_flat = np.asarray(x, dtype=np.float64)
+        cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
             raise ValueError(f"x must be 1D of length {self.n}, got shape") # {x_flat.shape}")
 
@@ -2403,6 +2378,19 @@ cdef class VfHier:
         self.vfHier = NULL
         self.n = 0
 
+    cdef inline void _apply_ptr(self,
+                                const double *x,
+                                double *y) noexcept nogil:
+        """
+        Low-level apply that assumes:
+          - self.vfHier != NULL
+          - x and y point to length-n buffers (n = self.n)
+          - y is already allocated
+        Runs nogil so bfVfHierApply can use OpenMP, and so callers can
+        call it from prange/nogil regions.
+        """
+        bfVfHierApply(self.vfHier, <BfReal*>x, <BfReal*>y)
+
     @staticmethod
     def from_trimesh(Trimesh tm,
                      double eta=2.0,
@@ -2505,25 +2493,19 @@ cdef class VfHier:
             "rank_total":        int(s.rankTotal),
         }
 
-
-    cpdef cnp.ndarray apply(self, cnp.ndarray x):
+    cpdef cnp.ndarray apply_vec(self, cnp.ndarray x):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
             raise ValueError(f"x must be 1D of length {self.n}")
 
         cdef cnp.ndarray y = np.zeros_like(x_flat)
-        bfVfHierApply(self.vfHier, <BfReal*>x_flat.data, <BfReal*>y.data)
+
+        with nogil:
+            self._apply_ptr(<const double *> x_flat.data,
+                            <double *> y.data)
         return y
 
     cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y):
-        """
-        Apply the hierarchical FF operator y = F @ x into a preallocated y.
-
-        - x: 1D ndarray of length n (will be coerced to float64 view)
-        - y: 1D ndarray of length n, float64 (output is written in-place)
-
-        This avoids repeated allocations in tight loops (thermal time stepping).
-        """
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
             raise ValueError(f"x must be 1D of length {self.n}")
@@ -2533,10 +2515,91 @@ cdef class VfHier:
         if y.ndim != 1 or y.shape[0] != self.n:
             raise ValueError(f"y must be 1D of length {self.n}")
 
-        bfVfHierApply(self.vfHier,
-                      <BfReal*>x_flat.data,
-                      <BfReal*>y.data)
+        with nogil:
+            self._apply_ptr(<const double *> x_flat.data,
+                            <double *> y.data)
         return y
+
+    cdef inline void _apply_mat_ptr(self,
+                                    const double *X,
+                                    double *Y,
+                                    BfSize k) noexcept nogil:
+        """
+        Apply to a block of k RHS stored column-major (Fortran):
+          X is (n, k) with leading dimension ldX = n
+          Y is (n, k) with leading dimension ldY = n
+        """
+        bfVfHierApplyMany(self.vfHier,
+                          <const BfReal *> X, <BfSize> self.n,
+                          <BfReal *> Y, <BfSize> self.n,
+                          k)
+
+    cpdef cnp.ndarray apply_mat(self, cnp.ndarray X):
+        """
+        Return Y = H * X for X shaped (n, k). Uses the C “many RHS” path.
+
+        Enforces Fortran order so the C side can treat X,Y as column-major
+        and call GEMM-friendly kernels.
+        """
+        cdef cnp.ndarray X2 = np.asarray(X, dtype=np.float64)
+        if X2.ndim != 2:
+            raise ValueError("apply_mat expects a 2D array (n, k)")
+        if X2.shape[0] != self.n:
+            raise ValueError(
+                f"X must have shape (n, k) with n={self.n}; got {(<object> X2).shape}"
+            )
+
+        # Force column-major for best kernels and simplest C contract
+        cdef cnp.ndarray Xf = np.asfortranarray(X2, dtype=np.float64)
+        cdef Py_ssize_t k_py = Xf.shape[1]
+        cdef BfSize k = <BfSize> k_py
+
+        cdef cnp.ndarray Yf = np.empty((self.n, k_py), dtype=np.float64, order='F')
+
+        with nogil:
+            self._apply_mat_ptr(<const double*> Xf.data,
+                                <double*>       Yf.data,
+                                k)
+        return Yf
+
+    cpdef apply_mat_inplace(self, cnp.ndarray X, cnp.ndarray Y):
+        """
+        In-place: Y[:] = H * X  (or Y += ... if your C function accumulates).
+        Requires Fortran-contiguous X and Y (or we copy X).
+        """
+        cdef cnp.ndarray X2 = np.asarray(X, dtype=np.float64)
+        if X2.ndim != 2 or X2.shape[0] != self.n:
+            raise ValueError(f"X must be 2D with shape (n,k), n={self.n}")
+        if Y.dtype != np.float64 or Y.ndim != 2 or Y.shape[0] != self.n:
+            raise ValueError("Y must be float64 2D with shape (n,k)")
+        if Y.shape[1] != X2.shape[1]:
+            raise ValueError("X and Y must have same number of RHS (k)")
+
+        cdef cnp.ndarray Xf = X2 if X2.flags.f_contiguous else np.asfortranarray(X2)
+        if not Y.flags.f_contiguous:
+            raise ValueError("Y must be Fortran-contiguous for apply_mat_inplace")
+
+        cdef BfSize k = <BfSize> Xf.shape[1]
+
+        with nogil:
+            self._apply_mat_ptr(<const double*> Xf.data,
+                                <double*>       Y.data,
+                                k)
+        return Y
+
+    cpdef apply(self, object x):
+        """
+        Convenience overload:
+          - 1D -> vector apply
+          - 2D -> block apply
+        """
+        cdef cnp.ndarray arr = np.asarray(x, dtype=np.float64)
+        if arr.ndim == 1:
+            return self.apply_vec(arr)  # make a private helper if you want
+        elif arr.ndim == 2:
+            return self.apply_mat(arr)
+        else:
+            raise ValueError("apply expects 1D or 2D array")
 
     @staticmethod
     cdef VfHier from_ptr(BfVfHier *ptr):
@@ -3512,3 +3575,33 @@ def compare_vf_compressions(path=None,
     #     "rel_err_old": rel_err_old,
     #     "rel_err_new": rel_err_new,
     # }
+
+cdef extern from "omp.h":
+    int omp_get_max_threads()
+    int omp_get_num_procs()
+    int omp_get_dynamic()
+    void omp_set_dynamic(int)
+    void omp_set_num_threads(int)
+
+def omp_info():
+    return {
+        "num_procs": omp_get_num_procs(),
+        "max_threads": omp_get_max_threads(),
+        "dynamic": omp_get_dynamic(),
+    }
+
+def omp_force(int n):
+    omp_set_dynamic(0)
+    omp_set_num_threads(n)
+
+from cython.parallel cimport prange
+# from libc.stdlib cimport malloc, free
+
+def omp_smoke(long n=200_000_000, int nt=0):
+    cdef double s = 0
+    cdef Py_ssize_t i
+    if nt <= 0:
+        nt = 0  # let OMP decide / env
+    for i in prange(n, schedule='static', num_threads=nt, nogil=True):
+            s += (i % 97) * 1e-12
+    return s

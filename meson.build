@@ -281,7 +281,8 @@ butterfly_lib = library(
 
 butterfly_dep = declare_dependency(
   link_with : butterfly_lib,
-  include_directories : butterfly_include_directories
+  include_directories : butterfly_include_directories,
+  dependencies : openmp_dep.found() ? [openmp_dep] : []
 )
 
 install_subdir('include/bf', install_dir : 'include', install_tag : 'devel')

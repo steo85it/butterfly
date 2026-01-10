@@ -177,7 +177,7 @@ static BfVec *MatVfHierMulVec(BfMat const *mat, BfVec const *vec) {
   BF_ASSERT(bfVecGetType(vec) == BF_TYPE_VEC_REAL);
 
   BfVecReal const *vxReal = bfVecConstToVecRealConst(vec);
-  BfReal const *xData = bfVecRealGetDataPtr(vxReal);
+  BfReal const *xData = bfVecRealGetDataConstPtr(vxReal);
 
   /* Allocate output vector y (real, size n) */
   BfVecReal *vyReal = bfVecRealNewWithValue(n, 0);

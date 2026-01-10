@@ -2,30 +2,31 @@
 # cython: boundscheck=False, wraparound=False, cdivision=True, nonecheck=False, initializedcheck=False
 
 import sys
+import time
 import numpy as np
 cimport numpy as cnp
+from cython.parallel cimport prange
 
 cnp.import_array()
 
 cdef extern from "thrmlLib.h":
     void conductionQ(int nz, double z[], double dt, double Qn, double Qnp1,
                      double T[], double ti[], double rhoc[],
-                     double emiss, double Fgeotherm, double *Fsurf)
+                     double emiss, double Fgeotherm, double *Fsurf) nogil
 
     void conductionT(int nz, double z[], double dt, double T[], double Tsurf,
                      double Tsurfp1, double ti[], double rhoc[],
-                     double Fgeotherm, double *Fsurf)
+                     double Fgeotherm, double *Fsurf) nogil
 
     double flux_noatm(double R, double decl, double latitude, double HA,
-                      double surfaceSlope, double azFac)
+                      double surfaceSlope, double azFac) nogil
 
     void heatflux_from_temperature(int nz, double z[], double T[],
-                                   double k[], double H[])
-
-    # void setgrid(int nz, double zmax, double zfac)
+                                   double k[], double H[]) nogil
 
     void tridag(double a[], double b[], double c[], double r[],
-                double T[], unsigned long nz)
+                double T[], unsigned long nz) nogil
+
 
 cdef double SIGSB = 5.6704e-8
 
@@ -103,7 +104,7 @@ cdef class BfPccThermalModel1D:
 
     def __cinit__(self,
                   double[::1] z,
-                  double[:, ::1] T0,
+                  object T0_in,
                   double[::1] ti,
                   double[::1] rhoc,
                   double[::1] emiss,
@@ -115,8 +116,8 @@ cdef class BfPccThermalModel1D:
             raise ValueError('bcond should be "Q" or "T"')
         self._bcond = bcond
 
-        # safer
-        T0 = np.ascontiguousarray(T0, dtype=np.float64)
+        cdef cnp.ndarray[cnp.double_t, ndim=2] T0_arr = np.ascontiguousarray(T0_in, dtype=np.float64)
+        cdef double[:, ::1] T0 = T0_arr
 
         self._num_faces = T0.shape[0]
         self._num_layers = z.size
@@ -171,10 +172,10 @@ cdef class BfPccThermalModel1D:
         if self.Qprev.ndim != 1 or self.Qprev.size != self.num_faces:
             raise ValueError('"Q0" should be a 1D array with length == T0.shape[0]')
 
-        self._Fsurf = np.empty_like(self._Qprev)
+        self._Fsurf = np.empty(self._num_faces, dtype=np.float64)
         self._Fsurf[:] = np.nan
 
-        self._T = T0
+        self._T = T0_arr   # assigns memoryview from ndarray (keeps base alive)
         cdef Py_ssize_t j
         for i in range(self._num_faces):
             for j in range(self._num_layers):
@@ -216,44 +217,45 @@ cdef class BfPccThermalModel1D:
         Xv = X_arr  # typed view
 
         if self._bcond == 'Q':
-            # Reject negative flux
             if (X_arr < 0).any():
                 raise RuntimeError('trying to step with negative fluxes')
 
-            for i in range(self._num_faces):
-                conductionQ(
-                    self._num_layers_interior,
-                    &z[0],
-                    dt,
-                    Qprev[i],
-                    Xv[i],
-                    &T[i, 0],
-                    &ti[0],
-                    &rhoc[0],
-                    emiss[i],
-                    Fgeotherm[i],
-                    &Fsurf[i])
+            # Parallel over faces (each face touches disjoint T[i,:], Fsurf[i], Qprev[i])
+            with nogil:
+                for i in prange(self._num_faces, schedule='static'):
+                    conductionQ(
+                        self._num_layers_interior,
+                        &z[0],
+                        dt,
+                        Qprev[i],
+                        Xv[i],
+                        &T[i, 0],
+                        &ti[0],
+                        &rhoc[0],
+                        emiss[i],
+                        Fgeotherm[i],
+                        &Fsurf[i])
 
-            # IMPORTANT: update Qprev in-place (do NOT rebind self._Qprev)
-            for i in range(self._num_faces):
-                Qprev[i] = Xv[i]
+                    # update Qprev per-face safely in same loop
+                    Qprev[i] = Xv[i]
 
         elif self._bcond == 'T':
             if (X_arr < 0).any():
                 raise RuntimeError('trying to step with negative input temps')
 
-            for i in range(self._num_faces):
-                conductionT(
-                    self._num_layers_interior,
-                    &z[0],
-                    dt,
-                    &T[i, 0],
-                    T[i, 0],   # previous surface T
-                    Xv[i],     # current surface T
-                    &ti[0],
-                    &rhoc[0],
-                    Fgeotherm[i],
-                    &Fsurf[i])
+            with nogil:
+                for i in prange(self._num_faces, schedule='static'):
+                    conductionT(
+                        self._num_layers_interior,
+                        &z[0],
+                        dt,
+                        &T[i, 0],
+                        T[i, 0],   # previous surface T
+                        Xv[i],     # current surface T
+                        &ti[0],
+                        &rhoc[0],
+                        Fgeotherm[i],
+                        &Fsurf[i])
 
         else:
             raise RuntimeError(f'got unexpected BC mode: "{self._bcond}"')
@@ -350,6 +352,13 @@ cdef inline int _zero(double[::1] v) nogil:
         v[k] = 0.0
     return 0
 
+cdef inline int _zero2(double[::1, :] A) nogil:
+    cdef Py_ssize_t i, j
+    for i in range(A.shape[0]):
+        for j in range(A.shape[1]):
+            A[i, j] = 0.0
+    return 0
+
 
 cpdef object run_thermal_series_with_bf(
     object ff_op,
@@ -405,6 +414,9 @@ cpdef object run_thermal_series_with_bf(
     Tsurf_all : (nt, Nfaces)
         Surface temperature at each time.
     """
+    import os
+    print("affinity:", len(os.sched_getaffinity(0)), sorted(os.sched_getaffinity(0))[:32])
+
     cdef Py_ssize_t nt = E_series.shape[0]
     cdef Py_ssize_t Nfaces = E_series.shape[1]
     cdef Py_ssize_t nz = z.shape[0]
@@ -557,6 +569,22 @@ cpdef object run_thermal_series_with_bf(
     cdef double[::1] res_long_view = res_long
     cdef double[::1] Q_view = Q
 
+    # --- many-RHS scratch (optional fast path) ---
+    cdef bint use_many = False
+    use_many = hasattr(ff_op, "apply_mat_inplace")
+
+    cdef cnp.ndarray[cnp.double_t, ndim=2] X2 = None
+    cdef cnp.ndarray[cnp.double_t, ndim=2] Y2 = None
+    cdef double[::1, :] X2_view
+    cdef double[::1, :] Y2_view
+
+    if use_many:
+        # Fortran order: (Nfaces, 2) with columns = RHS
+        X2 = np.empty((Nfaces, 2), dtype=np.float64, order='F')
+        Y2 = np.empty((Nfaces, 2), dtype=np.float64, order='F')
+        X2_view = X2
+        Y2_view = Y2
+
     cdef double[:, ::1] Tmat
 
     cdef double[::1] E_t_view
@@ -600,35 +628,65 @@ cpdef object run_thermal_series_with_bf(
         t_idx = 0
         E_t_view = E_view[t_idx, :]
 
-        # shortwave reflected
-        for i in range(Nfaces):
-            tmp_short_view[i] = E_t_view[i] + Qrefl_view[i]
-        _zero(res_short_view)
-        ff_op.apply_inplace(tmp_short, res_short)
-        if not np.isfinite(res_short).all():
-            raise RuntimeError("non-finite res_short from FF apply")
+        if use_many:
+            # Build 2 RHS columns:
+            #   col0 = shortwave input  = E + Qrefl
+            #   col1 = longwave input   = eps*sigma*T^4 + (1-eps)*QIR
+            for i in range(Nfaces):
+                X2_view[i, 0] = E_t_view[i] + Qrefl_view[i]
 
-        for i in range(Nfaces):
-            Qrefl_next_view[i] = rho * res_short_view[i]
-            if clamp and Qrefl_next_view[i] < 0.0:
-                Qrefl_next_view[i] = 0.0
+                val = emiss_view[i]*SIGSB*Tsurf_prev_view[i]*Tsurf_prev_view[i]* \
+                      Tsurf_prev_view[i]*Tsurf_prev_view[i] + \
+                      (1.0 - emiss_view[i]) * QIR_view[i]
+                X2_view[i, 1] = val
 
-        # longwave
-        for i in range(Nfaces):
-            val = emiss_view[i]*SIGSB*Tsurf_prev_view[i]*Tsurf_prev_view[i]* \
-                  Tsurf_prev_view[i]*Tsurf_prev_view[i] + \
-                  (1.0 - emiss_view[i]) * QIR_view[i]
-            tmp_long_view[i] = val
+            with nogil:
+                _zero2(Y2_view)
+            ff_op.apply_mat_inplace(X2, Y2)
 
-        _zero(res_long_view)
-        ff_op.apply_inplace(tmp_long, res_long)
-        if not np.isfinite(res_long).all():
-            raise RuntimeError("non-finite res_long from FF apply")
+            if not np.isfinite(Y2).all():
+                raise RuntimeError("non-finite Y2 from FF apply_mat_inplace")
 
-        for i in range(Nfaces):
-            QIR_next_view[i] = res_long_view[i]
-            if clamp and QIR_next_view[i] < 0.0:
-                QIR_next_view[i] = 0.0
+            # Unpack and clamp:
+            for i in range(Nfaces):
+                Qrefl_next_view[i] = rho * Y2_view[i, 0]
+                if clamp and Qrefl_next_view[i] < 0.0:
+                    Qrefl_next_view[i] = 0.0
+
+                QIR_next_view[i] = Y2_view[i, 1]
+                if clamp and QIR_next_view[i] < 0.0:
+                    QIR_next_view[i] = 0.0
+
+        else:
+            # shortwave reflected
+            for i in range(Nfaces):
+                tmp_short_view[i] = E_t_view[i] + Qrefl_view[i]
+            _zero(res_short_view)
+            ff_op.apply_inplace(tmp_short, res_short)
+            if not np.isfinite(res_short).all():
+                raise RuntimeError("non-finite res_short from FF apply")
+
+            for i in range(Nfaces):
+                Qrefl_next_view[i] = rho * res_short_view[i]
+                if clamp and Qrefl_next_view[i] < 0.0:
+                    Qrefl_next_view[i] = 0.0
+
+            # longwave
+            for i in range(Nfaces):
+                val = emiss_view[i]*SIGSB*Tsurf_prev_view[i]*Tsurf_prev_view[i]* \
+                      Tsurf_prev_view[i]*Tsurf_prev_view[i] + \
+                      (1.0 - emiss_view[i]) * QIR_view[i]
+                tmp_long_view[i] = val
+
+            _zero(res_long_view)
+            ff_op.apply_inplace(tmp_long, res_long)
+            if not np.isfinite(res_long).all():
+                raise RuntimeError("non-finite res_long from FF apply")
+
+            for i in range(Nfaces):
+                QIR_next_view[i] = res_long_view[i]
+                if clamp and QIR_next_view[i] < 0.0:
+                    QIR_next_view[i] = 0.0
 
         # net flux at t0
         for i in range(Nfaces):
@@ -694,36 +752,76 @@ cpdef object run_thermal_series_with_bf(
                 sys.stdout.flush()
 
             E_t_view = E_view[t_idx, :]
+            t0 = time.perf_counter()
 
-            # shortwave reflected
-            for i in range(Nfaces):
-                tmp_short_view[i] = E_t_view[i] + Qrefl_view[i]
-            _zero(res_short_view)
-            ff_op.apply_inplace(tmp_short, res_short)
-            if not np.isfinite(res_short).all():
-                raise RuntimeError("non-finite res_short from FF apply")
+            if use_many:
+                # Build 2 RHS columns:
+                #   col0 = shortwave input  = E + Qrefl
+                #   col1 = longwave input   = eps*sigma*T^4 + (1-eps)*QIR
+                for i in range(Nfaces):
+                    X2_view[i, 0] = E_t_view[i] + Qrefl_view[i]
 
-            for i in range(Nfaces):
-                Qrefl_next_view[i] = rho * res_short_view[i]
-                if clamp and Qrefl_next_view[i] < 0.0:
-                    Qrefl_next_view[i] = 0.0
+                    val = emiss_view[i] * SIGSB * Tsurf_prev_view[i] * Tsurf_prev_view[i] * \
+                          Tsurf_prev_view[i] * Tsurf_prev_view[i] + \
+                          (1.0 - emiss_view[i]) * QIR_view[i]
+                    X2_view[i, 1] = val
+                tA = time.perf_counter()
 
-            # longwave
-            for i in range(Nfaces):
-                val = emiss_view[i]*SIGSB*Tsurf_prev_view[i]*Tsurf_prev_view[i]* \
-                      Tsurf_prev_view[i]*Tsurf_prev_view[i] + \
-                      (1.0 - emiss_view[i]) * QIR_view[i]
-                tmp_long_view[i] = val
+                with nogil:
+                    _zero2(Y2_view)
+                ff_op.apply_mat_inplace(X2, Y2)
 
-            _zero(res_long_view)
-            ff_op.apply_inplace(tmp_long, res_long)
-            if not np.isfinite(res_long).all():
-                raise RuntimeError("non-finite res_long from FF apply")
+                if not np.isfinite(Y2).all():
+                    raise RuntimeError("non-finite Y2 from FF apply_mat_inplace")
+                tB = time.perf_counter()
 
-            for i in range(Nfaces):
-                QIR_next_view[i] = res_long_view[i]
-                if clamp and QIR_next_view[i] < 0.0:
-                    QIR_next_view[i] = 0.0
+                # Unpack and clamp:
+                for i in range(Nfaces):
+                    Qrefl_next_view[i] = rho * Y2_view[i, 0]
+                    if clamp and Qrefl_next_view[i] < 0.0:
+                        Qrefl_next_view[i] = 0.0
+
+                    QIR_next_view[i] = Y2_view[i, 1]
+                    if clamp and QIR_next_view[i] < 0.0:
+                        QIR_next_view[i] = 0.0
+                tC = time.perf_counter()
+                tD = time.perf_counter()
+                tE = time.perf_counter()
+            else:
+                # shortwave reflected
+                for i in range(Nfaces):
+                    tmp_short_view[i] = E_t_view[i] + Qrefl_view[i]
+                tA = time.perf_counter()
+                _zero(res_short_view)
+                ff_op.apply_inplace(tmp_short, res_short)
+                if not np.isfinite(res_short).all():
+                    raise RuntimeError("non-finite res_short from FF apply")
+                tB = time.perf_counter()
+
+                for i in range(Nfaces):
+                    Qrefl_next_view[i] = rho * res_short_view[i]
+                    if clamp and Qrefl_next_view[i] < 0.0:
+                        Qrefl_next_view[i] = 0.0
+                tC = time.perf_counter()
+
+                # longwave
+                for i in range(Nfaces):
+                    val = emiss_view[i]*SIGSB*Tsurf_prev_view[i]*Tsurf_prev_view[i]* \
+                          Tsurf_prev_view[i]*Tsurf_prev_view[i] + \
+                          (1.0 - emiss_view[i]) * QIR_view[i]
+                    tmp_long_view[i] = val
+                tD = time.perf_counter()
+
+                _zero(res_long_view)
+                ff_op.apply_inplace(tmp_long, res_long)
+                tE = time.perf_counter()
+                if not np.isfinite(res_long).all():
+                    raise RuntimeError("non-finite res_long from FF apply")
+
+                for i in range(Nfaces):
+                    QIR_next_view[i] = res_long_view[i]
+                    if clamp and QIR_next_view[i] < 0.0:
+                        QIR_next_view[i] = 0.0
 
             # net flux at t_idx
             for i in range(Nfaces):
@@ -738,9 +836,11 @@ cpdef object run_thermal_series_with_bf(
                 dt_step = dt_scalar
             else:
                 dt_step = dt_view[t_idx - 1]
+            tF = time.perf_counter()
 
             # conduction step advances from previous endpoint flux (stored in model._Qprev) to current Q
             model.step(dt_step, Q)
+            tG = time.perf_counter()
 
             # shift radiative states for next step
             for i in range(Nfaces):
@@ -755,6 +855,7 @@ cpdef object run_thermal_series_with_bf(
 
             # store and diagnostics
             Tmat = model._T
+            tH = time.perf_counter()
 
             if return_diagnostics:
                 for j in range(nz):
@@ -787,6 +888,10 @@ cpdef object run_thermal_series_with_bf(
                         tbar_min_view[j] = tbar_z_view[j]
                     if tbar_z_view[j] > tbar_max_view[j]:
                         tbar_max_view[j] = tbar_z_view[j]
+
+            print(f"[timing] prepS={tA - t0:.4f} applyS={tB - tA:.4f} postS={tC - tB:.4f} "
+                  f"prepL={tD - tC:.4f} applyL={tE - tD:.4f} postL={tF - tE:.4f} "
+                  f"cond={tG - tF:.4f} store={tH - tG:.4f} total={tH - t0:.4f}")
 
         # end of cycle: write mu_z, amp_z, drift
         if return_diagnostics:

@@ -56,10 +56,18 @@ cdef extern from "bf/vf_hier.h":
 
     void bfVfHierApply(const BfVfHier *vfHier,
                        const BfReal *x,
-                       BfReal *y)
+                       BfReal *y) nogil
+
+    void bfVfHierApplyMany(const BfVfHier *vfHier,
+                           const BfReal   *X, BfSize ldX,
+                           BfReal         *Y, BfSize ldY,
+                           BfSize nrhs) nogil
+
+    BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier)
 
     void bfVfHierDeinitAndDealloc(BfVfHier **vfHierPtr)
 
     bint bfVfHierSave(const BfVfHier *vfHier, const char *path)
     BfVfHier *bfVfHierLoad(const char *path)
     BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier)
+
