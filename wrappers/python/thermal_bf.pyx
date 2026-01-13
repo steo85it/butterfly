@@ -529,10 +529,29 @@ cpdef object run_thermal_series_with_bf(
     cdef cnp.ndarray[cnp.double_t, ndim=1] drift_max = None
     cdef cnp.ndarray[cnp.double_t, ndim=2] Tbar_last = None
 
+    # --- NEW: per-step radiative / flux diagnostics (last cycle only) ---
+    cdef cnp.ndarray[cnp.double_t, ndim=1] sumE_t = None          # sum(E_dir)
+    cdef cnp.ndarray[cnp.double_t, ndim=1] sumQrefl_t = None       # sum(clamped Qrefl_next)
+    cdef cnp.ndarray[cnp.double_t, ndim=1] sumQIR_t = None         # sum(clamped QIR_next)
+    cdef cnp.ndarray[cnp.double_t, ndim=1] sumQnet_t = None        # sum(Q) where Q is what goes into conduction
+    cdef cnp.ndarray[cnp.double_t, ndim=1] minReflRaw_t = None     # min(raw rho*FF(...)) before clamp
+    cdef cnp.ndarray[cnp.double_t, ndim=1] minIRRaw_t = None       # min(raw FF(...)) before clamp
+    cdef cnp.ndarray[cnp.longlong_t, ndim=1] negReflRaw_t = None   # count(raw refl < 0) before clamp
+    cdef cnp.ndarray[cnp.longlong_t, ndim=1] negIRRaw_t = None     # count(raw IR < 0) before clamp
+
     cdef double[:, ::1] mu_z_view
     cdef double[:, ::1] amp_z_view
     cdef double[::1] drift_max_view
     cdef double[:, ::1] Tbar_last_view
+
+    cdef double[::1] sumE_t_view
+    cdef double[::1] sumQrefl_t_view
+    cdef double[::1] sumQIR_t_view
+    cdef double[::1] sumQnet_t_view
+    cdef double[::1] minReflRaw_t_view
+    cdef double[::1] minIRRaw_t_view
+    cdef long long[::1] negReflRaw_t_view
+    cdef long long[::1] negIRRaw_t_view
 
     if return_diagnostics:
         mu_z = np.empty((num_reps, nz), dtype=np.float64)
@@ -541,10 +560,29 @@ cpdef object run_thermal_series_with_bf(
         drift_max[:] = np.nan
         Tbar_last = np.empty((nt, nz), dtype=np.float64)  # only last cycle’s Tbar(t,z)
 
+        # NEW: last cycle per-step diagnostics (length nt)
+        sumE_t = np.empty(nt, dtype=np.float64);        sumE_t[:] = np.nan
+        sumQrefl_t = np.empty(nt, dtype=np.float64);    sumQrefl_t[:] = np.nan
+        sumQIR_t = np.empty(nt, dtype=np.float64);      sumQIR_t[:] = np.nan
+        sumQnet_t = np.empty(nt, dtype=np.float64);     sumQnet_t[:] = np.nan
+        minReflRaw_t = np.empty(nt, dtype=np.float64);  minReflRaw_t[:] = np.nan
+        minIRRaw_t = np.empty(nt, dtype=np.float64);    minIRRaw_t[:] = np.nan
+        negReflRaw_t = np.empty(nt, dtype=np.int64);    negReflRaw_t[:] = 0
+        negIRRaw_t = np.empty(nt, dtype=np.int64);      negIRRaw_t[:] = 0
+
         mu_z_view = mu_z
         amp_z_view = amp_z
         drift_max_view = drift_max
         Tbar_last_view = Tbar_last
+
+        sumE_t_view = sumE_t
+        sumQrefl_t_view = sumQrefl_t
+        sumQIR_t_view = sumQIR_t
+        sumQnet_t_view = sumQnet_t
+        minReflRaw_t_view = minReflRaw_t
+        minIRRaw_t_view = minIRRaw_t
+        negReflRaw_t_view = negReflRaw_t
+        negIRRaw_t_view = negIRRaw_t
 
     # --- working arrays (all length Nfaces) ---
     cdef cnp.ndarray[cnp.double_t, ndim=1] Qrefl = np.zeros(Nfaces, dtype=np.float64)
@@ -613,6 +651,12 @@ cpdef object run_thermal_series_with_bf(
     cdef Py_ssize_t rep, out_t
     cdef double mu_j, dtmp, dmax
 
+    # NEW: step diagnostic accumulators (reused each t_idx)
+    cdef double accE, accQrefl, accQIR, accQnet
+    cdef double raw_refl, raw_ir
+    cdef double min_raw_refl, min_raw_ir
+    cdef long long neg_raw_refl, neg_raw_ir
+
     for rep in range(num_reps):
 
         # init cycle accumulators
@@ -647,13 +691,30 @@ cpdef object run_thermal_series_with_bf(
             if not np.isfinite(Y2).all():
                 raise RuntimeError("non-finite Y2 from FF apply_mat_inplace")
 
-            # Unpack and clamp:
+            # Unpack and clamp (+ NEW: raw negativity/min before clamp)
+            min_raw_refl = 1.0e300
+            min_raw_ir = 1.0e300
+            neg_raw_refl = 0
+            neg_raw_ir = 0
+
             for i in range(Nfaces):
-                Qrefl_next_view[i] = rho * Y2_view[i, 0]
+                raw_refl = rho * Y2_view[i, 0]
+                raw_ir = Y2_view[i, 1]
+
+                if raw_refl < min_raw_refl:
+                    min_raw_refl = raw_refl
+                if raw_ir < min_raw_ir:
+                    min_raw_ir = raw_ir
+                if raw_refl < 0.0:
+                    neg_raw_refl += 1
+                if raw_ir < 0.0:
+                    neg_raw_ir += 1
+
+                Qrefl_next_view[i] = raw_refl
                 if clamp and Qrefl_next_view[i] < 0.0:
                     Qrefl_next_view[i] = 0.0
 
-                QIR_next_view[i] = Y2_view[i, 1]
+                QIR_next_view[i] = raw_ir
                 if clamp and QIR_next_view[i] < 0.0:
                     QIR_next_view[i] = 0.0
 
@@ -666,8 +727,16 @@ cpdef object run_thermal_series_with_bf(
             if not np.isfinite(res_short).all():
                 raise RuntimeError("non-finite res_short from FF apply")
 
+            min_raw_refl = 1.0e300
+            neg_raw_refl = 0
             for i in range(Nfaces):
-                Qrefl_next_view[i] = rho * res_short_view[i]
+                raw_refl = rho * res_short_view[i]
+                if raw_refl < min_raw_refl:
+                    min_raw_refl = raw_refl
+                if raw_refl < 0.0:
+                    neg_raw_refl += 1
+
+                Qrefl_next_view[i] = raw_refl
                 if clamp and Qrefl_next_view[i] < 0.0:
                     Qrefl_next_view[i] = 0.0
 
@@ -683,20 +752,50 @@ cpdef object run_thermal_series_with_bf(
             if not np.isfinite(res_long).all():
                 raise RuntimeError("non-finite res_long from FF apply")
 
+            min_raw_ir = 1.0e300
+            neg_raw_ir = 0
             for i in range(Nfaces):
-                QIR_next_view[i] = res_long_view[i]
+                raw_ir = res_long_view[i]
+                if raw_ir < min_raw_ir:
+                    min_raw_ir = raw_ir
+                if raw_ir < 0.0:
+                    neg_raw_ir += 1
+
+                QIR_next_view[i] = raw_ir
                 if clamp and QIR_next_view[i] < 0.0:
                     QIR_next_view[i] = 0.0
 
-        # net flux at t0
+        # ---- compute net flux Q at t0 and (optionally) write step diagnostics ----
+        if return_diagnostics and rep == num_reps - 1:
+            accE = 0.0
+            accQrefl = 0.0
+            accQIR = 0.0
+            accQnet = 0.0
+
         for i in range(Nfaces):
-            val = (1.0 - rho)*(E_t_view[i] + Qrefl_next_view[i]) \
-                  + emiss_view[i]*QIR_next_view[i]
+            val = (1.0 - rho)*(E_t_view[i] + Qrefl_next_view[i]) + emiss_view[i]*QIR_next_view[i]
             if clamp and val < 0.0:
                 val = 0.0
             Q_view[i] = val
-            # Make model's "previous" flux consistent for the first real step
             Qprev_model[i] = val
+
+            if return_diagnostics and rep == num_reps - 1:
+                accE += E_t_view[i]
+                accQrefl += Qrefl_next_view[i]
+                accQIR += QIR_next_view[i]
+                accQnet += val
+
+        if return_diagnostics and rep == num_reps - 1:
+            sumE_t_view[0] = accE
+            sumQrefl_t_view[0] = accQrefl
+            sumQIR_t_view[0] = accQIR
+            sumQnet_t_view[0] = accQnet
+
+            minReflRaw_t_view[0] = min_raw_refl
+            minIRRaw_t_view[0] = min_raw_ir
+            negReflRaw_t_view[0] = neg_raw_refl
+            negIRRaw_t_view[0] = neg_raw_ir
+
 
         # shift radiative states for next step
         for i in range(Nfaces):
@@ -775,15 +874,33 @@ cpdef object run_thermal_series_with_bf(
                     raise RuntimeError("non-finite Y2 from FF apply_mat_inplace")
                 tB = time.perf_counter()
 
-                # Unpack and clamp:
+                # Unpack + raw stats + clamp:
+                min_raw_refl = 1.0e300
+                min_raw_ir = 1.0e300
+                neg_raw_refl = 0
+                neg_raw_ir = 0
+
                 for i in range(Nfaces):
-                    Qrefl_next_view[i] = rho * Y2_view[i, 0]
+                    raw_refl = rho * Y2_view[i, 0]
+                    raw_ir = Y2_view[i, 1]
+
+                    if raw_refl < min_raw_refl:
+                        min_raw_refl = raw_refl
+                    if raw_ir < min_raw_ir:
+                        min_raw_ir = raw_ir
+                    if raw_refl < 0.0:
+                        neg_raw_refl += 1
+                    if raw_ir < 0.0:
+                        neg_raw_ir += 1
+
+                    Qrefl_next_view[i] = raw_refl
                     if clamp and Qrefl_next_view[i] < 0.0:
                         Qrefl_next_view[i] = 0.0
 
-                    QIR_next_view[i] = Y2_view[i, 1]
+                    QIR_next_view[i] = raw_ir
                     if clamp and QIR_next_view[i] < 0.0:
                         QIR_next_view[i] = 0.0
+
                 tC = time.perf_counter()
                 tD = time.perf_counter()
                 tE = time.perf_counter()
@@ -798,8 +915,16 @@ cpdef object run_thermal_series_with_bf(
                     raise RuntimeError("non-finite res_short from FF apply")
                 tB = time.perf_counter()
 
+                min_raw_refl = 1.0e300
+                neg_raw_refl = 0
                 for i in range(Nfaces):
-                    Qrefl_next_view[i] = rho * res_short_view[i]
+                    raw_refl = rho * res_short_view[i]
+                    if raw_refl < min_raw_refl:
+                        min_raw_refl = raw_refl
+                    if raw_refl < 0.0:
+                        neg_raw_refl += 1
+
+                    Qrefl_next_view[i] = raw_refl
                     if clamp and Qrefl_next_view[i] < 0.0:
                         Qrefl_next_view[i] = 0.0
                 tC = time.perf_counter()
@@ -818,18 +943,48 @@ cpdef object run_thermal_series_with_bf(
                 if not np.isfinite(res_long).all():
                     raise RuntimeError("non-finite res_long from FF apply")
 
+                min_raw_ir = 1.0e300
+                neg_raw_ir = 0
                 for i in range(Nfaces):
-                    QIR_next_view[i] = res_long_view[i]
+                    raw_ir = res_long_view[i]
+                    if raw_ir < min_raw_ir:
+                        min_raw_ir = raw_ir
+                    if raw_ir < 0.0:
+                        neg_raw_ir += 1
+
+                    QIR_next_view[i] = raw_ir
                     if clamp and QIR_next_view[i] < 0.0:
                         QIR_next_view[i] = 0.0
 
-            # net flux at t_idx
+            # ---- compute net flux Q at this t_idx and (optionally) write step diagnostics ----
+            if return_diagnostics and rep == num_reps - 1:
+                accE = 0.0
+                accQrefl = 0.0
+                accQIR = 0.0
+                accQnet = 0.0
+
             for i in range(Nfaces):
-                val = (1.0 - rho)*(E_t_view[i] + Qrefl_next_view[i]) \
-                      + emiss_view[i]*QIR_next_view[i]
+                val = (1.0 - rho)*(E_t_view[i] + Qrefl_next_view[i]) + emiss_view[i]*QIR_next_view[i]
                 if clamp and val < 0.0:
                     val = 0.0
                 Q_view[i] = val
+
+                if return_diagnostics and rep == num_reps - 1:
+                    accE += E_t_view[i]
+                    accQrefl += Qrefl_next_view[i]
+                    accQIR += QIR_next_view[i]
+                    accQnet += val
+
+            if return_diagnostics and rep == num_reps - 1:
+                sumE_t_view[t_idx] = accE
+                sumQrefl_t_view[t_idx] = accQrefl
+                sumQIR_t_view[t_idx] = accQIR
+                sumQnet_t_view[t_idx] = accQnet
+
+                minReflRaw_t_view[t_idx] = min_raw_refl
+                minIRRaw_t_view[t_idx] = min_raw_ir
+                negReflRaw_t_view[t_idx] = neg_raw_refl
+                negIRRaw_t_view[t_idx] = neg_raw_ir
 
             # dt for interval [t_idx-1, t_idx]
             if dt_is_scalar:
@@ -837,6 +992,10 @@ cpdef object run_thermal_series_with_bf(
             else:
                 dt_step = dt_view[t_idx - 1]
             tF = time.perf_counter()
+
+            if return_diagnostics and rep == num_reps - 1:
+                if not np.isfinite(Q).all():
+                    raise RuntimeError("non-finite Q before conduction")
 
             # conduction step advances from previous endpoint flux (stored in model._Qprev) to current Q
             model.step(dt_step, Q)
@@ -922,6 +1081,16 @@ cpdef object run_thermal_series_with_bf(
         "amp_z": amp_z,
         "drift_max": drift_max,
         "Tbar_last": Tbar_last,
+
+        # NEW:
+        "sumE_t": sumE_t,
+        "sumQrefl_t": sumQrefl_t,
+        "sumQIR_t": sumQIR_t,
+        "sumQnet_t": sumQnet_t,
+        "minReflRaw_t": minReflRaw_t,
+        "minIRRaw_t": minIRRaw_t,
+        "negReflRaw_t": negReflRaw_t,
+        "negIRRaw_t": negIRRaw_t,
     }
     return T_all, Tsurf_all, diag
 

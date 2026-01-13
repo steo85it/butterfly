@@ -91,6 +91,21 @@ static double g_vf_csr_slice_time    = 0.0;  /* bfMatCsrRealNewSubmatrixFromIndi
 static double g_vf_leaf_map_time     = 0.0;  /* build childRowFaces + global→parent maps */
 #endif
 
+/* ------------------------------------------------------------
+ * Optional lightweight logging for vf_hier.
+ * If BF_VF_HIER_LOG is not defined as a macro, the compiler will
+ * assume it's an external function -> link error.
+ * ------------------------------------------------------------ */
+#ifndef BF_VF_HIER_ENABLE_LOG
+#define BF_VF_HIER_ENABLE_LOG 0
+#endif
+
+#if BF_VF_HIER_ENABLE_LOG
+  #define BF_VF_HIER_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+  #define BF_VF_HIER_LOG(...) ((void)0)
+#endif
+
 /* Approximate max nnz (= mi*mj) for a block we are willing to
  * raytrace in one shot and then reuse via CSR slicing.
  *
@@ -1064,6 +1079,12 @@ static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
     bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
                         &truncSpec, backend);
 
+  if (!truncated) {
+    /* Not an error by itself, but often indicates “k==maxRank”.
+       With the new gates in linalg.c, this is usually safe. */
+    BF_VF_HIER_LOG("SVD leaf: not truncated (k hit maxRank or tol loose)\n");
+  }
+
   #if BF_VF_HIER_TIME_SVD
     double t_svd_end = bfVfHierNowSecs();
     #pragma omp atomic
@@ -1135,6 +1156,9 @@ static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
   block->data.svd.rank    = k;
   block->data.svd.work    = NULL;
   block->data.svd.workLen = 0;
+  block->data.svd.U_cache  = NULL;
+  block->data.svd.S_cache  = NULL;
+  block->data.svd.VT_cache = NULL;
 
   bfMatCsrRealDeinitAndDealloc(&Acsr);
 
@@ -1680,6 +1704,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
    Planned/tiled apply assumes leaf local row i corresponds to perm index (row_i0 + i). */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1701,6 +1727,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     /* MUST be tree index range, not global face ids */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1731,6 +1759,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     /* MUST be tree index range, not global face ids */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1752,6 +1782,12 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
       bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
                         &truncSpec, backend);
 
+  if (!truncated) {
+    /* Not an error by itself, but often indicates “k==maxRank”.
+       With the new gates in linalg.c, this is usually safe. */
+    BF_VF_HIER_LOG("SVD leaf: not truncated (k hit maxRank or tol loose)\n");
+  }
+
   #if BF_VF_HIER_TIME_SVD
     double t_svd_end = bfVfHierNowSecs();
     #pragma omp atomic
@@ -1771,6 +1807,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     /* MUST be tree index range, not global face ids */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1795,6 +1833,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     /* MUST be tree index range, not global face ids */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1817,6 +1857,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     /* MUST be tree index range, not global face ids */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -1837,6 +1879,9 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
   block->data.svd.rank    = k;
   block->data.svd.work    = NULL;
   block->data.svd.workLen = 0;
+  block->data.svd.U_cache  = NULL;
+  block->data.svd.S_cache  = NULL;
+  block->data.svd.VT_cache = NULL;
 
   /* rowInds/colInds are now owned by the SVD leaf; don't deinit them here */
 
@@ -1844,6 +1889,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
 //  bfMatDelete(&A_dense);
   block->data.svd.row_i0 = meta->i0;
   block->data.svd.row_i1 = meta->i1;
+  block->data.svd.col_j0 = meta->j0;
+  block->data.svd.col_j1 = meta->j1;
   return block;
 }
 
@@ -2286,6 +2333,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     block->data.sparse.colsAreLocal = BF_TRUE;
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2304,6 +2353,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     block->data.sparse.colsAreLocal = BF_TRUE;
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2319,6 +2370,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     block->data.sparse.colsAreLocal = BF_TRUE;
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2350,6 +2403,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     block->data.sparse.colsAreLocal = BF_TRUE;
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2374,6 +2429,12 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
       bfGetTruncatedSvd(bfMatCsrRealToMat(Acsr), &U, &S, &VT,
                         &truncSpec, backend);
 
+  if (!truncated) {
+    /* Not an error by itself, but often indicates “k==maxRank”.
+       With the new gates in linalg.c, this is usually safe. */
+    BF_VF_HIER_LOG("SVD leaf: not truncated (k hit maxRank or tol loose)\n");
+  }
+
 #if BF_VF_HIER_TIME_SVD
   double t_svd_end = bfVfHierNowSecs();
   #pragma omp atomic
@@ -2394,6 +2455,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     block->data.sparse.colsAreLocal = BF_TRUE;
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2417,6 +2480,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     bfMatDelete(&VT);
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2440,6 +2505,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     bfMatDelete(&VT);
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
+    block->data.sparse.col_j0 = meta->j0;
+    block->data.sparse.col_j1 = meta->j1;
     return block;
   }
 
@@ -2460,6 +2527,9 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   block->data.svd.rank    = k;
   block->data.svd.work    = NULL;
   block->data.svd.workLen = 0;
+  block->data.svd.U_cache  = NULL;
+  block->data.svd.S_cache  = NULL;
+  block->data.svd.VT_cache = NULL;
 
 #if BF_VF_HIER_DEBUG_SVD_FILTER
   g_svd_accept++;
@@ -2468,6 +2538,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   bfMatCsrRealDeinitAndDealloc(&Acsr);
   block->data.svd.row_i0 = meta->i0;
   block->data.svd.row_i1 = meta->i1;
+  block->data.svd.col_j0 = meta->j0;
+  block->data.svd.col_j1 = meta->j1;
   return block;
 }
 
@@ -3148,7 +3220,7 @@ static BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
 
 #define BF_VFHIER_MAGIC "BFVFHIER"
 #define BF_VFHIER_MAGIC_LEN 7
-#define BF_VFHIER_VERSION 1u
+#define BF_VFHIER_VERSION 2u
 
 static BfBool write_bytes(FILE *fp, void const *buf, size_t n) {
   return fwrite(buf, 1, n, fp) == n;
@@ -3375,6 +3447,8 @@ static BfBool write_block(FILE *fp, BfVfHierBlock const *block) {
 
     if (!write_u64(fp, (uint64_t)leaf->row_i0)) return BF_FALSE;
     if (!write_u64(fp, (uint64_t)leaf->row_i1)) return BF_FALSE;
+    if (!write_u64(fp, (uint64_t)leaf->col_j0)) return BF_FALSE;
+    if (!write_u64(fp, (uint64_t)leaf->col_j1)) return BF_FALSE;
 
     return BF_TRUE;
   }
@@ -3396,6 +3470,8 @@ static BfBool write_block(FILE *fp, BfVfHierBlock const *block) {
 
     if (!write_u64(fp, (uint64_t)leaf->row_i0)) return BF_FALSE;
     if (!write_u64(fp, (uint64_t)leaf->row_i1)) return BF_FALSE;
+    if (!write_u64(fp, (uint64_t)leaf->col_j0)) return BF_FALSE;
+    if (!write_u64(fp, (uint64_t)leaf->col_j1)) return BF_FALSE;
 
     return BF_TRUE;
   }
@@ -3435,11 +3511,15 @@ static BfVfHierBlock *read_block(FILE *fp) {
     block->data.sparse.mat = read_csr(fp);
     if (block->data.sparse.mat == NULL) goto fail;
 
-    uint64_t i0_64, i1_64;
+    uint64_t i0_64, i1_64, j0_64, j1_64;
     if (!read_u64(fp, &i0_64)) goto fail;
     if (!read_u64(fp, &i1_64)) goto fail;
     block->data.sparse.row_i0 = (BfSize)i0_64;
     block->data.sparse.row_i1 = (BfSize)i1_64;
+    if (!read_u64(fp, &j0_64)) goto fail;
+    if (!read_u64(fp, &j1_64)) goto fail;
+    block->data.sparse.col_j0 = (BfSize)j0_64;
+    block->data.sparse.col_j1 = (BfSize)j1_64;
 
     return block;
   }
@@ -3473,11 +3553,15 @@ static BfVfHierBlock *read_block(FILE *fp) {
     block->data.svd.work = NULL;
     block->data.svd.workLen = 0;
 
-    uint64_t i0_64, i1_64;
+    uint64_t i0_64, i1_64, j0_64, j1_64;
     if (!read_u64(fp, &i0_64)) goto fail;
     if (!read_u64(fp, &i1_64)) goto fail;
     block->data.svd.row_i0 = (BfSize)i0_64;
     block->data.svd.row_i1 = (BfSize)i1_64;
+    if (!read_u64(fp, &j0_64)) goto fail;
+    if (!read_u64(fp, &j1_64)) goto fail;
+    block->data.svd.col_j0 = (BfSize)j0_64;
+    block->data.svd.col_j1 = (BfSize)j1_64;
 
     return block;
   }
@@ -3704,6 +3788,114 @@ static void collect_leaf_blocks(BfVfHierBlock const *block, BfPtrArray *out) {
   }
 }
 
+/* Count leaf blocks (sparse+svd) without allocating a BfPtrArray.
+ *
+ * NOTE: bfInitPtrArray(&arr, 0) is *not* valid in this codebase because
+ * extendPtrArray() asserts new_capacity > arr->capacity and doubling 0 stays 0.
+ */
+static BfSize count_leaf_blocks(BfVfHierBlock const *block) {
+  if (!block) return 0;
+
+  switch (block->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE:
+  case BF_VF_HIER_BLOCK_SVD:
+    return 1;
+
+  case BF_VF_HIER_BLOCK_NODE: {
+    BfSize cnt = 0;
+    for (BfSize i = 0; i < bfPtrArraySize(&block->data.node.children); ++i) {
+      BfVfHierBlock *child = bfPtrArrayGet(&block->data.node.children, i);
+      cnt += count_leaf_blocks(child);
+    }
+    return cnt;
+  }
+
+  default:
+    return 0;
+  }
+}
+
+/* -------- leaf block dump (for plotting/debug) -------- */
+BfSize bfVfHierGetNumLeafBlocks(BfVfHier const *vfHier) {
+  BF_ASSERT(vfHier != NULL);
+  BF_ASSERT(vfHier->root != NULL);
+
+  /* Count directly (no temporary ptr-array). */
+  return count_leaf_blocks(vfHier->root);
+}
+
+void bfVfHierDumpLeafBlocks(
+    BfVfHier const *vfHier,
+    BfSize *row_i0, BfSize *row_i1,
+    BfSize *col_j0, BfSize *col_j1,
+    uint8_t *kind,
+    BfSize *rank,
+    unsigned long long *nnz
+) {
+  BF_ASSERT(vfHier != NULL);
+  BF_ASSERT(vfHier->root != NULL);
+  BF_ASSERT(row_i0 != NULL && row_i1 != NULL);
+  BF_ASSERT(col_j0 != NULL && col_j1 != NULL);
+  BF_ASSERT(kind != NULL);
+  /* rank and nnz may be NULL */
+
+  BfPtrArray leaves;
+  /* Pre-size to avoid repeated reallocations and avoid invalid cap=0. */
+  BfSize n_est = count_leaf_blocks(vfHier->root);
+  bfInitPtrArray(&leaves, n_est > 0 ? n_est : 16);
+
+  collect_leaf_blocks(vfHier->root, &leaves);
+
+  BfSize n = (BfSize)bfPtrArraySize(&leaves);
+
+  for (BfSize k = 0; k < n; ++k) {
+    BfVfHierBlock const *leaf = (BfVfHierBlock const *)bfPtrArrayGet(&leaves, k);
+
+    /* leaf must be SPARSE or SVD */
+    if (leaf->kind == BF_VF_HIER_BLOCK_SPARSE) {
+      row_i0[k] = leaf->data.sparse.row_i0;
+      row_i1[k] = leaf->data.sparse.row_i1;
+      col_j0[k] = leaf->data.sparse.col_j0;
+      col_j1[k] = leaf->data.sparse.col_j1;
+      kind[k]   = (uint8_t)0;
+      if (rank) rank[k] = (BfSize)0;
+
+      if (nnz) {
+        /* CSR nnz = rowptr[m] where m = num rows */
+        BfMatCsrReal const *Acsr = leaf->data.sparse.mat;
+        if (Acsr) {
+            BfSize m = row_i1[k] - row_i0[k];
+            BfSize const *rp = bfMatCsrRealGetRowptrConstPtr((BfMatCsrReal *)Acsr);
+            nnz[k] = (unsigned long long)rp[m];
+        } else {
+          nnz[k] = 0ull;
+        }
+      }
+
+    } else if (leaf->kind == BF_VF_HIER_BLOCK_SVD) {
+      row_i0[k] = leaf->data.svd.row_i0;
+      row_i1[k] = leaf->data.svd.row_i1;
+      col_j0[k] = leaf->data.svd.col_j0;
+      col_j1[k] = leaf->data.svd.col_j1;
+      kind[k]   = (uint8_t)1;
+      if (rank) rank[k] = leaf->data.svd.rank;
+
+      /* No CSR here; nnz is undefined for SVD leaves. */
+      if (nnz) nnz[k] = 0ull;
+
+    } else {
+      /* should never happen: collect_leaf_blocks only returns leaves */
+      BF_ASSERT(false);
+      row_i0[k] = row_i1[k] = col_j0[k] = col_j1[k] = 0;
+      kind[k] = (uint8_t)255;
+      if (rank) rank[k] = 0;
+      if (nnz) nnz[k] = 0ull;
+    }
+  } /* end for (k) */
+  bfPtrArrayDeinit(&leaves);
+}
+
+
 static BfSize get_leaf_row_i0(BfVfHierBlock const *b) {
   if (b->kind == BF_VF_HIER_BLOCK_SPARSE) return b->data.sparse.row_i0;
   if (b->kind == BF_VF_HIER_BLOCK_SVD)    return b->data.svd.row_i0;
@@ -3713,6 +3905,34 @@ static BfSize get_leaf_row_i0(BfVfHierBlock const *b) {
 static BfSize get_leaf_row_i1(BfVfHierBlock const *b) {
   if (b->kind == BF_VF_HIER_BLOCK_SPARSE) return b->data.sparse.row_i1;
   if (b->kind == BF_VF_HIER_BLOCK_SVD)    return b->data.svd.row_i1;
+  return 0;
+}
+
+static BfSize get_leaf_col_j0(BfVfHierBlock const *leaf) {
+  if (leaf->kind == BF_VF_HIER_BLOCK_SPARSE) return leaf->data.sparse.col_j0;
+  if (leaf->kind == BF_VF_HIER_BLOCK_SVD)    return leaf->data.svd.col_j0;
+  if (leaf->kind == BF_VF_HIER_BLOCK_NONE)   return BF_SIZE_BAD_VALUE;
+  BF_DIE();
+}
+
+static BfSize get_leaf_col_j1(BfVfHierBlock const *leaf) {
+  if (leaf->kind == BF_VF_HIER_BLOCK_SPARSE) return leaf->data.sparse.col_j1;
+  if (leaf->kind == BF_VF_HIER_BLOCK_SVD)    return leaf->data.svd.col_j1;
+  if (leaf->kind == BF_VF_HIER_BLOCK_NONE)   return BF_SIZE_BAD_VALUE;
+  BF_DIE();
+}
+
+static uint8_t classify_leaf_kind(BfVfHierBlock const *leaf) {
+  switch (leaf->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE: return 0;
+  case BF_VF_HIER_BLOCK_SVD:    return 1;
+  case BF_VF_HIER_BLOCK_NONE:   return 2;
+  default:                      return 3;
+  }
+}
+
+static BfSize get_leaf_rank(BfVfHierBlock const *leaf) {
+  if (leaf->kind == BF_VF_HIER_BLOCK_SVD) return leaf->data.svd.rank;
   return 0;
 }
 

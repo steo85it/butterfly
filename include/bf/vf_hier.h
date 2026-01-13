@@ -4,6 +4,7 @@
 #define BF_VF_HIER_H
 
 #include <bf/def.h>
+#include <stdint.h>
 #include <bf/size_array.h>
 #include <bf/ptr_array.h>
 #include <bf/quadtree.h>
@@ -100,6 +101,17 @@ BfVfHier *bfVfHierNew(void);
 
 void bfVfHierCollectStats(BfVfHier const *vfHier,
                           BfVfHierStats *stats);
+
+BfSize bfVfHierGetNumLeafBlocks(BfVfHier const *vfHier);
+
+void bfVfHierDumpLeafBlocks(BfVfHier const *vfHier,
+                            BfSize   *row_i0,
+                            BfSize   *row_i1,
+                            BfSize   *col_j0,
+                            BfSize   *col_j1,
+                            uint8_t  *kind,
+                            BfSize   *rank,
+                            unsigned long long *nnz);
 
 void bfVfHierInitFromTrimesh(BfVfHier        *vfHier,
                              BfTrimesh const *trimesh,

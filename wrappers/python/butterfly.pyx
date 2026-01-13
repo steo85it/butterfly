@@ -2493,6 +2493,43 @@ cdef class VfHier:
             "rank_total":        int(s.rankTotal),
         }
 
+    cpdef dump_leaf_blocks(self):
+        """
+        Dump leaf rectangles in perm-index space.
+
+        Returns:
+          row_i0, row_i1, col_j0, col_j1 : np.ndarray uintp, shape (nleaf,)
+          kind : np.ndarray uint8, shape (nleaf,)   (0=sparse,1=svd,2=none)
+          rank : np.ndarray uintp, shape (nleaf,)   (0 unless svd)
+          nnz  : np.ndarray uint64, shape (nleaf,)  (CSR nnz if sparse, 0 if svd)
+        """
+        import numpy as np
+        cdef BfSize nleaf
+
+        if self.vfHier == NULL:
+            raise ValueError("VfHier is NULL")
+
+        nleaf = bfVfHierGetNumLeafBlocks(self.vfHier)
+
+        cdef cnp.ndarray row_i0 = np.empty((<Py_ssize_t>nleaf,), dtype=np.uintp)
+        cdef cnp.ndarray row_i1 = np.empty((<Py_ssize_t>nleaf,), dtype=np.uintp)
+        cdef cnp.ndarray col_j0 = np.empty((<Py_ssize_t>nleaf,), dtype=np.uintp)
+        cdef cnp.ndarray col_j1 = np.empty((<Py_ssize_t>nleaf,), dtype=np.uintp)
+        cdef cnp.ndarray kind   = np.empty((<Py_ssize_t>nleaf,), dtype=np.uint8)
+        cdef cnp.ndarray rank   = np.empty((<Py_ssize_t>nleaf,), dtype=np.uintp)
+        cdef cnp.ndarray nnz    = np.empty((<Py_ssize_t>nleaf,), dtype=np.uint64)
+
+        bfVfHierDumpLeafBlocks(self.vfHier,
+                               <BfSize*>row_i0.data,
+                               <BfSize*>row_i1.data,
+                               <BfSize*>col_j0.data,
+                               <BfSize*>col_j1.data,
+                               <unsigned char*>kind.data,
+                               <BfSize*>rank.data,
+                               <unsigned long long*>nnz.data)
+
+        return row_i0, row_i1, col_j0, col_j1, kind, rank, nnz
+
     cpdef cnp.ndarray apply_vec(self, cnp.ndarray x):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:

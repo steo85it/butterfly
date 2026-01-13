@@ -71,3 +71,12 @@ cdef extern from "bf/vf_hier.h":
     BfVfHier *bfVfHierLoad(const char *path)
     BfSize bfVfHierGetNumFaces(const BfVfHier *vfHier)
 
+    BfSize bfVfHierGetNumLeafBlocks(const BfVfHier *vfHier)
+    void bfVfHierDumpLeafBlocks(const BfVfHier *vfHier,
+                                BfSize *row_i0,
+                                BfSize *row_i1,
+                                BfSize *col_j0,
+                                BfSize *col_j1,
+                                unsigned char *kind,
+                                BfSize *rank,
+                                unsigned long long *nnz)
