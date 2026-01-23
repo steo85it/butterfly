@@ -35,3 +35,6 @@ cdef extern from "bf/linalg.h":
                            BfMat **VTPtr,
                            const BfTruncSpec *truncSpec,
                            BfBackend backend)
+
+    void bfSparseSvdPrintStats(const char *tag)
+    void bfSparseSvdResetStats()

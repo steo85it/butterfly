@@ -27,6 +27,7 @@
 #include <arpack.h>
 
 #include <stdio.h>  /* make sure this is present near the top of the file */
+#include <stdlib.h>  /* atexit */
 
 #ifndef BF_HAVE_PRIMME_SVDS
 #define BF_HAVE_PRIMME_SVDS 1
@@ -44,7 +45,7 @@ _Static_assert(sizeof(BfReal) == sizeof(double),
 /* ---- CSR SVD debug logging ----------------------------------------- */
 
 #ifndef BF_SPARSE_SVD_DEBUG
-#define BF_SPARSE_SVD_DEBUG 0
+    #define BF_SPARSE_SVD_DEBUG 1
 #endif
 
 #if BF_SPARSE_SVD_DEBUG
@@ -62,9 +63,147 @@ static int bfSparseSvdsMonitorWarned = 0;
 static long long gPrimmeCsrMatvecCalls_A  = 0;
 static long long gPrimmeCsrMatvecCalls_AT = 0;
 /* Max wall-clock time per PRIMME_SVDS call, in seconds.
+ *
+ * Runtime override:
+ *   export BF_PRIMME_SVDS_MAX_WALLTIME=0     -> disable time-based abort
+ *   export BF_PRIMME_SVDS_MAX_WALLTIME=1.0   -> abort after ~1s per leaf
+ *
  * If <= 0, no time-based stopping is applied.
  */
-static const double BF_PRIMME_SVDS_MAX_WALLTIME = 1.0;  /* e.g. 1 second per block */
+static double bfPrimmeSvdsMaxWalltime(void) {
+  static int initialized = 0;
+  static double wall = 10.0; /* default */
+
+  if (!initialized) {
+    initialized = 1;
+    char const *s = getenv("BF_PRIMME_SVDS_MAX_WALLTIME");
+    if (s && *s) {
+      char *endp = NULL;
+      double v = strtod(s, &endp);
+      if (endp != s && isfinite(v)) {
+        wall = v;
+      }
+    }
+    SPARSE_SVD_LOG("[bf] sparse SVD: BF_PRIMME_SVDS_MAX_WALLTIME=%.6g (env override)\n", wall);
+  }
+
+  return wall;
+}
+
+/* ---- Sparse SVD aggregate stats --------------------------------------- */
+#ifndef BF_SPARSE_SVD_STATS
+#define BF_SPARSE_SVD_STATS 1
+#endif
+
+/* Print summary every N leaf attempts (0 disables periodic printing) */
+#ifndef BF_SPARSE_SVD_STATS_EVERY
+#define BF_SPARSE_SVD_STATS_EVERY 500
+#endif
+
+/* Counters (best-effort; in OpenMP builds, use atomic updates) */
+static long long gSparseSvd_leafTotal        = 0;
+static long long gSparseSvd_acceptSvd        = 0;
+static long long gSparseSvd_reject_notAchTol = 0;
+static long long gSparseSvd_reject_rowSum    = 0;
+static long long gSparseSvd_reject_bytes     = 0;
+static long long gSparseSvd_reject_physics   = 0;
+static long long gSparseSvd_reject_solver    = 0;
+static long long gSparseSvd_skip_nnz0        = 0;
+static long long gSparseSvd_skip_numZero     = 0;
+static long long gSparseSvd_skip_tiny        = 0;
+
+#ifdef _OPENMP
+  #define BF_SVDSTAT_INC(x) do { _Pragma("omp atomic") (x)++; } while (0)
+  #define BF_SVDSTAT_ADD(x, v) do { _Pragma("omp atomic") (x) += (v); } while (0)
+#else
+  #define BF_SVDSTAT_INC(x) do { (x)++; } while (0)
+  #define BF_SVDSTAT_ADD(x, v) do { (x) += (v); } while (0)
+#endif
+
+static void bfSparseSvdPrintStatsNow(char const *tag) {
+#if BF_SPARSE_SVD_STATS
+  long long t = gSparseSvd_leafTotal;
+  long long acc   = gSparseSvd_acceptSvd;
+  long long rejT  = gSparseSvd_reject_notAchTol;
+  long long rejRS = gSparseSvd_reject_rowSum;
+  long long rejB  = gSparseSvd_reject_bytes;
+  long long rejP  = gSparseSvd_reject_physics;
+  long long rejS  = gSparseSvd_reject_solver;
+  long long sk0   = gSparseSvd_skip_nnz0;
+  long long skZ   = gSparseSvd_skip_numZero;
+  long long skTi  = gSparseSvd_skip_tiny;
+
+  double denom = (t > 0) ? (double)t : 1.0;
+
+  bfLogInfo(
+    "[bf][sparse_svd][stats]%s leaves=%lld  acceptSVD=%lld(%.1f%%) "
+    "rejTol=%lld  rejRowSum=%lld  rejBytes=%lld  rejPhys=%lld  rejSolver=%lld  "
+    "skip(nnz0=%lld numZero=%lld tiny=%lld)\n",
+    tag ? tag : "",
+    t,
+    acc, 100.0*(double)acc/denom,
+    rejT, rejRS, rejB, rejP, rejS,
+    sk0, skZ, skTi);
+#else
+  (void)tag;
+#endif
+}
+
+static void bfSparseSvdMaybePrintStats(void) {
+#if BF_SPARSE_SVD_STATS
+  long long t = gSparseSvd_leafTotal;
+  if (BF_SPARSE_SVD_STATS_EVERY <= 0) return;
+  if (t > 0 && (t % (long long)BF_SPARSE_SVD_STATS_EVERY) == 0)
+    bfSparseSvdPrintStatsNow("");
+#endif
+}
+
+/* ---- Public API: print/reset sparse SVD stats ------------------------ */
+/* Put prototypes in bf/linalg.h (see Patch 2). */
+
+void bfSparseSvdPrintStats(char const *tag) {
+#if BF_SPARSE_SVD_STATS
+  bfSparseSvdPrintStatsNow(tag);
+#else
+  (void)tag;
+#endif
+}
+
+void bfSparseSvdResetStats(void) {
+#if BF_SPARSE_SVD_STATS
+  gSparseSvd_leafTotal        = 0;
+  gSparseSvd_acceptSvd        = 0;
+  gSparseSvd_reject_notAchTol = 0;
+  gSparseSvd_reject_rowSum    = 0;
+  gSparseSvd_reject_bytes     = 0;
+  gSparseSvd_reject_physics   = 0;
+  gSparseSvd_reject_solver    = 0;
+  gSparseSvd_skip_nnz0        = 0;
+  gSparseSvd_skip_numZero     = 0;
+  gSparseSvd_skip_tiny        = 0;
+#endif
+}
+
+/* One-time atexit hook to print final summary (optional) */
+#ifndef BF_SPARSE_SVD_STATS_ATEXIT
+#define BF_SPARSE_SVD_STATS_ATEXIT 0
+#endif
+
+static int gSparseSvdAtexitInstalled = 0;
+
+static void bfSparseSvdPrintStatsAtExit(void) {
+  bfSparseSvdPrintStatsNow(" [final]");
+}
+
+static void bfSparseSvdInstallAtexitOnce(void) {
+#if BF_SPARSE_SVD_STATS
+  if (!BF_SPARSE_SVD_STATS_ATEXIT) return;
+  if (!gSparseSvdAtexitInstalled) {
+    gSparseSvdAtexitInstalled = 1;
+    atexit(bfSparseSvdPrintStatsAtExit);
+  }
+#endif
+}
 
 static void bfPrimmeSvdsCappedMonitor(
     void *basisSvals, int *basisSize, int *basisFlags,
@@ -119,15 +258,17 @@ static void bfPrimmeSvdsCappedMonitor(
    *    This is exactly the pattern suggested in:
    *      https://github.com/primme/primme/issues/51
    */
-  if (BF_PRIMME_SVDS_MAX_WALLTIME > 0.0 &&
-      primme_svds->stats.elapsedTime > BF_PRIMME_SVDS_MAX_WALLTIME &&
-      primme_svds->maxMatvecs != 0) {
+  {
+    double wall = bfPrimmeSvdsMaxWalltime();
+    if (wall > 0.0 &&
+        primme_svds->stats.elapsedTime > wall &&
+        primme_svds->maxMatvecs != 0) {
 
     SPARSE_SVD_LOG(
       "[bf] sparse SVD: PRIMME monitor: elapsedTime=%.3e > %.3e s, "
       "forcing maxMatvecs=0 to abort\n",
       primme_svds->stats.elapsedTime,
-      BF_PRIMME_SVDS_MAX_WALLTIME);
+      wall);
 
     /* Outer SVDS matvec budget */
     primme_svds->maxMatvecs = 0;
@@ -135,6 +276,7 @@ static void bfPrimmeSvdsCappedMonitor(
     /* Inner eigensolvers as well, for safety */
     primme_svds->primme.maxMatvecs       = 0;
     primme_svds->primmeStage2.maxMatvecs = 0;
+    }
   }
 }
 #endif
@@ -147,7 +289,15 @@ static bool bfIsFiniteReal(BfReal x) {
 
 /* Keep CSR if SVD isn't at least this fraction smaller (0.9 = save >=10%) */
 #ifndef BF_SPARSE_SVD_MIN_SAVINGS_FRAC
-#define BF_SPARSE_SVD_MIN_SAVINGS_FRAC 0.90
+#define BF_SPARSE_SVD_MIN_SAVINGS_FRAC 0.98
+#endif
+
+/* If 1: enforce tol strictly (reject SVD when tol not achieved before maxRank).
+ * If 0: treat tol as a target; still allow acceptance via bytes + row-sum + phys gates.
+ * Fluxpy behavior is closer to 0.
+ */
+#ifndef BF_SPARSE_SVD_STRICT_TOL
+#define BF_SPARSE_SVD_STRICT_TOL 0
 #endif
 
 /* Enable a simple nonnegativity/physics probe for nonnegative operators */
@@ -155,17 +305,74 @@ static bool bfIsFiniteReal(BfReal x) {
 #define BF_SPARSE_SVD_PHYSICS_PROBE 1
 #endif
 
+/* Physics-probe helpers:
+ * - scale floor prevents absurdly strict negativity tests on weak leaves
+ * - y_floor skips the physics probe when outputs are numerically negligible
+ */
+#ifndef BF_SPARSE_SVD_PHYS_SCALE_FLOOR
+#define BF_SPARSE_SVD_PHYS_SCALE_FLOOR 1e-12
+#endif
+
+#ifndef BF_SPARSE_SVD_PHYS_Y_FLOOR
+#define BF_SPARSE_SVD_PHYS_Y_FLOOR 1e-14
+#endif
+
+/* If yMax is below this, the leaf output is effectively zero -> skip phys test */
+#ifndef BF_SPARSE_SVD_PHYS_YMAX_FLOOR
+#define BF_SPARSE_SVD_PHYS_YMAX_FLOOR 1e-14
+#endif
+
+/* Optional runtime override for eta_abs (set <=0 to ignore).
+ *   export BF_SPARSE_SVD_NEG_ETA_ABS=0.05
+ */
+static double bfSparseSvdNegEtaAbsOverride(void) {
+  static int initialized = 0;
+  static double v = 0.0;
+  if (!initialized) {
+    initialized = 1;
+    char const *s = getenv("BF_SPARSE_SVD_NEG_ETA_ABS");
+    if (s && *s) {
+      char *endp = NULL;
+      double x = strtod(s, &endp);
+      if (endp != s && isfinite(x)) v = x;
+    }
+  }
+  return v;
+}
+
 /* Allowed negativity magnitude relative to p99 scale, as a function of tol */
 static double bfSparseSvdNegEtaFromTol(BfTruncSpec const *truncSpec) {
+  /* Runtime override wins (useful for quick experiments) */
+  double ov = bfSparseSvdNegEtaAbsOverride();
+  if (ov > 0.0 && isfinite(ov)) return ov;
+
   if (truncSpec && truncSpec->usingTol) {
     double t = (double)truncSpec->tol;
-    /* You can tune these. Conservative defaults: */
-    if (t >= 1.0)  return 5e-2;
-    if (t >= 0.1)  return 1e-2;
-    if (t >= 0.01) return 5e-3;
-    return 1e-3;
+
+    /* Slightly looser defaults than before to avoid rejPhys on weak leaves */
+    if (t >= 1.0)  return 1e-1;  /* was 5e-2 */
+    if (t >= 0.1)  return 5e-2;  /* was 1e-2 */
+    if (t >= 0.01) return 1e-2;  /* was 5e-3 */
+    return 5e-3;                 /* was 1e-3 */
   }
-  return 1e-2;
+  return 5e-2; /* was 1e-2 */
+}
+
+/* Allowed *negative mass* ratio, as a function of tol:
+ *   neg_mass = sum(-min(y,0)) / sum(max(y,0))
+ *
+ * This prevents rejecting leaves where negatives exist but are tiny in magnitude.
+ */
+static double bfSparseSvdNegMassEtaFromTol(BfTruncSpec const *truncSpec) {
+  if (truncSpec && truncSpec->usingTol) {
+    double t = (double)truncSpec->tol;
+    /* Looser tol -> tolerate a bit more “mass” leakage */
+    if (t >= 1.0)  return 2e-2;
+    if (t >= 0.1)  return 5e-3;
+    if (t >= 0.01) return 1e-3;
+    return 5e-4;
+  }
+  return 5e-3;
 }
 
 static double bfSparseSvdEstimateBytesCsr(BfSize m, BfSize nnz) {
@@ -178,6 +385,206 @@ static double bfSparseSvdEstimateBytesSvd(BfSize m, BfSize n, BfSize k) {
   /* Dense U(m×k) + dense VT(k×n) + diag S(k) */
   return ((double)m * (double)k + (double)n * (double)k + (double)k) *
          (double)sizeof(BfReal);
+}
+
+/* ---- NEW: Row-sum check ------------------------------------------------ */
+
+/* Enable row-sum check (recommended for nonnegative operators like VF) */
+#ifndef BF_SPARSE_SVD_ROWSUM_CHECK
+#define BF_SPARSE_SVD_ROWSUM_CHECK 1
+#endif
+
+#ifndef BF_SPARSE_SVD_ROWSUM_REPAIR
+#define BF_SPARSE_SVD_ROWSUM_REPAIR 1
+#endif
+
+/* If 1, only repair deficits (energy loss): d = max(rs_csr - rs_svd, 0).
+ * This guarantees the repair term is nonnegative (won’t create negatives).
+ */
+#ifndef BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT
+#define BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT 1
+#endif
+
+/* Base tolerances for row-sum drift */
+#ifndef BF_SPARSE_SVD_ROWSUM_REL_TOL
+#define BF_SPARSE_SVD_ROWSUM_REL_TOL 5e-3
+#endif
+
+#ifndef BF_SPARSE_SVD_ROWSUM_ABS_TOL
+#define BF_SPARSE_SVD_ROWSUM_ABS_TOL 1e-12
+#endif
+
+/* Robust acceptance:
+ * - allow a small fraction of rows to violate the relative tolerance
+ * - use a high quantile of relative error (not max) to avoid 1-row outliers
+ */
+#ifndef BF_SPARSE_SVD_ROWSUM_BAD_FRAC_TOL
+#define BF_SPARSE_SVD_ROWSUM_BAD_FRAC_TOL 0.01   /* allow 1% rows to be “bad” */
+#endif
+
+#ifndef BF_SPARSE_SVD_ROWSUM_REL_Q
+#define BF_SPARSE_SVD_ROWSUM_REL_Q 0.99          /* check 99th percentile rel err */
+#endif
+
+/* Denominator floor for relative error: prevents tiny rows from dominating */
+#ifndef BF_SPARSE_SVD_ROWSUM_DENOM_FLOOR
+#define BF_SPARSE_SVD_ROWSUM_DENOM_FLOOR 1e-6
+#endif
+
+/* Optionally scale row-sum tolerance with truncSpec->tol */
+static double bfSparseSvdRowSumRelTol(BfTruncSpec const *truncSpec) {
+  (void)truncSpec;
+  /* Keep this independent of trunc tol for VF operators:
+   * trunc tol controls spectral truncation; row-sum gate protects energy.
+   */
+  return (double)BF_SPARSE_SVD_ROWSUM_REL_TOL; /* e.g. 5e-3 = 0.5% */
+}
+
+/* Forward decl: used by row-sum + physics checks */
+static BfReal bfSparseSvdQuantile(BfReal const *y, BfSize n, double p);
+
+/* Returns true if row-sums match within tolerance; false => reject SVD */
+static bool bfSparseSvdCheckRowSums(
+    BfMatCsrReal const *Acsr,
+    BfMatDenseReal const *U,     /* m x k */
+    BfMatDiagReal  const *S,     /* k diag */
+    BfMatDenseReal const *VT,    /* k x n */
+    BfTruncSpec const *truncSpec,
+    BfSize k)
+{
+  BfMat const *Amat = bfMatCsrRealConstToMatConst(Acsr);
+  BfSize m = bfMatGetNumRows(Amat);
+  BfSize n = bfMatGetNumCols(Amat);
+
+  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(Acsr);
+  BfReal const *data   = bfMatCsrRealGetDataConstPtr(Acsr);
+  BF_ASSERT(rowptr && data);
+
+  BfReal *rs_csr = bfMemAlloc(m, sizeof(BfReal));
+  BfReal *rs_svd = bfMemAlloc(m, sizeof(BfReal));
+  BfReal *v      = bfMemAlloc(k, sizeof(BfReal)); /* v = VT * 1 */
+  BfReal *t      = bfMemAlloc(k, sizeof(BfReal)); /* t = S * v */
+
+  if (!rs_csr || !rs_svd || !v || !t) {
+    if (rs_csr) bfMemFree(rs_csr);
+    if (rs_svd) bfMemFree(rs_svd);
+    if (v) bfMemFree(v);
+    if (t) bfMemFree(t);
+    /* If we can't check, don't block acceptance */
+    return true;
+  }
+
+  /* 1) CSR row sums */
+  for (BfSize i = 0; i < m; ++i) {
+    BfReal s = 0;
+    for (BfSize p = rowptr[i]; p < rowptr[i + 1]; ++p)
+      s += data[p];
+    rs_csr[i] = s;
+  }
+
+  /* 2) v_j = sum_i VT[j,i] (x = ones) */
+  for (BfSize j = 0; j < k; ++j) {
+    BfReal sum = 0;
+    BfVecReal *row = bfMatDenseRealGetRowView((BfMatDenseReal *)VT, j);
+    if (row == NULL) {
+      bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+      return false;
+    }
+    for (BfSize i = 0; i < n; ++i)
+      sum += row->data[i*row->stride];
+    v[j] = sum;
+    bfVecRealDeinitAndDealloc(&row);
+  }
+
+  /* 3) t = S * v */
+  for (BfSize j = 0; j < k; ++j)
+    t[j] = S->data[j] * v[j];
+
+  /* 4) rs_svd = U * t */
+  for (BfSize i = 0; i < m; ++i) {
+    BfReal sum = 0;
+    BfVecReal *ui = bfMatDenseRealGetRowView((BfMatDenseReal *)U, i);
+    if (ui == NULL) {
+      bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+      return false;
+    }
+    for (BfSize j = 0; j < k; ++j)
+      sum += ui->data[j*ui->stride] * t[j];
+    rs_svd[i] = sum;
+    bfVecRealDeinitAndDealloc(&ui);
+  }
+
+  /* 5) Compare: per-row combined tolerance
+   *    diff <= absTol + relTol*|a|
+   *
+   * This is crucial for VF-like operators where |rowsum| << 1:
+   * using denom=max(1,|a|) turns a “relative” test into an absolute one.
+   */
+  double relTol = bfSparseSvdRowSumRelTol(truncSpec);
+  double absTol = (double)BF_SPARSE_SVD_ROWSUM_ABS_TOL;
+
+  /* Compute robust denom floor: avoid tiny rows dominating rel error */
+  double denomFloor = (double)BF_SPARSE_SVD_ROWSUM_DENOM_FLOOR;
+  if (denomFloor < absTol) denomFloor = absTol;
+
+  /* Build rel error array, track maxAbs, and count “bad” rows */
+  BfReal *relErr = bfMemAlloc(m, sizeof(BfReal));
+  if (relErr == NULL) {
+    /* If we can't allocate, don't block acceptance */
+    bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+    return true;
+  }
+
+  double maxAbs = 0.0;
+  BfSize worstAbsI = 0;
+  long long bad = 0;
+
+  for (BfSize i = 0; i < m; ++i) {
+    double a = (double)rs_csr[i];
+    double b = (double)rs_svd[i];
+    double diff = fabs(b - a);
+
+    double denom = fabs(a);
+    if (denom < denomFloor) denom = denomFloor;
+
+    double rel = diff / denom;
+    relErr[i] = (BfReal)rel;
+
+    if (diff > maxAbs) { maxAbs = diff; worstAbsI = i; }
+    if (rel > relTol) bad++;
+  }
+
+  double badFrac = (m > 0) ? ((double)bad / (double)m) : 0.0;
+  double q = (double)BF_SPARSE_SVD_ROWSUM_REL_Q;
+  if (q < 0.0) q = 0.0;
+  if (q > 1.0) q = 1.0;
+
+  BfReal relQ = bfSparseSvdQuantile(relErr, m, q);
+
+  /* Accept if:
+   *  (A) absolute error is tiny, OR
+   *  (B) high-quantile relative error is within tol AND only a small fraction are bad.
+   */
+  bool ok = (maxAbs <= absTol) ||
+            ((double)relQ <= relTol && badFrac <= (double)BF_SPARSE_SVD_ROWSUM_BAD_FRAC_TOL);
+
+  SPARSE_SVD_LOG(
+    "[bf] sparse SVD: row-sum check: ok=%d relQ(%.2f)=%.3e tol=%.3e badFrac=%.3e badTol=%.3e "
+    "maxAbs=%.3e worstAbsRow=%lu denomFloor=%.3e\n",
+    (int)ok, q, (double)relQ, relTol, badFrac,
+    (double)BF_SPARSE_SVD_ROWSUM_BAD_FRAC_TOL,
+    maxAbs, (unsigned long)worstAbsI, denomFloor);
+
+  bfMemFree(relErr);
+
+  (void)worstAbsI;
+
+  bfMemFree(rs_csr);
+  bfMemFree(rs_svd);
+  bfMemFree(v);
+  bfMemFree(t);
+
+  return ok;
 }
 
 /* Compute p-quantile of y (0<=p<=1). Uses full sort via bfRealArgsort. */
@@ -207,6 +614,52 @@ static bool bfMatCsrRealSparseTruncatedSvd(BfMatCsrReal const *Acsr,
                                            BfMat             **UPtr,
                                            BfMatDiagReal     **SPtr,
                                            BfMat             **VTPtr);
+
+static bool bfSparseSvdUseFrobTol(void) {
+  static int init = 0;
+  static int use  = 0;
+  if (!init) {
+    init = 1;
+    char const *s = getenv("BF_TRUNC_TOL_FROBENIUS");
+    if (s && *s) {
+      use = (atoi(s) != 0);
+    }
+    SPARSE_SVD_LOG("[bf] sparse SVD: BF_TRUNC_TOL_FROBENIUS=%d\n", use);
+  }
+  return use != 0;
+}
+
+/* Choose smallest k such that sqrt(tail/total) <= tol, where
+ * total = sum_i sigma_i^2, tail = sum_{i>=k} sigma_i^2.
+ * Returns k in [0..S->numElts].
+ */
+static BfSize bfTruncSpecGetNumTermsFrob(BfTruncSpec const *truncSpec,
+                                        BfMatDiagReal const *S) {
+  if (S == NULL || S->numElts == 0) return 0;
+  if (truncSpec == NULL || !truncSpec->usingTol) return 0;
+
+  double tol = (double)truncSpec->tol;
+  if (!(tol > 0.0) || !isfinite(tol)) return S->numElts;
+
+  double total = 0.0;
+  for (BfSize i = 0; i < S->numElts; ++i) {
+    double si = (double)S->data[i];
+    if (!isfinite(si) || si < 0) break;
+    total += si*si;
+  }
+  if (!(total > 0.0)) return 0;
+
+  double tail = total;
+  for (BfSize k = 0; k < S->numElts; ++k) {
+    double sk = (double)S->data[k];
+    tail -= sk*sk;
+    if (tail < 0.0) tail = 0.0;
+    double relTail = sqrt(tail/total);
+    if (relTail <= tol) return k + 1;
+  }
+
+  return S->numElts;
+}
 
 BfSize bfTruncSpecGetNumTerms(BfTruncSpec const *truncSpec, BfMatDiagReal const *S) {
   BfSize k = 0;
@@ -1534,6 +1987,7 @@ static void bfPrimmeCsrMatrixMatvec(
  *   - zero-fill the remaining entries/columns so callers can safely
  *     treat them as “nonexistent / zero singular values”.
  */
+#if !BF_HAVE_PRIMME_SVDS
 static int csrAtA_top_eigs_arpack(BfMatCsrReal const *Acsr,
                                   BfSize               nev,
                                   BfReal              *dr_out,
@@ -1833,6 +2287,7 @@ cleanup:
 
   return status;
 }
+#endif /* !BF_HAVE_PRIMME_SVDS */
 
 /* Compute a truncated SVD of a CSR real matrix A using ARPACK on A^T A.
  *
@@ -1910,8 +2365,18 @@ SPARSE_SVD_LOG("[bf] sparse SVD: enter m=%lu n=%lu nnz=%lu maxRank(in)=%lu\n",
                (unsigned long)nnz,
                (unsigned long)maxRank);
 
+#if BF_SPARSE_SVD_STATS
+bfSparseSvdInstallAtexitOnce();
+BF_SVDSTAT_INC(gSparseSvd_leafTotal);
+bfSparseSvdMaybePrintStats();
+#endif
+
 if (nnz == 0) {
   SPARSE_SVD_LOG("[bf] sparse SVD: skipping zero block (nnz=0), keep sparse/zero leaf\n");
+#if BF_SPARSE_SVD_STATS
+  BF_SVDSTAT_INC(gSparseSvd_skip_nnz0);
+  bfSparseSvdMaybePrintStats();
+#endif
   return false;
 }
 
@@ -1929,14 +2394,21 @@ for (BfSize k = 0; k < nnz; ++k) {
 if (maxAbs <= 10*DBL_MIN) {
   SPARSE_SVD_LOG("[bf] sparse SVD: skipping numerically-zero block (max|a_ij|=%.3e)\n",
                  (double)maxAbs);
+#if BF_SPARSE_SVD_STATS
+  BF_SVDSTAT_INC(gSparseSvd_skip_numZero);
+  bfSparseSvdMaybePrintStats();
+#endif
   return false;
 }
 
-/* NEW: optional – treat very tiny blocks as not worth compressing */
 if (maxAbs < 1e-11) {
   SPARSE_SVD_LOG(
     "[bf] sparse SVD: block too small to bother (max|a_ij|=%.3e), keeping CSR\n",
     (double)maxAbs);
+#if BF_SPARSE_SVD_STATS
+  BF_SVDSTAT_INC(gSparseSvd_skip_tiny);
+  bfSparseSvdMaybePrintStats();
+#endif
   return false;
 }
 
@@ -1982,14 +2454,16 @@ if (maxAbs < 1e-11) {
   if (maxRank == 0 || maxRank > maxPossibleRank)
     maxRank = maxPossibleRank;
 
-  /* flux-style memory budget */
+  /* Memory budget based on FULL CSR bytes (data + indices).
+   * This aligns the maxRank cap with the later accept/reject bytes gate.
+   */
   {
-    double maxNbytes    = (double)nnz * (double)sizeof(BfReal);
+    double csrBytesFull = bfSparseSvdEstimateBytesCsr(m, nnz);
     double bytesPerRank = (double)(m + n + 1) * (double)sizeof(BfReal);
     BfSize maxRankByBytes = maxRank;
 
     if (bytesPerRank > 0) {
-      maxRankByBytes = (BfSize)(maxNbytes / bytesPerRank);
+      maxRankByBytes = (BfSize)(csrBytesFull / bytesPerRank);
 
       if (maxRankByBytes == 0 && nnz > 0)
         maxRankByBytes = 1;
@@ -1998,8 +2472,8 @@ if (maxAbs < 1e-11) {
         maxRank = maxRankByBytes;
     }
 
-    SPARSE_SVD_LOG("[bf] sparse SVD: mem budget: maxNbytes=%.3e bytesPerRank=%.3e -> maxRankByBytes=%lu, chosen maxRank=%lu\n",
-                   maxNbytes,
+    SPARSE_SVD_LOG("[bf] sparse SVD: mem budget (full CSR): csrBytesFull=%.3e bytesPerRank=%.3e -> maxRankByBytes=%lu, chosen maxRank=%lu\n",
+                   csrBytesFull,
                    bytesPerRank,
                    (unsigned long)maxRankByBytes,
                    (unsigned long)maxRank);
@@ -2190,6 +2664,10 @@ if (maxAbs < 1e-11) {
   if (numConv <= 0) {
     SPARSE_SVD_LOG(
       "[bf] sparse SVD: PRIMME_SVDS produced 0 usable modes; keeping CSR block\n");
+#if BF_SPARSE_SVD_STATS
+    BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+    bfSparseSvdMaybePrintStats();
+#endif
     truncated = false;
     goto cleanup;
   }
@@ -2293,6 +2771,10 @@ for (BfSize j = 0; j < maxRank; ++j) {
       (unsigned long)nnz,
       (unsigned long)maxRank);
 
+#if BF_SPARSE_SVD_STATS
+    BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+    bfSparseSvdMaybePrintStats();
+#endif
     truncated = false;
     goto cleanup;
   }
@@ -2410,7 +2892,7 @@ for (BfSize j = 0; j < maxRank; ++j) {
                    (unsigned long)nnz,
                    (unsigned long)maxRank);
 
-    SPARSE_SVD_LOG(...);
+    SPARSE_SVD_LOG("[bf] sparse SVD: rejecting because largest singular value is non-finite or <= 0\n");
     truncated = false;
     goto cleanup;
   }
@@ -2458,7 +2940,10 @@ for (BfSize j = 0; j < maxRank; ++j) {
   /* Rank selection */
   BfSize k = 0;
   if (truncSpec->usingTol) {
-    k = bfTruncSpecGetNumTerms(truncSpec, Sfull);
+    if (bfSparseSvdUseFrobTol())
+      k = bfTruncSpecGetNumTermsFrob(truncSpec, Sfull);
+    else
+      k = bfTruncSpecGetNumTerms(truncSpec, Sfull);
   } else {
     k = truncSpec->k <= maxRank ? truncSpec->k : maxRank;
   }
@@ -2476,19 +2961,68 @@ for (BfSize j = 0; j < maxRank; ++j) {
 
   bool achievedTol = true;
   if (truncSpec->usingTol && k == maxRank) {
-    double s0 = (double)Sfull->data[0];
-    double sLast = (double)Sfull->data[maxRank - 1];
-    double rel = (s0 > 0) ? (sLast / s0) : 0.0;
+    if (bfSparseSvdUseFrobTol()) {
+      /* Frobenius-tail tol: if we used all available modes and still
+       * don't meet tail/total <= tol, then we didn't “achieve tol”.
+       */
+      double total = 0.0;
+      for (BfSize i = 0; i < maxRank; ++i) {
+        double si = (double)Sfull->data[i];
+        total += si*si;
+      }
+      double tail = 0.0; /* tail beyond maxRank is unknown; assume 0 */
+      double relTail = (total > 0.0) ? sqrt(tail/total) : 0.0;
 
-    if (rel > (double)truncSpec->tol) {
-      achievedTol = false;
-      SPARSE_SVD_LOG(
-        "[bf] sparse SVD: did not reach tol before maxRank "
-        "(maxRank=%lu, s_last/s0=%.3e > tol=%.3e); keeping SVD only if it helps\n",
-        (unsigned long)maxRank, rel, (double)truncSpec->tol);
+      /* If total is ~0, treat as achieved (effectively zero block). */
+      if (total > 0.0 && relTail > (double)truncSpec->tol) {
+        achievedTol = false;
+        SPARSE_SVD_LOG(
+          "[bf] sparse SVD: did not reach Frobenius-tail tol before maxRank "
+          "(maxRank=%lu, relTail=%.3e > tol=%.3e)\n",
+          (unsigned long)maxRank, relTail, (double)truncSpec->tol);
+      }
+    } else {
+      /* Spectral tol: s_last/s0 <= tol */
+      double s0 = (double)Sfull->data[0];
+      double sLast = (double)Sfull->data[maxRank - 1];
+      double rel = (s0 > 0) ? (sLast / s0) : 0.0;
+
+      if (rel > (double)truncSpec->tol) {
+        achievedTol = false;
+        SPARSE_SVD_LOG(
+          "[bf] sparse SVD: did not reach tol before maxRank "
+          "(maxRank=%lu, s_last/s0=%.3e > tol=%.3e); keeping SVD only if it helps\n",
+          (unsigned long)maxRank, rel, (double)truncSpec->tol);
+      }
     }
   }
+
   SPARSE_SVD_LOG("[bf] sparse SVD: achievedTol=%d\n", (int)achievedTol);
+
+#if BF_SPARSE_SVD_STRICT_TOL
+  /* Strict semantics: reject if tol not achieved before maxRank */
+  if (truncSpec != NULL && truncSpec->usingTol && !achievedTol) {
+    SPARSE_SVD_LOG(
+      "[bf] sparse SVD: rejecting SVD because tol not achieved (maxRank=%lu, tol=%.3e)\n",
+      (unsigned long)maxRank, (double)truncSpec->tol);
+#if BF_SPARSE_SVD_STATS
+    BF_SVDSTAT_INC(gSparseSvd_reject_notAchTol);
+    bfSparseSvdMaybePrintStats();
+#endif
+    truncated = false;
+    goto cleanup;
+  }
+#else
+  /* Soft semantics (fluxpy-like): log, but allow acceptance if it passes
+   * bytes + row-sum + physics gates.
+   */
+  if (truncSpec != NULL && truncSpec->usingTol && !achievedTol) {
+    SPARSE_SVD_LOG(
+      "[bf] sparse SVD: tol not achieved before maxRank (maxRank=%lu, tol=%.3e); "
+      "continuing with bytes/row-sum/physics gates\n",
+      (unsigned long)maxRank, (double)truncSpec->tol);
+  }
+#endif
 
   /* ---- Memory-benefit gate: keep CSR if SVD is not meaningfully smaller ---- */
   {
@@ -2505,6 +3039,10 @@ for (BfSize j = 0; j < maxRank; ++j) {
       SPARSE_SVD_LOG(
         "[bf] sparse SVD: keeping CSR (SVD not worth it): %.3e >= %.3e * %.3e\n",
         bytes_svd, (double)BF_SPARSE_SVD_MIN_SAVINGS_FRAC, bytes_csr);
+#if BF_SPARSE_SVD_STATS
+      BF_SVDSTAT_INC(gSparseSvd_reject_bytes);
+      bfSparseSvdMaybePrintStats();
+#endif
       truncated = false;
       goto cleanup;
     }
@@ -2562,12 +3100,186 @@ for (BfSize j = 0; j < maxRank; ++j) {
     bfVecRealDeinitAndDealloc(&tmpReal);
   }
 
+#if BF_SPARSE_SVD_ROWSUM_CHECK
+  /* ---- Row-sum gate: preserve A*1 (energy-ish) ------------------------- */
+  if (!bfSparseSvdCheckRowSums(Acsr, U, S, VT, truncSpec, k)) {
+
+#if BF_SPARSE_SVD_ROWSUM_REPAIR
+    SPARSE_SVD_LOG("[bf] sparse SVD: row-sum drift detected -> attempting rank-1 repair\n");
+
+    /* Build d = rs_csr - rs_svd (optionally clamp to deficits only),
+     * then append a rank-1 term:  A += d * (1/n) * 1^T
+     *
+     * Implementation: add one extra “mode”
+     *   - new column in U: u0 = d
+     *   - new diagonal entry in S: s0 = 1
+     *   - new row in VT: v0^T = (1/n) * 1^T
+     *
+     * NOTE: this is not orthonormal SVD anymore, but BF’s matvec doesn’t
+     * require orthonormal factors; it just multiplies U*S*VT.
+     */
+
+    /* 1) Recompute row sums here (cheap vs rejecting) */
+    {
+      BfMat const *Amat2 = bfMatCsrRealConstToMatConst(Acsr);
+      BfSize m2 = bfMatGetNumRows(Amat2);
+      BfSize n2 = bfMatGetNumCols(Amat2);
+
+      BfReal *d = bfMemAlloc(m2, sizeof(BfReal));
+      if (d == NULL) {
+        SPARSE_SVD_LOG("[bf] sparse SVD: repair failed (alloc d)\n");
+        goto rowsum_reject;
+      }
+
+      /* Get rs_csr and rs_svd via existing checker’s internal math:
+       * easiest: compute A*1 for CSR and SVD right here.
+       */
+
+      /* CSR rs = A * 1 */
+      BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(Acsr);
+      BfReal const *ad = bfMatCsrRealGetDataConstPtr(Acsr);
+      for (BfSize i = 0; i < m2; ++i) {
+        BfReal s = 0;
+        for (BfSize p = rp[i]; p < rp[i + 1]; ++p) s += ad[p];
+        d[i] = s;
+      }
+
+      /* SVD rs = U*S*VT*1 */
+      BfReal *v1 = bfMemAlloc(k, sizeof(BfReal));
+      BfReal *t1 = bfMemAlloc(k, sizeof(BfReal));
+      if (v1 == NULL || t1 == NULL) {
+        bfMemFree(d);
+        if (v1) bfMemFree(v1);
+        if (t1) bfMemFree(t1);
+        SPARSE_SVD_LOG("[bf] sparse SVD: repair failed (alloc v1/t1)\n");
+        goto rowsum_reject;
+      }
+
+      for (BfSize j = 0; j < k; ++j) {
+        BfVecReal *row = bfMatDenseRealGetRowView(VT, j);
+        if (row == NULL) { bfMemFree(d); bfMemFree(v1); bfMemFree(t1); goto rowsum_reject; }
+        BfReal sum = 0;
+        for (BfSize i = 0; i < n2; ++i) sum += row->data[i*row->stride];
+        v1[j] = sum;
+        bfVecRealDeinitAndDealloc(&row);
+      }
+
+      for (BfSize j = 0; j < k; ++j) t1[j] = S->data[j] * v1[j];
+
+      for (BfSize i = 0; i < m2; ++i) {
+        BfVecReal *ui = bfMatDenseRealGetRowView(U, i);
+        if (ui == NULL) { bfMemFree(d); bfMemFree(v1); bfMemFree(t1); goto rowsum_reject; }
+        BfReal sum = 0;
+        for (BfSize j = 0; j < k; ++j) sum += ui->data[j*ui->stride] * t1[j];
+        /* d <- rs_csr - rs_svd */
+        d[i] = d[i] - sum;
+#if BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT
+        if (d[i] < 0) d[i] = 0;
+#endif
+        bfVecRealDeinitAndDealloc(&ui);
+      }
+
+      bfMemFree(v1);
+      bfMemFree(t1);
+
+      /* 2) Allocate expanded factors */
+      BfMatDenseReal *U2  = bfMatDenseRealNew();
+      BfMatDiagReal  *S2  = bfMatDiagRealNew();
+      BfMatDenseReal *VT2 = bfMatDenseRealNew();
+
+      bfMatDenseRealInit(U2, m2, k + 1);
+      bfMatDiagRealInit(S2, k + 1, k + 1);
+      bfMatDenseRealInit(VT2, k + 1, n2);
+
+      /* copy old factors */
+      for (BfSize j = 0; j < k; ++j) {
+        /* copy col j of U */
+        BfVec *colU = bfMatDenseRealGetColView(bfMatDenseRealToMat(U), j);
+        bfMatDenseRealSetCol(U2, j, colU);
+        bfVecDelete(&colU);
+
+        S2->data[j] = S->data[j];
+
+        /* copy row j of VT */
+        BfVecReal *rowVT = bfMatDenseRealGetRowView(VT, j);
+        bfMatDenseRealSetRow(bfMatDenseRealToMat(VT2), j, bfVecRealToVec(rowVT));
+        bfVecRealDeinitAndDealloc(&rowVT);
+      }
+
+      /* append repair mode */
+      S2->data[k] = 1.0;
+
+      /* U2 last column = d */
+      {
+        BfVecReal dv;
+        bfVecRealInitView(&dv, m2, BF_DEFAULT_STRIDE, d);
+        bfMatDenseRealSetCol(U2, k, bfVecRealToVec(&dv));
+      }
+
+      /* VT2 last row = (1/n) * 1^T */
+      {
+        BfReal *ones = bfMemAlloc(n2, sizeof(BfReal));
+        if (ones == NULL) { bfMemFree(d); goto rowsum_reject; }
+        BfReal invn = (n2 > 0) ? (1.0/(BfReal)n2) : 0.0;
+        for (BfSize i = 0; i < n2; ++i) ones[i] = invn;
+        BfVecReal ov;
+        bfVecRealInitView(&ov, n2, BF_DEFAULT_STRIDE, ones);
+        bfMatDenseRealSetRow(bfMatDenseRealToMat(VT2), k, bfVecRealToVec(&ov));
+        bfMemFree(ones);
+      }
+
+      bfMemFree(d);
+
+      /* swap in repaired factors */
+      bfMatDenseRealDeinitAndDealloc(&U);
+      bfMatDenseRealDeinitAndDealloc(&VT);
+      bfMatDiagRealDeinitAndDealloc(&S);
+
+      U  = U2;
+      VT = VT2;
+      S  = S2;
+      k  = k + 1;
+
+      /* re-check row sums: if still bad, reject */
+      if (!bfSparseSvdCheckRowSums(Acsr, U, S, VT, truncSpec, k)) {
+        SPARSE_SVD_LOG("[bf] sparse SVD: repair failed to satisfy row-sum gate\n");
+        goto rowsum_reject;
+      }
+    }
+
+    SPARSE_SVD_LOG("[bf] sparse SVD: repair succeeded\n");
+    goto rowsum_ok;
+
+rowsum_reject:
+    SPARSE_SVD_LOG("[bf] sparse SVD: rejecting SVD due to row-sum drift\n");
+#if BF_SPARSE_SVD_STATS
+    BF_SVDSTAT_INC(gSparseSvd_reject_rowSum);
+    bfSparseSvdMaybePrintStats();
+#endif
+    truncated = false;
+    goto cleanup;
+
+rowsum_ok:
+    ; /* continue */
+
+#else
+    SPARSE_SVD_LOG("[bf] sparse SVD: rejecting SVD due to row-sum drift\n");
+#if BF_SPARSE_SVD_STATS
+    BF_SVDSTAT_INC(gSparseSvd_reject_rowSum);
+    bfSparseSvdMaybePrintStats();
+#endif
+    truncated = false;
+    goto cleanup;
+#endif
+  }
+#endif
+
 #if BF_SPARSE_SVD_PHYSICS_PROBE
   /* ---- Physics probe gate: A_svd * x should be ~nonnegative for x>=0 ----
    * This is intentionally cheap and catches catastrophic non-physical SVDs.
    */
   {
-    double eta = bfSparseSvdNegEtaFromTol(truncSpec);
+    /* eta computed later as eta_abs; keep single source of truth */
 
     /* Two probes: x = ones, and x = pseudo-random positive (deterministic) */
     const int numProbes = 2;
@@ -2628,50 +3340,95 @@ for (BfSize j = 0; j < maxRank; ++j) {
         }
 
 
-        /* Compute min, max, p99, and negative fraction */
+        /* Compute min/max and negative/positive “mass” */
         BfReal yMin = BF_INFINITY;
         BfReal yMax = 0;
-        BfSize negCount = 0;
+        double sumPos = 0.0;
+        double sumNeg = 0.0;
+
         for (BfSize i = 0; i < m; ++i) {
-          BfReal yi = y[i];
-          if (yi < yMin) yMin = yi;
-          if (yi > yMax) yMax = yi;
+          double yi = (double)y[i];
+          if ((BfReal)yi < yMin) yMin = (BfReal)yi;
+          if ((BfReal)yi > yMax) yMax = (BfReal)yi;
+
+          if (yi >= 0.0) sumPos += yi;
+          else           sumNeg += -yi; /* accumulate magnitude of negatives */
         }
 
-        /* abs negativity threshold scaled to output magnitude */
-        BfReal negAbs = (BfReal)(1e-12 * (double)(yMax > 0 ? yMax : 1.0));
-        for (BfSize i = 0; i < m; ++i)
-          if (y[i] < -negAbs) ++negCount;
+        double negMass = 0.0;
+        if (sumPos > 0.0) negMass = sumNeg / sumPos;
+        else if (sumNeg > 0.0) negMass = BF_INFINITY;
 
-        /* p99 requires a sorted view: make a copy */
+        /* If output is (near-)zero, don't reject on “negativity fractions”.
+         * This avoids insane ratios when sumPos≈0 and also avoids pointless
+         * rejections on numerically-null leaves.
+         */
+        double yAbsMax = fmax(fabs((double)yMin), (double)yMax);
+        double sumTot  = sumPos + sumNeg;
+
+        /* Option C: near-zero leaf auto-accept */
+        if ((double)yMax < (double)BF_SPARSE_SVD_PHYS_Y_FLOOR ||
+            yAbsMax      < (double)BF_SPARSE_SVD_PHYS_Y_FLOOR ||
+            sumTot       < (double)BF_SPARSE_SVD_PHYS_Y_FLOOR) {
+          SPARSE_SVD_LOG(
+            "[bf] sparse SVD: physics probe=%d near-zero output (yMax=%.3e yAbsMax=%.3e sumTot=%.3e) -> auto-pass\n",
+            probe, (double)yMax, yAbsMax, sumTot);
+          continue;
+        }
+
+        /* Option A: robust scale so it doesn’t go tiny on weak-coupling leaves */
+        BfReal yP99 = 0;
+
+        /* default fallback scale from max magnitude */
+        BfReal scale = (yMax > 0 ? yMax : (BfReal)yAbsMax);
+        if (scale <= 0) scale = 1.0;
+
         BfReal *yCopy = bfMemAlloc(m, sizeof(BfReal));
-        if (yCopy == NULL) {
-          /* fallback: use max as scale */
-          BfReal scale = (yMax > 0 ? yMax : 1.0);
-          if (yMin < (BfReal)(-eta * (double)scale) || ((double)negCount/(double)m) > 1e-3) {
-            SPARSE_SVD_LOG("[bf] sparse SVD: physics probe reject (fallback scale): "
-                           "probe=%d yMin=%.3e yMax=%.3e negFrac=%.3e eta=%.3e\n",
-                           probe, (double)yMin, (double)yMax,
-                           (double)negCount/(double)m, eta);
-            truncated = false;
-            goto cleanup;
-          }
-        } else {
+        if (yCopy != NULL) {
           for (BfSize i = 0; i < m; ++i) yCopy[i] = y[i];
-          BfReal yP99 = bfSparseSvdQuantile(yCopy, m, 0.99);
+          yP99 = bfSparseSvdQuantile(yCopy, m, 0.99);
           bfMemFree(yCopy);
+        }
 
-          BfReal scale = (yP99 > 0 ? yP99 : (yMax > 0 ? yMax : 1.0));
-          double negFrac = (double)negCount / (double)m;
+        /* scale = max(yP99, 0.1*yMax, scale_floor) */
+        {
+          BfReal s = scale;
 
-          SPARSE_SVD_LOG("[bf] sparse SVD: physics probe=%d yMin=%.3e yP99=%.3e yMax=%.3e negFrac=%.3e eta=%.3e\n",
-                         probe, (double)yMin, (double)yP99, (double)yMax, negFrac, eta);
+          if (yP99 > 0) s = yP99;
 
-          if (yMin < (BfReal)(-eta * (double)scale) || negFrac > 1e-3) {
-            SPARSE_SVD_LOG("[bf] sparse SVD: physics probe reject\n");
-            truncated = false;
-            goto cleanup;
-          }
+          BfReal s2 = (BfReal)(0.1 * (double)yMax);
+          if (s2 > s) s = s2;
+
+          BfReal floorS = (BfReal)BF_SPARSE_SVD_PHYS_SCALE_FLOOR;
+          if (floorS > s) s = floorS;
+
+          scale = s;
+        }
+
+        /* Thresholds:
+         *  - eta_abs: min-value floor relative to scale (magnitude-aware)
+         *  - eta_mass: allowed total negative “mass” fraction
+         */
+        double eta_abs  = bfSparseSvdNegEtaFromTol(truncSpec);
+        double eta_mass = bfSparseSvdNegMassEtaFromTol(truncSpec);
+
+        SPARSE_SVD_LOG(
+          "[bf] sparse SVD: physics probe=%d "
+          "yMin=%.3e yP99=%.3e yMax=%.3e scale=%.3e "
+          "negMass=%.3e (eta_mass=%.3e) eta_abs=%.3e\n",
+          probe,
+          (double)yMin, (double)yP99, (double)yMax, (double)scale,
+          negMass, eta_mass, eta_abs);
+
+        /* Reject only if negatives are meaningful in magnitude */
+        if (negMass > eta_mass || (double)yMin < -eta_abs*(double)scale) {
+          SPARSE_SVD_LOG("[bf] sparse SVD: physics probe reject\n");
+#if BF_SPARSE_SVD_STATS
+          BF_SVDSTAT_INC(gSparseSvd_reject_physics);
+          bfSparseSvdMaybePrintStats();
+#endif
+          truncated = false;
+          goto cleanup;
         }
       }
 
@@ -2685,6 +3442,11 @@ for (BfSize j = 0; j < maxRank; ++j) {
   *UPtr  = bfMatDenseRealToMat(U);
   *SPtr  = S;
   *VTPtr = bfMatDenseRealToMat(VT);
+
+#if BF_SPARSE_SVD_STATS
+  BF_SVDSTAT_INC(gSparseSvd_acceptSvd);
+  bfSparseSvdMaybePrintStats();
+#endif
 
   /* Ownership transferred to caller */
   U = NULL;

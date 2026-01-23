@@ -28,6 +28,7 @@ from helm2 cimport *
 from indexed_mat cimport *
 from layer_pot cimport *
 from linalg cimport *
+from logging cimport *
 from mat cimport *
 from mat_block_coo cimport *
 from mat_block_dense cimport *
@@ -64,6 +65,28 @@ from vf_hier cimport *
 
 def seed(BfSize seed):
     bfSeed(seed)
+
+def set_bf_log_level(level: str):
+    cdef bytes b = level.encode()
+    if level == "todo":
+        bfSetLogLevel(BF_LOG_LEVEL_TODO)
+    elif level == "debug":
+        bfSetLogLevel(BF_LOG_LEVEL_DEBUG)
+    elif level == "info":
+        bfSetLogLevel(BF_LOG_LEVEL_INFO)
+    elif level == "warn":
+        bfSetLogLevel(BF_LOG_LEVEL_WARN)
+    elif level == "error":
+        bfSetLogLevel(BF_LOG_LEVEL_ERROR)
+    else:
+        raise ValueError("level must be one of: todo, debug, info, warn, error")
+
+def sparse_svd_print_stats(tag=""):
+    cdef bytes b = (<str>tag).encode()
+    bfSparseSvdPrintStats(b)
+
+def sparse_svd_reset_stats():
+    bfSparseSvdResetStats()
 
 cdef reify_mat(BfMat *mat):
     cdef BfType type_ = bfMatGetType(mat)
@@ -1017,8 +1040,79 @@ cdef class Points2:
         bfPoints2Get(self.points, i, point)
         return Point2(point[0], point[1])
 
-    def extend(self, Points2 points):
-        bfPoints2Extend(self.points, points.points)
+    @staticmethod
+    def from_numpy(arr):
+        """
+        Build a Points2 from a numpy array of shape (N,2).
+
+        Accepts float32/float64; internally stored as BfReal (double).
+        """
+        import numpy as np
+
+        cdef Points2 pts
+        cdef object a_obj
+        cdef Py_ssize_t n, i
+        cdef double[:, :] mv
+        cdef BfPoint2 p
+
+        a_obj = np.asarray(arr, dtype=np.float64)
+        if (<object>a_obj).ndim != 2 or (<object>a_obj).shape[1] != 2:
+            raise ValueError(f"Points2.from_numpy expects (N,2), got {(<object>a_obj).shape}")
+
+        n = (<object>a_obj).shape[0]
+        pts = Points2(n)
+
+        mv = a_obj
+        for i in range(n):
+            p[0] = mv[i, 0]
+            p[1] = mv[i, 1]
+            bfPoints2Append(pts.points, p)
+
+        return pts
+
+    def extend(self, points):
+        """
+        Extend this Points2 with:
+          - another Points2
+          - numpy array shaped (N,2)
+          - iterable of (x,y) pairs (e.g., list[tuple[float,float]])
+        """
+        import numpy as np
+
+        cdef BfPoint2 p
+        cdef Py_ssize_t n, i
+        cdef double[:, :] mv
+        cdef object a_obj
+        cdef object pt
+
+        # Fast path: Points2 -> Points2
+        if isinstance(points, Points2):
+            bfPoints2Extend(self.points, (<Points2>points).points)
+            return
+
+        # Numpy path: try to view as (N,2)
+        try:
+            a_obj = np.asarray(points, dtype=np.float64)
+        except Exception:
+            a_obj = None
+
+        if a_obj is not None and (<object>a_obj).ndim == 2 and (<object>a_obj).shape[1] == 2:
+            n = (<object>a_obj).shape[0]
+            mv = a_obj
+            for i in range(n):
+                p[0] = mv[i, 0]
+                p[1] = mv[i, 1]
+                bfPoints2Append(self.points, p)
+            return
+
+        # Generic iterable path (list of pairs, generator, etc.)
+        for pt in points:
+            if pt is None or len(pt) != 2:
+                raise ValueError("Points2.extend expects an iterable of (x,y) pairs")
+            p[0] = float(pt[0])
+            p[1] = float(pt[1])
+            bfPoints2Append(self.points, p)
+
 
 cdef class Quadtree(Tree):
     cdef BfQuadtree *quadtree
@@ -1448,8 +1542,78 @@ cdef class Vectors2:
     def __len__(self):
         return bfVectors2GetSize(self.vectors)
 
-    def extend(self, Vectors2 vectors):
-        bfVectors2Extend(self.vectors, vectors.vectors)
+    @staticmethod
+    def from_numpy(arr):
+        """
+        Build a Vectors2 from a numpy array of shape (N,2).
+
+        Accepts float32/float64; internally stored as BfReal (double).
+        """
+        import numpy as np
+
+        cdef Vectors2 vecs
+        cdef object a_obj
+        cdef Py_ssize_t n, i
+        cdef double[:, :] mv
+        cdef BfPoint2 v
+
+        a_obj = np.asarray(arr, dtype=np.float64)
+        if (<object>a_obj).ndim != 2 or (<object>a_obj).shape[1] != 2:
+            raise ValueError(f"Vectors2.from_numpy expects (N,2), got {(<object>a_obj).shape}")
+
+        n = (<object>a_obj).shape[0]
+        vecs = Vectors2()
+
+        mv = a_obj
+        for i in range(n):
+            v[0] = mv[i, 0]
+            v[1] = mv[i, 1]
+            bfVectors2Append(vecs.vectors, v)
+
+        return vecs
+
+    def extend(self, vectors):
+        """
+        Extend this Vectors2 with:
+          - another Vectors2
+          - numpy array shaped (N,2)
+          - iterable of (x,y) pairs (e.g., list[tuple[float,float]])
+        """
+        import numpy as np
+
+        cdef BfPoint2 v
+        cdef Py_ssize_t n, i
+        cdef double[:, :] mv
+        cdef object a_obj
+        cdef object it
+
+        # Fast path: Vectors2 -> Vectors2
+        if isinstance(vectors, Vectors2):
+            bfVectors2Extend(self.vectors, (<Vectors2>vectors).vectors)
+            return
+
+        # Numpy path: try to view as (N,2)
+        try:
+            a_obj = np.asarray(vectors, dtype=np.float64)
+        except Exception:
+            a_obj = None
+
+        if a_obj is not None and (<object>a_obj).ndim == 2 and (<object>a_obj).shape[1] == 2:
+            n = (<object>a_obj).shape[0]
+            mv = a_obj
+            for i in range(n):
+                v[0] = mv[i, 0]
+                v[1] = mv[i, 1]
+                bfVectors2Append(self.vectors, v)
+            return
+
+        # Generic iterable path
+        for it in vectors:
+            if it is None or len(it) != 2:
+                raise ValueError("Vectors2.extend expects an iterable of (x,y) pairs")
+            v[0] = float(it[0])
+            v[1] = float(it[1])
+            bfVectors2Append(self.vectors, v)
 
 cdef class Vectors3:
     cdef BfVectors3 *vectors
@@ -2213,7 +2377,7 @@ cdef class HierarchicalFormFactor:
     cpdef cnp.ndarray apply(self, cnp.ndarray x):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
-            raise ValueError(f"x must be 1D of length {self.n}, got shape") # {x_flat.shape}")
+            raise ValueError(f"x must be 1D of length {self.n}, got {(<object>x_flat).shape}")
 
         cdef cnp.ndarray y = np.zeros_like(x_flat)
         cdef FFBlock leaf
@@ -2372,11 +2536,13 @@ cdef void _collect_leaves(FFBlock block,
 
 cdef class VfHier:
     cdef BfVfHier *vfHier
-    cdef BfSize     n
+    cdef BfSize     _n
+    cdef object     _qt_owner  # keep Quadtree alive if C stores pointer
 
     def __cinit__(self):
         self.vfHier = NULL
-        self.n = 0
+        self._n = 0
+        self._qt_owner = None
 
     cdef inline void _apply_ptr(self,
                                 const double *x,
@@ -2393,6 +2559,7 @@ cdef class VfHier:
 
     @staticmethod
     def from_trimesh(Trimesh tm,
+                     object quadtree=None,
                      double eta=2.0,
                      BfSize leaf_max=128,
                      BfSize leaf_min=1,
@@ -2405,28 +2572,76 @@ cdef class VfHier:
         """
         Build a compressed (hierarchical/SVD) C-side form-factor operator.
 
-        By default this will:
-          - ensure face geometry (normals) is available
-          - initialize the Embree scene
-        before constructing the quadtree and BfVfHier.
+        Parameters
+        ----------
+        tm : Trimesh
+            The mesh used for VF computation.
+        quadtree : Quadtree or None
+            If provided, use this quadtree instead of building one from tm.
+            This enables the "flux-style" split: quadtree from projected coords,
+            flux computations on 3D coords, as long as face ordering matches.
         """
         cdef VfHier H = VfHier.__new__(VfHier)
+        cdef Quadtree qt
 
         if ensure_geometry:
             tm.ensure_face_geometry()
         if init_embree_scene:
             tm.init_embree()
 
-        qt = _quadtree_from_trimesh_xy(tm)       # returns a Quadtree
-        H.vfHier = bfVfHierNewFromQuadtree(tm.trimesh,
-                                           qt.quadtree,
-                                           eta, leaf_max, leaf_min, min_area,
-                                           tol, min_svd_size, max_svd_rank_frac)
+        if quadtree is None:
+            qt = _quadtree_from_trimesh_xy(tm)
+        else:
+            if not isinstance(quadtree, Quadtree):
+                raise TypeError(
+                    "VfHier.from_trimesh: quadtree must be a butterfly.Quadtree (or None)"
+                )
+            qt = <Quadtree> quadtree
+
+        # Keep the quadtree alive in case the C object stores the pointer.
+        H._qt_owner = qt
+
+        H.vfHier = bfVfHierNewFromQuadtree(
+            tm.trimesh,
+            qt.quadtree,
+            eta, leaf_max, leaf_min, min_area,
+            tol, min_svd_size, max_svd_rank_frac)
+
         if H.vfHier == NULL:
             raise RuntimeError("bfVfHierNewFromQuadtree failed")
 
-        H.n = tm.num_faces
+        H._n = tm.num_faces
         return H
+
+    @staticmethod
+    def from_quadtree(Trimesh tm,
+                      Quadtree quadtree,
+                      double eta=2.0,
+                      BfSize leaf_max=128,
+                      BfSize leaf_min=1,
+                      BfReal min_area=0.0,
+                      double tol=1e-2,
+                      BfSize min_svd_size=16384,
+                      double max_svd_rank_frac=0.9,
+                      bint ensure_geometry=True,
+                      bint init_embree_scene=True):
+        """
+        Explicit constructor taking a pre-built Quadtree.
+
+        This matches the API your illum_common.py expects:
+            VfHier.from_quadtree(bf_tm, quadtree, **kwargs)
+        """
+        return VfHier.from_trimesh(tm,
+                                   quadtree=quadtree,
+                                   eta=eta,
+                                   leaf_max=leaf_max,
+                                   leaf_min=leaf_min,
+                                   min_area=min_area,
+                                   tol=tol,
+                                   min_svd_size=min_svd_size,
+                                   max_svd_rank_frac=max_svd_rank_frac,
+                                   ensure_geometry=ensure_geometry,
+                                   init_embree_scene=init_embree_scene)
 
     @staticmethod
     def from_csr_and_trimesh(MatCsrReal Afull,
@@ -2448,6 +2663,9 @@ cdef class VfHier:
         cdef VfHier H = VfHier.__new__(VfHier)
         cdef Quadtree qt = _quadtree_from_trimesh_xy(tm)
 
+        # Keep alive for same reason as from_trimesh
+        H._qt_owner = qt
+
         H.vfHier = bfVfHierNewFromCsrAndQuadtree(
             Afull.mat_csr_real,
             qt.quadtree,
@@ -2462,36 +2680,36 @@ cdef class VfHier:
         if H.vfHier == NULL:
             raise RuntimeError("bfVfHierNewFromCsrAndQuadtree failed")
 
-        H.n = tm.num_faces
+        H._n = tm.num_faces
         return H
 
     def get_stats(self):
-        """
-        Return C-side VfHier statistics as a Python dict.
+            """
+            Return C-side VfHier statistics as a Python dict.
 
-        Keys:
-          - num_sparse_leaves
-          - num_svd_leaves
-          - num_nodes
-          - nnz_sparse_total
-          - mem_bytes_sparse
-          - mem_bytes_svd
-          - mem_bytes_total
-          - rank_total
-        """
-        cdef BfVfHierStats s
-        bfVfHierCollectStats(self.vfHier, &s)
+            Keys:
+              - num_sparse_leaves
+              - num_svd_leaves
+              - num_nodes
+              - nnz_sparse_total
+              - mem_bytes_sparse
+              - mem_bytes_svd
+              - mem_bytes_total
+              - rank_total
+            """
+            cdef BfVfHierStats s
+            bfVfHierCollectStats(self.vfHier, &s)
 
-        return {
-            "num_sparse_leaves": int(s.numSparseLeaves),
-            "num_svd_leaves":    int(s.numSvdLeaves),
-            "num_nodes":         int(s.numNodeBlocks),
-            "nnz_sparse_total":  int(s.nnzSparseTotal),
-            "mem_bytes_sparse":  int(s.memBytesSparseEst),
-            "mem_bytes_svd":     int(s.memBytesSvdEst),
-            "mem_bytes_total":   int(s.memBytesSparseEst + s.memBytesSvdEst),
-            "rank_total":        int(s.rankTotal),
-        }
+            return {
+                "num_sparse_leaves": int(s.numSparseLeaves),
+                "num_svd_leaves":    int(s.numSvdLeaves),
+                "num_nodes":         int(s.numNodeBlocks),
+                "nnz_sparse_total":  int(s.nnzSparseTotal),
+                "mem_bytes_sparse":  int(s.memBytesSparseEst),
+                "mem_bytes_svd":     int(s.memBytesSvdEst),
+                "mem_bytes_total":   int(s.memBytesSparseEst + s.memBytesSvdEst),
+                "rank_total":        int(s.rankTotal),
+            }
 
     cpdef dump_leaf_blocks(self):
         """
@@ -2532,8 +2750,8 @@ cdef class VfHier:
 
     cpdef cnp.ndarray apply_vec(self, cnp.ndarray x):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
-        if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
-            raise ValueError(f"x must be 1D of length {self.n}")
+        if x_flat.ndim != 1 or x_flat.shape[0] != self._n:
+            raise ValueError(f"x must be 1D of length {self._n}")
 
         cdef cnp.ndarray y = np.zeros_like(x_flat)
 
@@ -2544,13 +2762,13 @@ cdef class VfHier:
 
     cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
-        if x_flat.ndim != 1 or x_flat.shape[0] != self.n:
-            raise ValueError(f"x must be 1D of length {self.n}")
+        if x_flat.ndim != 1 or x_flat.shape[0] != self._n:
+            raise ValueError(f"x must be 1D of length {self._n}")
 
         if y.dtype != np.float64 or not y.flags.c_contiguous:
             raise ValueError("y must be float64 and C-contiguous")
-        if y.ndim != 1 or y.shape[0] != self.n:
-            raise ValueError(f"y must be 1D of length {self.n}")
+        if y.ndim != 1 or y.shape[0] != self._n:
+            raise ValueError(f"y must be 1D of length {self._n}")
 
         with nogil:
             self._apply_ptr(<const double *> x_flat.data,
@@ -2567,8 +2785,8 @@ cdef class VfHier:
           Y is (n, k) with leading dimension ldY = n
         """
         bfVfHierApplyMany(self.vfHier,
-                          <const BfReal *> X, <BfSize> self.n,
-                          <BfReal *> Y, <BfSize> self.n,
+                          <const BfReal *> X, <BfSize> self._n,
+                          <BfReal *> Y, <BfSize> self._n,
                           k)
 
     cpdef cnp.ndarray apply_mat(self, cnp.ndarray X):
@@ -2581,7 +2799,7 @@ cdef class VfHier:
         cdef cnp.ndarray X2 = np.asarray(X, dtype=np.float64)
         if X2.ndim != 2:
             raise ValueError("apply_mat expects a 2D array (n, k)")
-        if X2.shape[0] != self.n:
+        if X2.shape[0] != self._n:
             raise ValueError(
                 f"X must have shape (n, k) with n={self.n}; got {(<object> X2).shape}"
             )
@@ -2591,7 +2809,7 @@ cdef class VfHier:
         cdef Py_ssize_t k_py = Xf.shape[1]
         cdef BfSize k = <BfSize> k_py
 
-        cdef cnp.ndarray Yf = np.empty((self.n, k_py), dtype=np.float64, order='F')
+        cdef cnp.ndarray Yf = np.empty((self._n, k_py), dtype=np.float64, order='F')
 
         with nogil:
             self._apply_mat_ptr(<const double*> Xf.data,
@@ -2642,7 +2860,7 @@ cdef class VfHier:
     cdef VfHier from_ptr(BfVfHier *ptr):
         cdef VfHier obj = VfHier.__new__(VfHier)
         obj.vfHier = ptr
-        obj.n = bfVfHierGetNumFaces(ptr)
+        obj._n = bfVfHierGetNumFaces(ptr)
         return obj
 
     def __dealloc__(self):
@@ -2678,9 +2896,18 @@ cdef class VfHier:
 
     @property
     def n(self):
+        """
+        Backward-compatible alias used by downstream code:
+        number of faces / DOFs of the operator.
+        """
+        return <Py_ssize_t> self._n
+
+    @property
+    def num_faces(self):
+        # Keep existing API; prefer cached _n when available.
         if self.vfHier == NULL:
             return 0
-        return <Py_ssize_t> bfVfHierGetNumFaces(self.vfHier)
+        return <Py_ssize_t> self._n
 
 ### tests
 

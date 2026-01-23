@@ -51,3 +51,15 @@ bool bfGetTruncatedSvd(BfMat const *mat,
                        BfMat **VTPtr,
                        BfTruncSpec const *truncSpec,
                        BfBackend backend);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Print and reset aggregate sparse-SVD compression stats (best-effort counters). */
+void bfSparseSvdPrintStats(char const *tag);
+void bfSparseSvdResetStats(void);
+
+#ifdef __cplusplus
+}
+#endif
