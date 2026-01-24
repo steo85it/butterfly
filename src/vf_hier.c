@@ -686,30 +686,10 @@ static BfVfHierBlock *makeSparseLeaf(BfTrimesh const *tm,
   leaf->mat = bfMatCsrRealNewViewFactorMatrixFromTrimesh(
       tm, &leaf->rowInds, &leaf->colInds);
 
-  /* Decide once if CSR colind is already local 0..nA-1 or global faces */
-  BfSize mA = bfMatGetNumRows(bfMatCsrRealToMat(leaf->mat));
-  BfSize nA = bfMatGetNumCols(bfMatCsrRealToMat(leaf->mat));
-
-  BF_ASSERT(mA == bfSizeArrayGetSize(&leaf->rowInds));
-  BF_ASSERT(nA == bfSizeArrayGetSize(&leaf->colInds));
-
-  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(leaf->mat);
-  BfSize const *colind = bfMatCsrRealGetColindConstPtr(leaf->mat);
-
-  BF_ASSERT(rowptr != NULL);
-  BF_ASSERT(colind != NULL);
-
-  BfSize nnz = rowptr[mA];
-  BfSize maxCol = 0;
-  for (BfSize k = 0; k < nnz; ++k) {
-    if (colind[k] > maxCol)
-      maxCol = colind[k];
-  }
-
-  /* If maxCol < nA, interpret as local 0..nA-1 */
-  leaf->colsAreLocal = BF_FALSE;
-  if (nA > 0 && maxCol < nA)
-    leaf->colsAreLocal = BF_TRUE;
+  /* Enforce invariant */
+  BfSize nFaces = bfTrimeshGetNumFaces(tm);
+  reindexCsrColsToLocal(leaf->mat, &leaf->colInds, nFaces);
+  leaf->colsAreLocal = BF_TRUE;
 
   return block;
 }
@@ -1410,54 +1390,32 @@ static void bfVfSparseLeafApply(BfVfSparseLeaf const *leaf,
   BfSizeArray const *rowInds = &leaf->rowInds;
   BfSizeArray const *colInds = &leaf->colInds;
 
-  if (leaf->colsAreLocal) {
-    /* Local-column case: colind[k] indexes into colInds */
-    for (BfSize i = 0; i < mA; ++i) {
-      BfSize row_start = rowptr[i];
-      BfSize row_end   = rowptr[i + 1];
+  /* Invariant: CSR colind is ALWAYS local (indexes into leaf->colInds) */
+  BF_ASSERT(leaf->colsAreLocal);
 
-      BF_ASSERT(row_end >= row_start);
-      BF_ASSERT(row_end <= rowptr[mA]);
+  for (BfSize i = 0; i < mA; ++i) {
+    BfSize row_start = rowptr[i];
+    BfSize row_end   = rowptr[i + 1];
 
-      BfReal acc = 0;
+    BF_ASSERT(row_end >= row_start);
+    BF_ASSERT(row_end <= rowptr[mA]);
 
-      for (BfSize k = row_start; k < row_end; ++k) {
-        BfSize cLocal = colind[k];
-        BF_ASSERT(cLocal < bfSizeArrayGetSize((BfSizeArray *)colInds));
+    BfReal acc = 0;
 
-        BfSize globalCol = bfSizeArrayGet((BfSizeArray *)colInds, cLocal);
-        BF_ASSERT(globalCol < n);
+    for (BfSize k = row_start; k < row_end; ++k) {
+      BfSize cLocal = colind[k];
+      BF_ASSERT(cLocal < bfSizeArrayGetSize((BfSizeArray *)colInds));
 
-        acc += data[k] * x[globalCol];
-      }
+      BfSize globalCol = bfSizeArrayGet((BfSizeArray *)colInds, cLocal);
+      BF_ASSERT(globalCol < n);
 
-      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
-      BF_ASSERT(globalRow < n);
-
-      y[globalRow] += acc;
+      acc += data[k] * x[globalCol];
     }
-  } else {
-    /* Global-column case: colind[k] is already a global column index */
-    for (BfSize i = 0; i < mA; ++i) {
-      BfSize row_start = rowptr[i];
-      BfSize row_end   = rowptr[i + 1];
 
-      BF_ASSERT(row_end >= row_start);
-      BF_ASSERT(row_end <= rowptr[mA]);
+    BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
+    BF_ASSERT(globalRow < n);
 
-      BfReal acc = 0;
-
-      for (BfSize k = row_start; k < row_end; ++k) {
-        BfSize globalCol = colind[k];
-        BF_ASSERT(globalCol < n);
-        acc += data[k] * x[globalCol];
-      }
-
-      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
-      BF_ASSERT(globalRow < n);
-
-      y[globalRow] += acc;
-    }
+    y[globalRow] += acc;
   }
 }
 
@@ -1686,22 +1644,18 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
   /* Decide far vs near */
   BfBool far = isFar(rowNode, colNode, eta);
 
-  /* NEAR or SVD disabled: keep CSR leaf with whatever col indexing we got */
+  /* NEAR or SVD disabled: keep CSR leaf, but ENFORCE local columns invariant */
   if (!far || minSvdSize == 0) {
-    block->kind                         = BF_VF_HIER_BLOCK_SPARSE;
-    block->data.sparse.rowInds          = rowInds;
-    block->data.sparse.colInds          = colInds;
-    block->data.sparse.mat              = Acsr;
-    /* detect local vs global once, like makeSparseLeaf */
-    BfSize const *rp     = bfMatCsrRealGetRowptrConstPtr(Acsr);
-    BfSize *colind = (BfSize *)bfMatCsrRealGetColindConstPtr(Acsr);
-    BfSize nnz           = rp[mA];
-    BfSize maxCol = 0;
-    for (BfSize k = 0; k < nnz; ++k)
-      if (colind[k] > maxCol) maxCol = colind[k];
-    block->data.sparse.colsAreLocal = (nA > 0 && maxCol < nA) ? BF_TRUE : BF_FALSE;
-/* IMPORTANT: row_i0/row_i1 are in permutation (tree) index space.
-   Planned/tiled apply assumes leaf local row i corresponds to perm index (row_i0 + i). */
+    BfSize nFaces = bfTrimeshGetNumFaces(tm);
+    reindexCsrColsToLocal(Acsr, &colInds, nFaces);
+
+    block->kind                = BF_VF_HIER_BLOCK_SPARSE;
+    block->data.sparse.rowInds = rowInds;
+    block->data.sparse.colInds = colInds;
+    block->data.sparse.mat     = Acsr;
+    block->data.sparse.colsAreLocal = BF_TRUE;
+
+    /* IMPORTANT: row_i0/row_i1 are in permutation (tree) index space. */
     block->data.sparse.row_i0 = meta->i0;
     block->data.sparse.row_i1 = meta->i1;
     block->data.sparse.col_j0 = meta->j0;
@@ -3440,7 +3394,9 @@ static BfBool write_block(FILE *fp, BfVfHierBlock const *block) {
   case BF_VF_HIER_BLOCK_SPARSE: {
     BfVfSparseLeaf const *leaf = &block->data.sparse;
 
-    if (!write_u8(fp, (uint8_t)(leaf->colsAreLocal ? 1 : 0))) return BF_FALSE;
+    /* Invariant: always local columns */
+    if (!write_u8(fp, (uint8_t)1)) return BF_FALSE;
+    BF_ASSERT(leaf->colsAreLocal);
     if (!write_size_array(fp, &leaf->rowInds)) return BF_FALSE;
     if (!write_size_array(fp, &leaf->colInds)) return BF_FALSE;
     if (!write_csr(fp, leaf->mat)) return BF_FALSE;
@@ -3614,6 +3570,33 @@ BfBool bfVfHierSave(BfVfHier const *vfHier, char const *path) {
   return ok;
 }
 
+static void bfVfHierNormalizeCsrLeavesToLocal_(BfVfHierBlock *block, BfSize nFaces) {
+  if (block == NULL) return;
+
+  switch (block->kind) {
+  case BF_VF_HIER_BLOCK_SPARSE: {
+    BfVfSparseLeaf *leaf = &block->data.sparse;
+    if (!leaf->colsAreLocal) {
+      /* leaf->colInds is the global-face list defining the column ordering */
+      reindexCsrColsToLocal(leaf->mat, &leaf->colInds, nFaces);
+      leaf->colsAreLocal = BF_TRUE;
+    }
+  } break;
+
+  case BF_VF_HIER_BLOCK_NODE: {
+    BfPtrArray *children = &block->data.node.children;
+    for (BfSize i = 0; i < bfPtrArraySize(children); ++i)
+      bfVfHierNormalizeCsrLeavesToLocal_((BfVfHierBlock *)bfPtrArrayGet(children, i), nFaces);
+  } break;
+
+  case BF_VF_HIER_BLOCK_SVD:
+  case BF_VF_HIER_BLOCK_NONE:
+  default:
+    break;
+  }
+}
+
+
 BfVfHier *bfVfHierLoad(char const *path) {
   if (path == NULL) return NULL;
 
@@ -3643,6 +3626,9 @@ BfVfHier *bfVfHierLoad(char const *path) {
     bfVfHierDeinitAndDealloc(&vf);
     return NULL;
   }
+
+  /* Enforce invariant for any legacy files: CSR colind is local */
+  bfVfHierNormalizeCsrLeavesToLocal_(vf->root, vf->n);
 
   return vf;
 }
@@ -3675,51 +3661,29 @@ static void bfVfSparseLeafApplyMany(BfVfSparseLeaf const *leaf,
   BfSizeArray const *rowInds = &leaf->rowInds;
   BfSizeArray const *colInds = &leaf->colInds;
 
-  if (leaf->colsAreLocal) {
-    for (BfSize i = 0; i < mA; ++i) {
-      BfSize row_start = rowptr[i];
-      BfSize row_end   = rowptr[i + 1];
+  BF_ASSERT(leaf->colsAreLocal);
 
-      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
-      BF_ASSERT(globalRow < n);
+  for (BfSize i = 0; i < mA; ++i) {
+    BfSize row_start = rowptr[i];
+    BfSize row_end   = rowptr[i + 1];
 
-      BfReal *yRow = Y + globalRow; /* column-major: yRow[r*ldY] */
+    BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
+    BF_ASSERT(globalRow < n);
 
-      for (BfSize k = row_start; k < row_end; ++k) {
-        BfSize cLocal = colind[k];
-        BF_ASSERT(cLocal < bfSizeArrayGetSize((BfSizeArray *)colInds));
+    BfReal *yRow = Y + globalRow;
 
-        BfSize globalCol = bfSizeArrayGet((BfSizeArray *)colInds, cLocal);
-        BF_ASSERT(globalCol < n);
+    for (BfSize k = row_start; k < row_end; ++k) {
+      BfSize cLocal = colind[k];
+      BF_ASSERT(cLocal < bfSizeArrayGetSize((BfSizeArray *)colInds));
 
-        BfReal a = data[k];
-        BfReal const *xCol = X + globalCol;
+      BfSize globalCol = bfSizeArrayGet((BfSizeArray *)colInds, cLocal);
+      BF_ASSERT(globalCol < n);
 
-        /* y[globalRow, r] += a * x[globalCol, r] */
-        for (BfSize r = 0; r < nrhs; ++r)
-          yRow[r*ldY] += a * xCol[r*ldX];
-      }
-    }
-  } else {
-    for (BfSize i = 0; i < mA; ++i) {
-      BfSize row_start = rowptr[i];
-      BfSize row_end   = rowptr[i + 1];
+      BfReal a = data[k];
+      BfReal const *xCol = X + globalCol;
 
-      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
-      BF_ASSERT(globalRow < n);
-
-      BfReal *yRow = Y + globalRow;
-
-      for (BfSize k = row_start; k < row_end; ++k) {
-        BfSize globalCol = colind[k];
-        BF_ASSERT(globalCol < n);
-
-        BfReal a = data[k];
-        BfReal const *xCol = X + globalCol;
-
-        for (BfSize r = 0; r < nrhs; ++r)
-          yRow[r*ldY] += a * xCol[r*ldX];
-      }
+      for (BfSize r = 0; r < nrhs; ++r)
+        yRow[r*ldY] += a * xCol[r*ldX];
     }
   }
 }

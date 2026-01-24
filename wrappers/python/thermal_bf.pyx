@@ -477,21 +477,22 @@ cpdef object run_thermal_series_with_bf(
             sum_dt_cycle += dt_view[t_idx]
 
 
-    # for i in range(Nfaces):
-    #     Q0_view[i] = (1.0 - rho) * E0_view[i] + Fgeo_view[i]
-    #     if Q0_view[i] < 0.0 and clamp:
-    #         Q0_view[i] = 0.0
-    #     denom = emiss_view[i] * SIGSB
-    #     if denom <= 0.0:
-    #         Tsurf0_view[i] = 0.0
-    #     else:
-    #         Tsurf0_view[i] = (Q0_view[i] / denom)**0.25
-
+    # Flux-like *radiative* initializer (do NOT overwrite conductive ICs in T0).
+    # We only use this to seed the *radiative* iteration via Tsurf_prev (see Patch 2).
     for i in range(Nfaces):
-        Q0_view[i] = (1.0 - rho) * E0_view[i]
-        if Q0_view[i] < 0.0 and clamp:
-            Q0_view[i] = 0.0
-        Tsurf0_view[i] = T0_view[i, 0]  # bcond='Q' doesn't use it anyway
+        val = (1.0 - rho) * E0_view[i] + Fgeo_view[i]
+        if clamp and val < 0.0:
+            val = 0.0
+        Q0_view[i] = val
+
+        denom = emiss_view[i] * SIGSB
+        if denom > 0.0:
+            Tsurf0_view[i] = (val / denom) ** 0.25
+        else:
+            Tsurf0_view[i] = 0.0
+
+        # NOTE: intentionally DO NOT touch T0_view[i, 0] or deeper layers here.
+
 
     # --- construct Pcc model bundle ---
     cdef BfPccThermalModel1D model = BfPccThermalModel1D(
@@ -589,7 +590,9 @@ cpdef object run_thermal_series_with_bf(
     cdef cnp.ndarray[cnp.double_t, ndim=1] QIR = np.zeros(Nfaces, dtype=np.float64)
     cdef cnp.ndarray[cnp.double_t, ndim=1] Qrefl_next = np.zeros(Nfaces, dtype=np.float64)
     cdef cnp.ndarray[cnp.double_t, ndim=1] QIR_next = np.zeros(Nfaces, dtype=np.float64)
-    cdef cnp.ndarray[cnp.double_t, ndim=1] Tsurf_prev = np.asarray(T0[:, 0]).copy()
+    # Seed radiative iteration with Flux-like surface temperature guess,
+    # while keeping conduction state (T0) unchanged.
+    cdef cnp.ndarray[cnp.double_t, ndim=1] Tsurf_prev = np.asarray(Tsurf0).copy()
     cdef cnp.ndarray[cnp.double_t, ndim=1] tmp_short = np.empty(Nfaces, dtype=np.float64)
     cdef cnp.ndarray[cnp.double_t, ndim=1] tmp_long = np.empty(Nfaces, dtype=np.float64)
     cdef cnp.ndarray[cnp.double_t, ndim=1] res_short = np.empty(Nfaces, dtype=np.float64)

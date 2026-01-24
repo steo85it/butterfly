@@ -407,97 +407,161 @@ static BfReal integrateViewFactorMidpointRule(BfTrimesh const *trimesh, BfSize s
   BfVector3 dp;
   bfPoint3Sub(pSrc, pTgt, dp);
 
-  BfReal dotSrc = bfVector3Dot(nSrc, dp);
-  BfReal dotTgt = -bfVector3Dot(nTgt, dp);
   BfReal rSquared = bfVector3Dot(dp, dp);
+
+  BfReal dotSrc = -bfVector3Dot(nSrc, dp);
+  BfReal dotTgt = bfVector3Dot(nTgt, dp);
+
+  const char *dbg = getenv("BF_VF_DOT_DIAG");
+  if (dbg && dbg[0] != '\0') {
+    if (!(dotSrc > 0) || !(dotTgt > 0)) {
+      const char *si = getenv("BF_VF_DOT_I");
+      if (si) {
+        BfSize srcFilter = (BfSize)strtoull(si, NULL, 10);  /* <-- rename (no 'I') */
+        if (srcInd == srcFilter) {
+          fprintf(stderr,
+            "[bf] dotDiag src=%zu tgt=%zu dotSrc=%g dotTgt=%g r2=%g\n",
+            (size_t)srcInd, (size_t)tgtInd,
+            (double)dotSrc, (double)dotTgt, (double)rSquared);
+        }
+      }
+    }
+  }
 
   return areaTgt*fmax(0, dotSrc)*fmax(0, dotTgt)/(BF_PI*rSquared*rSquared);
 }
 
 #ifdef BF_EMBREE
-BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(BfTrimesh const *trimesh, BfSizeArray const *rowInds, BfSizeArray const *colInds) {
+BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(
+    BfTrimesh const *trimesh,
+    BfSizeArray const *rowInds,
+    BfSizeArray const *colInds)
+{
   BF_ERROR_BEGIN();
 
   BfSize numRows = bfSizeArrayGetSize(rowInds);
   BfSize numCols = bfSizeArrayGetSize(colInds);
 
+  /* Build GLOBAL->LOCAL col lookup so CSR stores LOCAL col indices [0,numCols) */
+  BfSize nFaces = bfTrimeshGetNumFaces(trimesh);
+  BfSize *colGlobalToLocal = bfMemAlloc(nFaces, sizeof(BfSize));
+  HANDLE_ERROR();
+  for (BfSize f = 0; f < nFaces; ++f) colGlobalToLocal[f] = BF_SIZE_BAD_VALUE;
+
+  for (BfSize j = 0; j < numCols; ++j) {
+    BfSize g = bfSizeArrayGet(colInds, j);
+    BF_ASSERT(g < nFaces);
+    colGlobalToLocal[g] = j;
+  }
+
   BfSizeArray *rowptr = bfSizeArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
-
   bfSizeArrayAppend(rowptr, 0);
 
   BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
-  BfRealArray *data   = bfRealArrayNewWithDefaultCapacity();
+  BfRealArray *data = bfRealArrayNewWithDefaultCapacity();
   HANDLE_ERROR();
 
-  /* Per-row scratch: each row builds its own colind/data, then we stitch */
+  /* Per-row scratch (built in parallel, stitched serially) */
   BfSizeArray **row_colind = bfMemAlloc(numRows, sizeof(*row_colind));
   BfRealArray **row_data   = bfMemAlloc(numRows, sizeof(*row_data));
+  HANDLE_ERROR();
   for (BfSize i = 0; i < numRows; ++i) { row_colind[i] = NULL; row_data[i] = NULL; }
 
   /* Optional progress */
   const char *env = getenv("BF_PROGRESS");
   size_t progress_step = env ? strtoul(env, NULL, 10) : 0;
 
-  #ifdef BF_OPENMP
-  #pragma omp parallel for schedule(dynamic,8)
-  #endif
-  for (BfSize i = 0; i < numRows; ++i) {
+  /* Optional numeric cutoff (default 0 to avoid “surprise” sparsification) */
+  BfReal eps = 0;
+  const char *eps_env = getenv("BF_VIEW_FACTOR_EPS");
+  if (eps_env != NULL) {
+    char *endptr = NULL;
+    double tmp = strtod(eps_env, &endptr);
+    if (endptr != eps_env) eps = (BfReal)tmp;
+  }
 
+#ifdef BF_OPENMP
+#pragma omp parallel for schedule(dynamic,8)
+#endif
+  for (BfSize i = 0; i < numRows; ++i) {
     if (progress_step && (i % progress_step == 0)) {
-  #ifdef BF_OPENMP
-  #pragma omp critical
-  #endif
+#ifdef BF_OPENMP
+#pragma omp critical
+#endif
       fprintf(stderr, "[bf] view-factor rows: %zu/%zu\n", (size_t)i, (size_t)numRows);
     }
 
-    BfSize rowInd = bfSizeArrayGet(rowInds, i);
+    BfSize rowGlobal = bfSizeArrayGet(rowInds, i);
 
-    /* 1) Thread-safe visibility (open-segment occlusion) */
-    BfSizeArray *visibleColInds =
-//        bfTrimeshGetVisibilityOpenSegment(trimesh, rowInd, colInds);
-        bfTrimeshGetVisibility(trimesh, rowInd, colInds);
-    if (visibleColInds == NULL) {
-      /* Defensive: if something failed, leave row empty */
-      visibleColInds = bfSizeArrayNewWithCapacity(0);
+    /* Visibility returns GLOBAL face ids in [0, nFaces). We always map GLOBAL->LOCAL
+       using colGlobalToLocal so the stored CSR uses LOCAL column indices [0, numCols). */
+    BfSizeArray *vis =
+       bfTrimeshGetVisibilityOpenSegment(trimesh, rowGlobal, colInds);
+//      bfTrimeshGetVisibility(trimesh, rowGlobal, colInds);
+
+    if (vis == NULL)
+      vis = bfSizeArrayNewWithCapacity(0);
+
+    BfSizeArray *ci = bfSizeArrayNewWithCapacity(bfSizeArrayGetSize(vis));
+    BfRealArray *ri = bfRealArrayNewWithCapacity(bfSizeArrayGetSize(vis));
+
+    for (BfSize t = 0; t < bfSizeArrayGetSize(vis); ++t) {
+      BfSize x = bfSizeArrayGet(vis, t);
+
+      BF_ASSERT(x < nFaces); /* visibility must return GLOBAL face ids */
+
+      /* vis returns GLOBAL face ids */
+      BfSize colGlobal = x;
+      if (colGlobal >= nFaces) continue;
+
+      /* Map GLOBAL col -> LOCAL col index in [0, numCols) */
+      BfSize colLocal = colGlobalToLocal[colGlobal];
+      if (colLocal == BF_SIZE_BAD_VALUE) continue;
+
+      /* Flux-like: force diagonal to 0 */
+      if (colGlobal == rowGlobal) continue;
+
+      BfReal value = integrateViewFactorMidpointRule(trimesh, rowGlobal, colGlobal);
+
+      /* Defensive + optional cutoff */
+      if (!isfinite(value)) continue;
+      if (value < 0) value = 0;          /* view factors should be non-negative */
+      if (value <= eps) continue;
+
+      bfSizeArrayAppend(ci, colLocal);
+      bfRealArrayAppend(ri, value);
     }
 
-    /* 2) Compute values for this row */
-    BfRealArray *rowVals = bfRealArrayNewWithCapacity(bfSizeArrayGetSize(visibleColInds));
-    for (BfSize j = 0; j < bfSizeArrayGetSize(visibleColInds); ++j) {
-      BfSize colInd = bfSizeArrayGet(visibleColInds, j);
-      BfReal value  = integrateViewFactorMidpointRule(trimesh, rowInd, colInd);
-      bfRealArrayAppend(rowVals, value);
-    }
+    bfSizeArrayDeinitAndDealloc(&vis);
 
-    /* 3) Store per-row results (ownership moved) */
-    row_colind[i] = visibleColInds;
-    row_data[i]   = rowVals;
+    row_colind[i] = ci;
+    row_data[i]   = ri;
   }
 
-  /* 4) Stitch into a single CSR (serial, no locks) */
+  /* Stitch CSR */
   for (BfSize i = 0; i < numRows; ++i) {
     BfSizeArray *ci = row_colind[i];
     BfRealArray *ri = row_data[i];
 
-    /* extend global arrays */
     bfSizeArrayExtend(colind, ci);
     bfRealArrayExtend(data, ri);
 
-    /* rowptr += row_nnz */
     BfSize nnz_i = bfSizeArrayGetSize(ci);
-    BfSize prev  = bfSizeArrayGetLast(rowptr);
+    BfSize prev = bfSizeArrayGetLast(rowptr);
     bfSizeArrayAppend(rowptr, prev + nnz_i);
 
-    /* cleanup per-row */
     bfSizeArrayDeinitAndDealloc(&ci);
     bfRealArrayDeinitAndDealloc(&ri);
   }
+
   bfMemFree(row_colind);
   bfMemFree(row_data);
+  bfMemFree(colGlobalToLocal);
 
-  BfMatCsrReal *matCsrReal = bfMatCsrRealNewFromArrays(numRows, numCols, rowptr, colind, data, BF_POLICY_STEAL);
+  BfMatCsrReal *matCsrReal =
+    bfMatCsrRealNewFromArrays(numRows, numCols, rowptr, colind, data, BF_POLICY_STEAL);
   HANDLE_ERROR();
 
   BF_ERROR_END() {

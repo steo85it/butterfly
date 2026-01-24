@@ -556,6 +556,187 @@ static void initFaceAreas(BfTrimesh *trimesh) {
   }
 }
 
+/* ---------------------------
+ * Face orientation diagnostics / fix
+ * --------------------------- */
+
+/* Return +1 if face traverses edge (a->b), -1 if (b->a), 0 if not found */
+static int edgeDirInFace(BfSize const *F, BfSize a, BfSize b) {
+  for (int i = 0; i < 3; ++i) {
+    BfSize u = F[i];
+    BfSize v = F[(i + 1) % 3];
+    if (u == a && v == b) return +1;
+    if (u == b && v == a) return -1;
+  }
+  return 0;
+}
+
+/* Flip face winding by swapping vertices 1 and 2 (reverses orientation) */
+static void flipFace(BfSize *F) {
+  BfSize tmp = F[1];
+  F[1] = F[2];
+  F[2] = tmp;
+}
+
+/* Count “bad” interior edges where two incident faces traverse shared edge
+ * in the SAME direction (dir0 == dir1). This is a strong indicator of
+ * inconsistent orientation in the input mesh. */
+static void bfTrimeshOrientationDiag(BfTrimesh const *trimesh,
+                                     BfSize *numInteriorEdges,
+                                     BfSize *numBadSameDir,
+                                     BfSize *numDegenerateEdges) {
+  BfSize nEdges = bfTrimeshGetNumEdges(trimesh);
+  *numInteriorEdges = 0;
+  *numBadSameDir = 0;
+  *numDegenerateEdges = 0;
+
+  for (BfSize e = 0; e < nEdges; ++e) {
+    /* ef[e] holds up to 2 incident faces */
+    BfSize const *ef = bfArrayGetPtr(trimesh->ef, e);
+    if (!BF_SIZE_OK(ef[0]) || !BF_SIZE_OK(ef[1])) continue; /* boundary/nonmanifold-ish */
+    ++(*numInteriorEdges);
+
+    BfSize2 edge;
+    bfArrayGet(trimesh->edges, e, edge);
+    BfSize a = edge[0], b = edge[1];
+
+    BfSize const *F0 = trimesh->faces[ef[0]];
+    BfSize const *F1 = trimesh->faces[ef[1]];
+
+    int d0 = edgeDirInFace(F0, a, b);
+    int d1 = edgeDirInFace(F1, a, b);
+
+    if (d0 == 0 || d1 == 0) {
+      ++(*numDegenerateEdges); /* should not happen if ef/edges consistent */
+      continue;
+    }
+
+    if (d0 == d1) ++(*numBadSameDir);
+  }
+}
+
+/* Propagate a consistent orientation across each connected component of the
+ * face adjacency graph. For each shared interior edge, we enforce opposite
+ * traversal directions across the two incident faces.
+ *
+ * Returns number of faces flipped. */
+static BfSize bfTrimeshOrientFacesCoherently(BfTrimesh *trimesh) {
+  BfSize numFaces = bfTrimeshGetNumFaces(trimesh);
+  BfSize numEdges = bfTrimeshGetNumEdges(trimesh);
+
+  bool *vis = bfMemAllocAndZero(numFaces, sizeof(bool));
+  if (!vis) return 0;
+
+  /* simple queue */
+  BfSize *q = bfMemAlloc(numFaces, sizeof(BfSize));
+  if (!q) { bfMemFree(vis); return 0; }
+
+  BfSize flipped = 0;
+  BfSize components = 0;
+
+  for (BfSize f0 = 0; f0 < numFaces; ++f0) {
+    if (vis[f0]) continue;
+    ++components;
+
+    /* start BFS from f0 */
+    BfSize qh = 0, qt = 0;
+    q[qt++] = f0;
+    vis[f0] = true;
+
+    while (qh < qt) {
+      BfSize f = q[qh++];
+      BfSize *F = trimesh->faces[f];
+
+      /* For each of 3 directed edges in face */
+      for (int k = 0; k < 3; ++k) {
+        BfSize u = F[k];
+        BfSize v = F[(k + 1) % 3];
+
+        /* Find undirected edge index in trimesh->edges */
+        BfSize2 eKey = {u, v};
+        SORT2(eKey[0], eKey[1]);
+        BfSize eInd = bfArrayFindSorted(trimesh->edges, eKey, (BfCompar)comparEdge);
+        if (!BF_SIZE_OK(eInd) || eInd >= numEdges) continue;
+
+        BfSize const *ef = bfArrayGetPtr(trimesh->ef, eInd);
+        if (!BF_SIZE_OK(ef[0]) || !BF_SIZE_OK(ef[1])) continue; /* boundary edge */
+
+        BfSize fA = ef[0], fB = ef[1];
+        BfSize fn = (f == fA) ? fB : ((f == fB) ? fA : BF_SIZE_BAD_VALUE);
+        if (!BF_SIZE_OK(fn)) continue;
+
+        if (!vis[fn]) {
+          /* Determine if neighbor needs flipping so edge is oppositely directed */
+          BfSize2 edge;
+          bfArrayGet(trimesh->edges, eInd, edge);
+          BfSize a = edge[0], b = edge[1];
+
+          int dCur = edgeDirInFace(trimesh->faces[f], a, b);
+          int dN   = edgeDirInFace(trimesh->faces[fn], a, b);
+
+          if (dCur != 0 && dN != 0 && dCur == dN) {
+            flipFace(trimesh->faces[fn]);
+            ++flipped;
+          }
+
+          vis[fn] = true;
+          q[qt++] = fn;
+        }
+      }
+    }
+  }
+
+  /* Invalidate face normals so they recompute with new winding */
+  if (trimesh->faceNormals != NULL) {
+    bfVectors3Deinit(trimesh->faceNormals);
+    bfMemFree(trimesh->faceNormals);
+    trimesh->faceNormals = NULL;
+  }
+
+  bfMemFree(q);
+  bfMemFree(vis);
+
+  /* Optional: print components info */
+  const char *diag = getenv("BF_ORIENT_DIAG");
+  if (diag && diag[0] != '\0') {
+    fprintf(stderr, "[bf] orientFaces: components=%zu flipped=%zu\n",
+            (size_t)components, (size_t)flipped);
+  }
+
+  return flipped;
+}
+
+/* Diagnostic wrapper + optional fix controlled by env vars:
+ *   BF_ORIENT_DIAG=1   prints before/after stats
+ *   BF_ORIENT_FACES=1  applies the coherent orientation fix
+ */
+static void bfTrimeshMaybeOrientFaces(BfTrimesh *trimesh) {
+  const char *diag = getenv("BF_ORIENT_DIAG");
+  const char *fix  = getenv("BF_ORIENT_FACES");
+
+  BfSize nInt=0, nBad=0, nDeg=0;
+
+  if (diag && diag[0] != '\0') {
+    bfTrimeshOrientationDiag(trimesh, &nInt, &nBad, &nDeg);
+    fprintf(stderr,
+      "[bf] orientDiag BEFORE  : interiorEdges=%zu badSameDir=%zu (%.3f%%) degenerate=%zu\n",
+      (size_t)nInt, (size_t)nBad, (nInt ? 100.0*(double)nBad/(double)nInt : 0.0),
+      (size_t)nDeg);
+  }
+
+  if (fix && fix[0] != '\0') {
+    BfSize nFlip = bfTrimeshOrientFacesCoherently(trimesh);
+
+    if (diag && diag[0] != '\0') {
+      bfTrimeshOrientationDiag(trimesh, &nInt, &nBad, &nDeg);
+      fprintf(stderr,
+        "[bf] orientDiag AFTER : interiorEdges=%zu badSameDir=%zu (%.3f%%) degenerate=%zu flippedFaces=%zu\n",
+        (size_t)nInt, (size_t)nBad, (nInt ? 100.0*(double)nBad/(double)nInt : 0.0),
+        (size_t)nDeg, (size_t)nFlip);
+    }
+  }
+}
+
 static void initCommon(BfTrimesh *trimesh) {
   BF_ERROR_BEGIN();
 
@@ -620,6 +801,8 @@ static void rebuildMesh(BfTrimesh *trimesh) {
   initCommon(trimesh);
   HANDLE_ERROR();
 
+  bfTrimeshMaybeOrientFaces(trimesh);
+
   BF_ERROR_END() {
     BF_DIE();
   }
@@ -653,6 +836,8 @@ void bfTrimeshInitFromBinaryFiles(BfTrimesh *trimesh,
 
   initCommon(trimesh);
   HANDLE_ERROR();
+
+  bfTrimeshMaybeOrientFaces(trimesh);
 
   BF_ERROR_END() {
     BF_DIE();
@@ -777,6 +962,8 @@ void bfTrimeshInitFromObjFile(BfTrimesh *trimesh, char const *objPath) {
   initCommon(trimesh);
   HANDLE_ERROR();
 
+  bfTrimeshMaybeOrientFaces(trimesh);
+
   BF_ERROR_END() {
     BF_DIE();
   }
@@ -820,6 +1007,8 @@ void bfTrimeshInitFromVertsAndFaces(BfTrimesh *trimesh, BfPoints3 const *verts, 
 
   initCommon(trimesh);
   HANDLE_ERROR();
+
+  bfTrimeshMaybeOrientFaces(trimesh);
 
   BF_ERROR_END() {
     BF_DIE();
@@ -1705,7 +1894,6 @@ void *bfTrimeshGetRTCSceneHandle(const BfTrimesh *trimesh) {
 
 static void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFunctionNArguments* args)
 {
-  /* We call rtcIntersect1, so Embree will invoke N==1. */
   if (args->N != 1) return;
 
   unsigned int* valid = (unsigned int*)args->valid;
@@ -1714,8 +1902,14 @@ static void trimeshGetVisibility_intersectionFilter(const struct RTCFilterFuncti
   const struct RTCHit* hit = (const struct RTCHit*)args->hit;
   const unsigned int primID = hit->primID;
 
-  /* Drop self-hits only. Target testing happens AFTER intersect. */
+  /* Reject self-hits (always) */
   if ((BfSize)primID == bf_tls_vis.srcInd) { valid[0] = 0; return; }
+
+  /* Optionally reject target-hits (OpenSegment uses this) */
+  if (BF_SIZE_OK(bf_tls_vis.tgtInd) && (BfSize)primID == bf_tls_vis.tgtInd) {
+    valid[0] = 0;
+    return;
+  }
 }
 
 BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh,
@@ -1745,6 +1939,7 @@ BfSizeArray *bfTrimeshGetVisibility(BfTrimesh const *trimesh,
 
   /* per-thread src for the self-hit filter */
   bf_tls_vis.srcInd = srcInd;
+  bf_tls_vis.tgtInd = BF_SIZE_BAD_VALUE;  /* important: don't reject target in normal mode */
 
   for (BfSize i = 0; i < bfSizeArrayGetSize(tgtInds); ++i) {
     BfSize tgt = bfSizeArrayGet(tgtInds, i);
@@ -1793,52 +1988,88 @@ BfSizeArray *bfTrimeshGetVisibilityOpenSegment(BfTrimesh const *trimesh,
   /* Source centroid */
   BfReal const *pSrc = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
 
+  struct RTCIntersectArguments iargs;
+  rtcInitIntersectArguments(&iargs);
+
+  struct RTCRayQueryContext context;
+  rtcInitRayQueryContext(&context);
+  iargs.context = &context;
+  iargs.filter  = trimeshGetVisibility_intersectionFilter;
+
+  /* Set TLS src once */
+  bf_tls_vis.srcInd = srcInd;
+
   for (BfSize k = 0; k < bfSizeArrayGetSize(tgtInds); ++k) {
     BfSize tgtInd = bfSizeArrayGet(tgtInds, k);
     if (tgtInd == srcInd) continue;
 
     BfReal const *pTgt = bfTrimeshGetFaceCentroidConstPtr(trimesh, tgtInd);
 
-    /* Direction and distance */
-    BfVector3 v;
-    v[0] = pTgt[0] - pSrc[0];
-    v[1] = pTgt[1] - pSrc[1];
-    v[2] = pTgt[2] - pSrc[2];
+    /* v = pTgt - pSrc */
+    double vx = (double)pTgt[0] - (double)pSrc[0];
+    double vy = (double)pTgt[1] - (double)pSrc[1];
+    double vz = (double)pTgt[2] - (double)pSrc[2];
 
-    BfReal d2 = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
-    if (d2 == 0) continue;
+    double d2 = vx*vx + vy*vy + vz*vz;
+    if (d2 <= 0) continue;
 
-    BfReal d    = sqrt(d2);
-    BfReal invd = 1.0/d;
-    BfVector3 dir = { v[0]*invd, v[1]*invd, v[2]*invd };
+    double d = sqrt(d2);
 
-    /* along-ray epsilon (don’t push off the normal) */
-    const float eps = fmaxf(1e-8f, 1e-6f * (float)d);
+    /* Open-segment epsilon:
+       - along-ray, symmetric
+       - small absolute, with mild distance scaling */
+    float eps = (float)fmax(1e-6, 1e-6*d);
 
-    struct RTCRay ray;
-    ray.org_x = (float)(pSrc[0] + eps*dir[0]);
-    ray.org_y = (float)(pSrc[1] + eps*dir[1]);
-    ray.org_z = (float)(pSrc[2] + eps*dir[2]);
-    ray.dir_x = (float)dir[0];
-    ray.dir_y = (float)dir[1];
-    ray.dir_z = (float)dir[2];
-    ray.tnear = eps;
-    ray.tfar  = (float)(d - eps);
-    ray.mask  = ~0u;
-    ray.flags = 0;
+    /* If segment is too short after trimming, skip */
+    if ((float)d <= 2.0f*eps) continue;
 
-    struct RTCOccludedArguments oargs;
-    rtcInitOccludedArguments(&oargs);
-    oargs.flags = RTC_RAY_QUERY_FLAG_COHERENT; /* same intent as “context.flags = COHERENT” */
+    /* Normalize direction so tfar is in distance units */
+    double invd = 1.0/d;
+    float dirx = (float)(vx*invd);
+    float diry = (float)(vy*invd);
+    float dirz = (float)(vz*invd);
 
-    rtcOccluded1(trimesh->scene, &ray, &oargs);
+    struct RTCRayHit rayHit;
+    memset(&rayHit, 0, sizeof(rayHit));
 
-    /* Embree 4: occlusion sets tfar < 0 */
-    if (!(ray.tfar < 0.0f)) {
+    struct RTCRay *ray = &rayHit.ray;
+    struct RTCHit *hit = &rayHit.hit;
+
+    /* Offset origin along ray direction by eps to avoid source self-hit */
+    ray->org_x = (float)pSrc[0] + eps*dirx;
+    ray->org_y = (float)pSrc[1] + eps*diry;
+    ray->org_z = (float)pSrc[2] + eps*dirz;
+
+    ray->dir_x = dirx;
+    ray->dir_y = diry;
+    ray->dir_z = dirz;
+
+    ray->tnear = eps;
+    ray->tfar  = (float)d - eps;
+
+    ray->mask  = ~0u;
+    ray->flags = 0;
+
+    /* Ensure “no hit” is detectable */
+    hit->geomID    = RTC_INVALID_GEOMETRY_ID;
+    hit->primID    = RTC_INVALID_GEOMETRY_ID;
+    hit->instID[0] = RTC_INVALID_GEOMETRY_ID;
+
+    /* In OpenSegment mode, reject target-hits too (endpoint exclusion) */
+    bf_tls_vis.tgtInd = tgtInd;
+
+    rtcIntersect1(trimesh->scene, &rayHit, &iargs);
+
+    /* Visible if no accepted hit occurs within (eps, d-eps).
+       If target slips in due to float/tfar rounding, treat as visible. */
+    if (hit->geomID == RTC_INVALID_GEOMETRY_ID || (BfSize)hit->primID == tgtInd) {
       bfSizeArrayAppend(vis, tgtInd);
       HANDLE_ERROR();
     }
   }
+
+  /* Reset for safety (optional) */
+  bf_tls_vis.tgtInd = BF_SIZE_BAD_VALUE;
 
   BF_ERROR_END() {
     bfSizeArrayDeinitAndDealloc(&vis);

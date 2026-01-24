@@ -2178,7 +2178,8 @@ cdef FFBlock _build_ff_block(Trimesh tm,
     cdef double rank_frac
 
     # Leaf-level block (both leaves or size small-enough)
-    if ((leafI and leafJ) or small) and mi >= leaf_min and mj >= leaf_min:
+    # if ((leafI and leafJ) or small) and mi >= leaf_min and mj >= leaf_min:
+    if (leafI and leafJ) or (small and mi >= leaf_min and mj >= leaf_min):
         if ff_debug:
             printf("[ff-debug] leaf candidate: mi=%zu mj=%zu leafI=%d leafJ=%d small=%d\n",
                    mi, mj, leafI, leafJ, small)
@@ -2440,7 +2441,7 @@ cdef Mat _dense_from_csr_block(MatCsrReal A):
                            "col index %zu >= nA=%zu\n", j, nA)
                     fflush(stdout)
                 continue
-            dense_mv[i, j] = da[k]
+            dense_mv[i, j] += da[k]
 
     # Optional NaN/Inf diagnostics
     if np.isnan(dense_mv).any() or np.isinf(dense_mv).any():
