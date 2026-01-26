@@ -113,8 +113,8 @@ static long long gSparseSvd_skip_numZero     = 0;
 static long long gSparseSvd_skip_tiny        = 0;
 
 #ifdef _OPENMP
-  #define BF_SVDSTAT_INC(x) do { _Pragma("omp atomic") (x)++; } while (0)
-  #define BF_SVDSTAT_ADD(x, v) do { _Pragma("omp atomic") (x) += (v); } while (0)
+  #define BF_SVDSTAT_INC(x) do { _Pragma("omp atomic") x++; } while (0)
+  #define BF_SVDSTAT_ADD(x, v) do { _Pragma("omp atomic") x += (v); } while (0)
 #else
   #define BF_SVDSTAT_INC(x) do { (x)++; } while (0)
   #define BF_SVDSTAT_ADD(x, v) do { (x) += (v); } while (0)
@@ -305,6 +305,29 @@ static bool bfIsFiniteReal(BfReal x) {
 #define BF_SPARSE_SVD_PHYSICS_PROBE 1
 #endif
 
+/* B) Cheap PRIMME sanity checks (recommended) */
+#ifndef BF_SPARSE_SVD_SOLVER_SANITY
+#define BF_SPARSE_SVD_SOLVER_SANITY 1
+#endif
+
+/* ||v|| should be ~1; ||A v|| should be ~sigma */
+#ifndef BF_SPARSE_SVD_SANITY_VNORM_TOL
+#define BF_SPARSE_SVD_SANITY_VNORM_TOL 1e-2
+#endif
+
+#ifndef BF_SPARSE_SVD_SANITY_SIG_REL_TOL
+#define BF_SPARSE_SVD_SANITY_SIG_REL_TOL 1e-2
+#endif
+
+/* small orthogonality check for first few right singular vectors */
+#ifndef BF_SPARSE_SVD_SANITY_ORTHO_TOL
+#define BF_SPARSE_SVD_SANITY_ORTHO_TOL 5e-2
+#endif
+
+#ifndef BF_SPARSE_SVD_SANITY_MAXK
+#define BF_SPARSE_SVD_SANITY_MAXK 4
+#endif
+
 /* Physics-probe helpers:
  * - scale floor prevents absurdly strict negativity tests on weak leaves
  * - y_floor skips the physics probe when outputs are numerically negligible
@@ -482,36 +505,61 @@ static bool bfSparseSvdCheckRowSums(
     rs_csr[i] = s;
   }
 
-  /* 2) v_j = sum_i VT[j,i] (x = ones) */
-  for (BfSize j = 0; j < k; ++j) {
-    BfReal sum = 0;
-    BfVecReal *row = bfMatDenseRealGetRowView((BfMatDenseReal *)VT, j);
-    if (row == NULL) {
+  /* 2) v = VT * 1  (avoid per-row GetRowView allocations) */
+  {
+    BfReal *ones = bfMemAlloc(n, sizeof(BfReal));
+    if (ones == NULL) {
+      bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+      /* If we can't check, don't block acceptance */
+      return true;
+    }
+
+    for (BfSize i = 0; i < n; ++i) ones[i] = 1.0;
+
+    BfVecReal ones_view;
+    bfVecRealInitView(&ones_view, n, BF_DEFAULT_STRIDE, ones);
+
+    BfVecReal *vvec =
+      bfVecToVecReal(
+        bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)VT),
+                    bfVecRealToVec(&ones_view)));
+
+    bfMemFree(ones);
+
+    if (vvec == NULL) {
       bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
       return false;
     }
-    for (BfSize i = 0; i < n; ++i)
-      sum += row->data[i*row->stride];
-    v[j] = sum;
-    bfVecRealDeinitAndDealloc(&row);
+
+    for (BfSize j = 0; j < k; ++j)
+      v[j] = vvec->data[j*vvec->stride];
+
+    bfVecRealDeinitAndDealloc(&vvec);
   }
 
   /* 3) t = S * v */
   for (BfSize j = 0; j < k; ++j)
     t[j] = S->data[j] * v[j];
 
-  /* 4) rs_svd = U * t */
-  for (BfSize i = 0; i < m; ++i) {
-    BfReal sum = 0;
-    BfVecReal *ui = bfMatDenseRealGetRowView((BfMatDenseReal *)U, i);
-    if (ui == NULL) {
+  /* 4) rs_svd = U * t  (avoid per-row GetRowView allocations) */
+  {
+    BfVecReal t_view;
+    bfVecRealInitView(&t_view, k, BF_DEFAULT_STRIDE, t);
+
+    BfVecReal *rsvec =
+      bfVecToVecReal(
+        bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)U),
+                    bfVecRealToVec(&t_view)));
+
+    if (rsvec == NULL) {
       bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
       return false;
     }
-    for (BfSize j = 0; j < k; ++j)
-      sum += ui->data[j*ui->stride] * t[j];
-    rs_svd[i] = sum;
-    bfVecRealDeinitAndDealloc(&ui);
+
+    for (BfSize i = 0; i < m; ++i)
+      rs_svd[i] = rsvec->data[i*rsvec->stride];
+
+    bfVecRealDeinitAndDealloc(&rsvec);
   }
 
   /* 5) Compare: per-row combined tolerance
@@ -587,17 +635,35 @@ static bool bfSparseSvdCheckRowSums(
   return ok;
 }
 
-/* Compute p-quantile of y (0<=p<=1). Uses full sort via bfRealArgsort. */
+/* Compute p-quantile of y (0<=p<=1). Uses full argsort via bfRealArgsort. */
 static BfReal bfSparseSvdQuantile(BfReal const *y, BfSize n, double p) {
   if (n == 0) return 0;
-  if (p <= 0) return y[0];
-  if (p >= 1) return y[n - 1];
+
+  /* clamp */
+  if (p < 0.0) p = 0.0;
+  if (p > 1.0) p = 1.0;
 
   BfSize *perm = bfMemAlloc(n, sizeof(BfSize));
-  if (perm == NULL) return y[n - 1]; /* fallback */
+  if (perm == NULL) {
+    /* fallback: return something safe without sorting */
+    return y[n - 1];
+  }
+
   bfRealArgsort(y, n, perm);
 
-  /* index in [0, n-1] */
+  /* endpoints */
+  if (p <= 0.0) {
+    BfReal q = y[perm[0]];
+    bfMemFree(perm);
+    return q;
+  }
+  if (p >= 1.0) {
+    BfReal q = y[perm[n - 1]];
+    bfMemFree(perm);
+    return q;
+  }
+
+  /* nearest-rank index in [0, n-1] */
   double idx_f = p * (double)(n - 1);
   BfSize idx = (BfSize)floor(idx_f + 0.5);
   if (idx >= n) idx = n - 1;
@@ -1009,7 +1075,7 @@ BfReal bfGetMaxEigenvalue(BfMat const *L, BfMat const *M) {
   if (resid == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
-  V = bfMemAlloc(N, ncv*sizeof(BfReal));
+  V = bfMemAlloc((BfSize)N*(BfSize)ncv, sizeof(BfReal));
   if (V == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
@@ -2314,6 +2380,8 @@ static bool bfMatCsrRealSparseTruncatedSvd(BfMatCsrReal const *Acsr,
 {
   BF_ERROR_BEGIN();
 
+  BF_ASSERT(truncSpec != NULL);
+
   /* Always initialize anything that may be freed in cleanup: */
   BfReal *lambda = NULL;
   BfReal *Z = NULL;
@@ -2520,15 +2588,29 @@ if (maxAbs < 1e-11) {
 
   /* --- PRIMME_SVDS backend: get singular values & right singular vectors --- */
 
-  svals    = bfMemAlloc(maxRank, sizeof(BfReal));
-  svecs    = bfMemAlloc((BfSize)(m + n)*maxRank, sizeof(BfReal));
-  resNorms = bfMemAlloc(maxRank, sizeof(BfReal));
+  /* --- PRIMME_SVDS backend: get singular values & right singular vectors --- */
+
+  /* Use an explicit initSize so we can parse svecs deterministically as:
+   *   leftBlock  = U  (m x initSize_in)
+   *   rightBlock = V  (n x initSize_in)
+   * stored as two contiguous column-major blocks.
+   */
+  PRIMME_INT initSize_in = (PRIMME_INT)maxRank;
+  if (initSize_in <= 0) initSize_in = 1;
+
+  svals    = bfMemAlloc((BfSize)initSize_in, sizeof(BfReal));
+  resNorms = bfMemAlloc((BfSize)initSize_in, sizeof(BfReal));
+  svecs    = bfMemAlloc((BfSize)initSize_in * (BfSize)(m + n), sizeof(BfReal));
 
   if (svals == NULL || svecs == NULL || resNorms == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
   primme_svds_params primme;
   primme_svds_initialize(&primme);
+
+  /* A) Fix PRIMME svecs parsing first: be explicit */
+  primme.numOrthoConst = 0;
+  primme.initSize      = initSize_in;
 
   /* Reasonable global matvec cap for this leaf */
   {
@@ -2615,12 +2697,19 @@ if (maxAbs < 1e-11) {
   long long csrAT_delta = csrAT_after - csrAT_before;
   long long csr_total   = csrA_delta + csrAT_delta;
 
-  /* Count how many singular values look “usable” (finite) */
+  /* Prefer PRIMME's reported count (if it returns it via initSize),
+   * otherwise fall back to scanning svals for finiteness.
+   */
   int numConv = 0;
+
+  /* Determine how many usable modes we actually got.
+   * Do NOT infer this from primme.initSize (input parameter); instead
+   * scan returned outputs for sanity.
+   */
   for (int j = 0; j < primme.numSvals; ++j) {
     if (!bfIsFiniteReal(svals[j])) break;
-    /* allow tiny negatives later; but stop if wildly negative/zero */
     if (svals[j] <= 0) break;
+    if (resNorms != NULL && !bfIsFiniteReal(resNorms[j])) break;
     ++numConv;
   }
 
@@ -2695,23 +2784,29 @@ if (maxAbs < 1e-11) {
   if (Z == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
-  BfSize ldsv = m + n;
+  /* A) Parse svecs as two contiguous blocks:
+   *   leftBlock:  m x initSize_in (U)
+   *   rightBlock: n x initSize_in (V)
+   * both stored column-major (each vector contiguous).
+   */
+  const BfReal *leftBlock  = (const BfReal *)svecs;
+  const BfReal *rightBlock = (const BfReal *)svecs + (BfSize)initSize_in * (BfSize)m;
 
-for (BfSize j = 0; j < maxRank; ++j) {
-  BfReal sj = svals[j];
+  for (BfSize j = 0; j < maxRank; ++j) {
+    BfReal sj = svals[j];
 
-  if (!bfIsFiniteReal(sj)) {
-    SPARSE_SVD_LOG(
-      "[bf] sparse SVD: PRIMME returned non-finite s[%lu]=%g; keeping CSR leaf\n",
-      (unsigned long)j, (double)sj);
-    truncated = false;
-    goto cleanup;
-  }
+    if (!bfIsFiniteReal(sj)) {
+      SPARSE_SVD_LOG(
+        "[bf] sparse SVD: PRIMME returned non-finite s[%lu]=%g; keeping CSR leaf\n",
+        (unsigned long)j, (double)sj);
+      truncated = false;
+      goto cleanup;
+    }
 
     /* Allow tiny negative s relative to the largest one */
     BfReal s0 = svals[0];
-    BfReal relTol = 1e-4;           /* tweakable */
-    BfReal absTol = 100*DBL_EPSILON; /* absolute floor */
+    BfReal relTol = 1e-4;
+    BfReal absTol = 100*DBL_EPSILON;
     BfReal negTol = relTol*fabs(s0) + absTol;
 
     if (sj < 0 && fabs(sj) <= negTol) {
@@ -2720,17 +2815,16 @@ for (BfSize j = 0; j < maxRank; ++j) {
       SPARSE_SVD_LOG(
         "[bf] sparse SVD: PRIMME returned significantly negative s[%lu]=%.3e (s0=%.3e); keeping CSR leaf\n",
         (unsigned long)j, (double)sj, (double)s0);
+      truncated = false;
+      goto cleanup;
+    }
 
-    truncated = false;
-    goto cleanup;
-  }
+    lambda[j] = sj*sj;
 
-  lambda[j] = sj*sj;
-
-    /* Right singular vector v_j: last n entries of column j in svecs */
-    const BfReal *col = &svecs[j*ldsv];
+    /* Right singular vector v_j is column j of rightBlock (length n) */
+    const BfReal *vj = rightBlock + (BfSize)j*(BfSize)n;
     for (BfSize i = 0; i < n; ++i)
-      Z[j*n + i] = col[m + i];
+      Z[j*n + i] = vj[i];
   }
 
   SPARSE_SVD_LOG(
@@ -2852,6 +2946,35 @@ for (BfSize j = 0; j < maxRank; ++j) {
       ZSorted[j*n + i] = Z[src_j*n + i];
   }
 
+#if BF_SPARSE_SVD_SOLVER_SANITY
+  /* Optional: quick orthogonality sanity check for first few right vectors */
+  {
+    BfSize kchk = maxRank;
+    if (kchk > (BfSize)BF_SPARSE_SVD_SANITY_MAXK) kchk = (BfSize)BF_SPARSE_SVD_SANITY_MAXK;
+
+    for (BfSize a = 0; a < kchk; ++a) {
+      for (BfSize b = 0; b < a; ++b) {
+        double dot = 0.0;
+        const BfReal *va = &ZSorted[a*n];
+        const BfReal *vb = &ZSorted[b*n];
+        for (BfSize i = 0; i < n; ++i) dot += (double)va[i] * (double)vb[i];
+
+        if (fabs(dot) > (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL) {
+          SPARSE_SVD_LOG(
+            "[bf] sparse SVD: solver sanity reject (V-ortho): a=%lu b=%lu dot=%.3e tol=%.3e\n",
+            (unsigned long)a, (unsigned long)b, dot, (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL);
+#if BF_SPARSE_SVD_STATS
+          BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+          bfSparseSvdMaybePrintStats();
+#endif
+          truncated = false;
+          goto cleanup;
+        }
+      }
+    }
+  }
+#endif
+
   Sfull = bfMatDiagRealNew();
   HANDLE_ERROR();
 
@@ -2970,16 +3093,16 @@ for (BfSize j = 0; j < maxRank; ++j) {
         double si = (double)Sfull->data[i];
         total += si*si;
       }
-      double tail = 0.0; /* tail beyond maxRank is unknown; assume 0 */
-      double relTail = (total > 0.0) ? sqrt(tail/total) : 0.0;
-
-      /* If total is ~0, treat as achieved (effectively zero block). */
-      if (total > 0.0 && relTail > (double)truncSpec->tol) {
+      /* With Frobenius-tail tol, if we used all computed modes (k==maxRank),
+       * we cannot certify the remaining tail beyond maxRank. Be conservative
+       * and mark tol as not achieved unless the block is effectively zero.
+       */
+      if (total > 0.0) {
         achievedTol = false;
         SPARSE_SVD_LOG(
-          "[bf] sparse SVD: did not reach Frobenius-tail tol before maxRank "
-          "(maxRank=%lu, relTail=%.3e > tol=%.3e)\n",
-          (unsigned long)maxRank, relTail, (double)truncSpec->tol);
+          "[bf] sparse SVD: cannot certify Frobenius-tail tol with k==maxRank "
+          "(maxRank=%lu, tol=%.3e); treating as not achieved\n",
+          (unsigned long)maxRank, (double)truncSpec->tol);
       }
     } else {
       /* Spectral tol: s_last/s0 <= tol */
@@ -3083,6 +3206,52 @@ for (BfSize j = 0; j < maxRank; ++j) {
     BfVecReal *tmpReal =
       bfVecToVecReal(bfMatMulVec(Amat, bfVecRealToVec(&vj_view)));
     HANDLE_ERROR();
+
+#if BF_SPARSE_SVD_SOLVER_SANITY
+    /* Sanity: ||v||~1 and ||A v||~sigma (before scaling) */
+    {
+      double nv2 = 0.0;
+      for (BfSize i = 0; i < n; ++i) {
+        double vi = (double)ZSorted[j*n + i];
+        nv2 += vi*vi;
+      }
+      double nv = sqrt(nv2);
+
+      double nAv2 = 0.0;
+      for (BfSize i = 0; i < m; ++i) {
+        double yi = (double)tmpReal->data[i*tmpReal->stride];
+        nAv2 += yi*yi;
+      }
+      double nAv = sqrt(nAv2);
+
+      if (fabs(nv - 1.0) > (double)BF_SPARSE_SVD_SANITY_VNORM_TOL) {
+        SPARSE_SVD_LOG(
+          "[bf] sparse SVD: solver sanity reject: ||v||=%.6e (tol=%.3e) j=%lu\n",
+          nv, (double)BF_SPARSE_SVD_SANITY_VNORM_TOL, (unsigned long)j);
+#if BF_SPARSE_SVD_STATS
+        BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+        bfSparseSvdMaybePrintStats();
+#endif
+        truncated = false;
+        goto cleanup;
+      }
+
+      if (sj > 0) {
+        double rel = fabs(nAv - (double)sj) / (double)sj;
+        if (rel > (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL) {
+          SPARSE_SVD_LOG(
+            "[bf] sparse SVD: solver sanity reject: ||A v||=%.6e sigma=%.6e rel=%.3e tol=%.3e j=%lu\n",
+            nAv, (double)sj, rel, (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL, (unsigned long)j);
+#if BF_SPARSE_SVD_STATS
+          BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+          bfSparseSvdMaybePrintStats();
+#endif
+          truncated = false;
+          goto cleanup;
+        }
+      }
+    }
+#endif
 
     if (sj > 0) {
       BfReal invSj = 1.0/sj;
@@ -3219,7 +3388,14 @@ for (BfSize j = 0; j < maxRank; ++j) {
       /* VT2 last row = (1/n) * 1^T */
       {
         BfReal *ones = bfMemAlloc(n2, sizeof(BfReal));
-        if (ones == NULL) { bfMemFree(d); goto rowsum_reject; }
+        if (ones == NULL) {
+          /* Avoid leaking expanded factors on this failure path */
+          bfMemFree(d);
+          bfMatDenseRealDeinitAndDealloc(&U2);
+          bfMatDenseRealDeinitAndDealloc(&VT2);
+          bfMatDiagRealDeinitAndDealloc(&S2);
+          goto rowsum_reject;
+        }
         BfReal invn = (n2 > 0) ? (1.0/(BfReal)n2) : 0.0;
         for (BfSize i = 0; i < n2; ++i) ones[i] = invn;
         BfVecReal ov;
@@ -3314,7 +3490,7 @@ rowsum_ok:
         /* t_j = s_j * dot(v_j, x) where v_j is row j of VT */
         for (BfSize j = 0; j < k; ++j) {
           BfVecReal *vj = bfMatDenseRealGetRowView(VT, j);
-          if (vj == NULL) { truncated = false; goto cleanup; }
+          if (vj == NULL) { truncated = false; goto probe_cleanup; }
 
           BfReal dot = 0;
           for (BfSize i = 0; i < n; ++i)
@@ -3328,7 +3504,7 @@ rowsum_ok:
         /* y = U * t */
         for (BfSize i = 0; i < m; ++i) {
           BfVecReal *ui = bfMatDenseRealGetRowView(U, i);
-          if (ui == NULL) { truncated = false; goto cleanup; }
+          if (ui == NULL) { truncated = false; goto probe_cleanup; }
 
           BfReal sum = 0;
           for (BfSize j = 0; j < k; ++j)
@@ -3432,12 +3608,25 @@ rowsum_ok:
         }
       }
 
+probe_done:
       bfMemFree(x);
       bfMemFree(y);
       bfMemFree(t);
+      goto probe_after;
+
+probe_cleanup:
+      /* Ensure no leaks on early abort inside the probe */
+      if (x) bfMemFree(x);
+      if (y) bfMemFree(y);
+      if (t) bfMemFree(t);
+      goto cleanup;
+
+probe_after:
+      ;
     }
   }
 #endif
+
 
   *UPtr  = bfMatDenseRealToMat(U);
   *SPtr  = S;

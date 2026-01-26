@@ -500,8 +500,7 @@ static void bfVfSvdLeafDeinit(BfVfSvdLeaf *leaf) {
   bfSizeArrayDeinit(&leaf->colInds);
   if (leaf->mat != NULL) {
     /* mat is a generic Mat (actually MatProduct); use BF's Mat destructor */
-    bfMatDelete(&leaf->mat);  /* or whatever your Mat destroy function is */
-  }
+    bfMatDelete(&leaf->mat);  /* or whatever your Mat destroy function is */  }
   if (leaf->work != NULL) {
     bfMemFree(leaf->work);
     leaf->work = NULL;
@@ -1481,8 +1480,8 @@ static void bfVfSvdLeafApply(BfVfSvdLeaf const *leaf,
 
   /* ySub = (U S V^T) * xSub via MatProduct */
   BfVec *vyBase = bfMatMulVec(leaf->mat, bfVecRealToVec(vx));
-  BfVecReal *vy = bfVecToVecReal(vyBase);
-  BfReal const *yData = bfVecRealGetDataPtr(vy);
+  BfVecReal const *vy = bfVecConstToVecRealConst(vyBase);
+  BfReal const *yData = bfVecRealGetDataConstPtr(vy);
 
   /* Scatter-add into global y */
   for (BfSize i = 0; i < m; ++i) {
@@ -1492,7 +1491,7 @@ static void bfVfSvdLeafApply(BfVfSvdLeaf const *leaf,
   }
 
   bfVecRealDeinitAndDealloc(&vx);
-  bfVecRealDeinitAndDealloc(&vy);
+  bfVecDeinitAndDealloc(&vyBase);
 }
 
 void bfVfHierApply(BfVfHier const *vfHier,
@@ -1549,44 +1548,32 @@ void bfVfHierDeinitAndDealloc(BfVfHier **vfHierPtr) {
   bfVfHierDealloc(vfHierPtr);
 }
 
-static void reindexCsrColsToLocal(BfMatCsrReal *Acsr,
-                                  BfSizeArray const *colFaces,
-                                  BfSize nFaces) {
-  BfMat *A = bfMatCsrRealToMat(Acsr);
-  BfSize mA = bfMatGetNumRows(A);
-  BfSize nA = bfMatGetNumCols(A);
+static void reindexCsrColsToLocal(BfMatCsrReal *A, BfSizeArray const *colFaces, BfSize nFaces) {
+  (void)colFaces;
+  (void)nFaces;
 
-  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(Acsr);
-  BfSize *colind = (BfSize *)bfMatCsrRealGetColindConstPtr(Acsr);
+  BfSize mA = bfMatGetNumRows(bfMatCsrRealToMat(A));
+  BfSize nA = bfMatGetNumCols(bfMatCsrRealToMat(A));
+  BfSize nnz = A->rowptr[mA];
 
-  BF_ASSERT(rowptr && colind);
-
-  BfSize nnz = rowptr[mA];
-  BfSize maxCol = 0;
-  for (BfSize k = 0; k < nnz; ++k)
-    if (colind[k] > maxCol) maxCol = colind[k];
-
-  if (maxCol < nA)
-    return;  /* already local */
-
-  BfSize *globalToLocal = bfMemAlloc(nFaces, sizeof(BfSize));
-  for (BfSize t = 0; t < nFaces; ++t)
-    globalToLocal[t] = BF_SIZE_BAD_VALUE;
-
-  for (BfSize j = 0; j < nA; ++j) {
-    BfSize g = bfSizeArrayGet((BfSizeArray *)colFaces, j);
-    globalToLocal[g] = j;
-  }
-
+  /* Hard invariant (no heuristics): CSR column indices MUST already be local. */
   for (BfSize k = 0; k < nnz; ++k) {
-    BfSize g = colind[k];
-    BF_ASSERT(g < nFaces);
-    BfSize local = globalToLocal[g];
-    BF_ASSERT(local < nA);
-    ((BfSize *)colind)[k] = local;  /* const-cast ok here */
+    BF_ASSERT(A->colind[k] < nA);
   }
+}
 
-  bfMemFree(globalToLocal);
+static void assertCsrColsLocal(BfMatCsrReal const *A) {
+  BfMat const *A0 = bfMatCsrRealConstToMatConst(A);
+  BfSize m = bfMatGetNumRows(A0);
+  BfSize n = bfMatGetNumCols(A0);
+
+  BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(A);
+  BfSize const *ci = bfMatCsrRealGetColindConstPtr(A);
+  BF_ASSERT(rp && ci);
+
+  BfSize nnz = rp[m];
+  for (BfSize k = 0; k < nnz; ++k)
+    BF_ASSERT(ci[k] < n);
 }
 
 static BfVfHierBlock *makeLeafWithOptionalSvd(
@@ -1646,8 +1633,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
 
   /* NEAR or SVD disabled: keep CSR leaf, but ENFORCE local columns invariant */
   if (!far || minSvdSize == 0) {
-    BfSize nFaces = bfTrimeshGetNumFaces(tm);
-    reindexCsrColsToLocal(Acsr, &colInds, nFaces);
+    /* CSR colind MUST already be local indices into colInds[] */
+    assertCsrColsLocal(Acsr);
 
     block->kind                = BF_VF_HIER_BLOCK_SPARSE;
     block->data.sparse.rowInds = rowInds;
@@ -1663,9 +1650,8 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     return block;
   }
 
-  /* FAR + SVD enabled: now you may need local columns */
-  BfSize nFaces = bfTrimeshGetNumFaces(tm);
-  reindexCsrColsToLocal(Acsr, &colInds, nFaces);
+  /* FAR + SVD enabled: CSR colind MUST already be local indices into colInds[] */
+  assertCsrColsLocal(Acsr);
 
   /* FAR and SVD enabled: decide whether to SVD-compress */
   unsigned long long blockSize =
@@ -2240,6 +2226,8 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     bfSizeArrayDeinit(&childColFaces);
     return NULL;
   }
+
+  assertCsrColsLocal(Acsr);
 
   BfMat *A = bfMatCsrRealToMat(Acsr);
   BfSize mA = bfMatGetNumRows(A);
@@ -3073,11 +3061,8 @@ static BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
     return NULL;
   }
 
-  /* Reindex to fit bfMatCsrRealNewSubmatrixFromIndices’s assumption (gCol < nCols) */
-  {
-    BfSize nFaces = bfTrimeshGetNumFaces(tm);
-    reindexCsrColsToLocal(A_par, &colFaces_par, nFaces);
-  }
+  /* Parent CSR colind MUST already be local indices into colFaces_par[] */
+  assertCsrColsLocal(A_par);
 
   /* NEW: optional heuristic — keep parent CSR as a single leaf
    * if we expect a hierarchy to be more expensive than the full block.
