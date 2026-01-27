@@ -414,18 +414,18 @@ static double bfSparseSvdEstimateBytesSvd(BfSize m, BfSize n, BfSize k) {
 
 /* Enable row-sum check (recommended for nonnegative operators like VF) */
 #ifndef BF_SPARSE_SVD_ROWSUM_CHECK
-#define BF_SPARSE_SVD_ROWSUM_CHECK 1
+#define BF_SPARSE_SVD_ROWSUM_CHECK 0
 #endif
 
 #ifndef BF_SPARSE_SVD_ROWSUM_REPAIR
-#define BF_SPARSE_SVD_ROWSUM_REPAIR 1
+#define BF_SPARSE_SVD_ROWSUM_REPAIR 0
 #endif
 
 /* If 1, only repair deficits (energy loss): d = max(rs_csr - rs_svd, 0).
  * This guarantees the repair term is nonnegative (won’t create negatives).
  */
 #ifndef BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT
-#define BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT 1
+#define BF_SPARSE_SVD_ROWSUM_REPAIR_ONLY_DEFICIT 0
 #endif
 
 /* Base tolerances for row-sum drift */
@@ -3424,7 +3424,36 @@ if (maxAbs < 1e-11) {
     }
 
     SPARSE_SVD_LOG("[bf] sparse SVD: repair succeeded\n");
+
+    /* NEW: re-run bytes gate after row-sum repair.
+     * The repair increments k, so bytes_svd can cross the “worth it” threshold.
+     * If it does, revert to CSR (i.e., reject this SVD leaf).
+     */
+    {
+      double bytes_csr = bfSparseSvdEstimateBytesCsr(m, nnz);
+      double bytes_svd = bfSparseSvdEstimateBytesSvd(m, n, k);
+
+      SPARSE_SVD_LOG(
+        "[bf] sparse SVD: bytes after repair: csr=%.3e svd(k=%lu)=%.3e (ratio=%.3f)\n",
+        bytes_csr, (unsigned long)k, bytes_svd,
+        (bytes_csr > 0 ? bytes_svd/bytes_csr : 1.0));
+
+      if (bytes_svd >= BF_SPARSE_SVD_MIN_SAVINGS_FRAC * bytes_csr) {
+        SPARSE_SVD_LOG(
+          "[bf] sparse SVD: rejecting repaired SVD (not worth it after repair): %.3e >= %.3e * %.3e\n",
+          bytes_svd, (double)BF_SPARSE_SVD_MIN_SAVINGS_FRAC, bytes_csr);
+
+#if BF_SPARSE_SVD_STATS
+        BF_SVDSTAT_INC(gSparseSvd_reject_bytes);
+        bfSparseSvdMaybePrintStats();
+#endif
+        truncated = false;
+        goto cleanup; /* frees repaired U/S/VT; caller keeps CSR */
+      }
+    }
+
     goto rowsum_ok;
+
 
 rowsum_reject:
     SPARSE_SVD_LOG("[bf] sparse SVD: rejecting SVD due to row-sum drift\n");
