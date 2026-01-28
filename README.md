@@ -13,20 +13,85 @@ Additionally:
 
 ## Compilation
 
+### Generic build (Meson)
+
 Use [Meson](https://mesonbuild.com/) to compile this library:
-```
+
+```bash
 meson setup builddir
 cd builddir
 meson compile
 ```
+
 This will build all of the examples, as well. Afterwards, the compiled executables for the examples will be in `./builddir/examples`.
 
-For Mac machines using homebrew, it may be necessary to specify paths to dependencies by passing the `-Dc_args` flag to meson, e.g. 
-```
+For Mac machines using homebrew, it may be necessary to specify paths to dependencies by passing the `-Dc_args` flag to meson, e.g.
+
+```bash
 meson setup builddir -Dc_args='-I/opt/homebrew/Cellar/suite-sparse/7.1.0/include/ -I/opt/homebrew/Cellar/openblas/0.3.24/include/'
 ```
 
-### Error handling
+### HPC build (Spack + Python venv)
+
+On our HPC systems we typically manage native dependencies with **Spack** and install the Python extensions into a **Python virtualenv**.
+
+#### 1) Spack environment (one-time)
+
+If this repo includes `spack.yaml` / `spack.lock` (recommended), you can reproduce the dependency environment like this:
+
+```bash
+. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
+spack env activate butterfly
+spack concretize -f
+spack install
+```
+
+Notes:
+
+* `spack.yaml` describes the dependency intent (packages/variants).
+* `spack.lock` pins a concretized solution for a given platform/compiler stack. On the same HPC (same OS/arch/compiler), using the lock file helps colleagues get the same dependency DAG.
+
+#### 2) Build + install butterfly into a venv (repeatable)
+
+Use the repo script:
+
+```bash
+. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
+spack env activate butterfly
+bash scripts/build_install_butterfly.sh
+```
+
+By default this does an incremental rebuild (keeps `build/`). To force a clean reconfigure/rebuild:
+
+```bash
+CLEAN=1 bash scripts/build_install_butterfly.sh
+```
+
+The script installs into:
+
+* `VENV_DIR=$HOME/nobackup/venvs/butterfly` (override via env var)
+
+and verifies imports:
+
+```bash
+python -c "import butterfly; print('butterfly OK')"
+python -c "import thermal_bf; print('thermal_bf OK')"
+```
+
+Common overrides:
+
+```bash
+# disable embree features
+WITH_EMBREE=0 bash scripts/build_install_butterfly.sh
+
+# build C library only (no Python extensions)
+WITH_PYTHON=0 bash scripts/build_install_butterfly.sh
+
+# set a non-default primme location
+PRIMME_ROOT=/path/to/primme bash scripts/build_install_butterfly.sh
+```
+
+## Error handling
 
 This library features "OpenGL-style" error handling (e.g., [see this page](https://www.khronos.org/opengl/wiki/OpenGL_Error)). The guiding principles are three-fold:
 
@@ -52,9 +117,9 @@ This library includes a set of types for modeling recursively composed hierarchi
 
 See the following GitHub issues:
 
-- https://github.com/msys2/MINGW-packages/issues/12857
-- https://github.com/xianyi/OpenBLAS/issues/3740
-- https://github.com/xianyi/OpenBLAS/issues/4013
+* [https://github.com/msys2/MINGW-packages/issues/12857](https://github.com/msys2/MINGW-packages/issues/12857)
+* [https://github.com/xianyi/OpenBLAS/issues/3740](https://github.com/xianyi/OpenBLAS/issues/3740)
+* [https://github.com/xianyi/OpenBLAS/issues/4013](https://github.com/xianyi/OpenBLAS/issues/4013)
 
 A bug in GCC 12's optimizer causes `zgemv` to segfault. This problem will arise if you ask butterfly to compute a complex SVD while running GCC 12 and OpenBLAS.
 

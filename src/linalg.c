@@ -45,7 +45,7 @@ _Static_assert(sizeof(BfReal) == sizeof(double),
 /* ---- CSR SVD debug logging ----------------------------------------- */
 
 #ifndef BF_SPARSE_SVD_DEBUG
-    #define BF_SPARSE_SVD_DEBUG 1
+    #define BF_SPARSE_SVD_DEBUG 0
 #endif
 
 #if BF_SPARSE_SVD_DEBUG
@@ -97,7 +97,7 @@ static double bfPrimmeSvdsMaxWalltime(void) {
 
 /* Print summary every N leaf attempts (0 disables periodic printing) */
 #ifndef BF_SPARSE_SVD_STATS_EVERY
-#define BF_SPARSE_SVD_STATS_EVERY 500
+#define BF_SPARSE_SVD_STATS_EVERY 0
 #endif
 
 /* Counters (best-effort; in OpenMP builds, use atomic updates) */

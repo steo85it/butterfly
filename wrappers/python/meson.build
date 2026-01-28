@@ -11,3 +11,21 @@ python3.extension_module(
   dependencies : [python3_dep, butterfly_dep, numpy_dep],
   install : true
 )
+
+python3.extension_module(
+  'thermal_bf',
+  sources : [
+    'thermal_bf.pyx',
+    pcc_src,
+  ],
+  include_directories : [
+    butterfly_inc,
+    pcc_inc,
+  ],
+  dependencies : [
+    butterfly_dep,
+    python3_dep,
+    numpy_dep,
+  ],
+  install : true,
+)

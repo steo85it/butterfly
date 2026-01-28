@@ -134,19 +134,22 @@ if openmp_dep.found()
   butterfly_dependencies += [openmp_dep]
 endif
 
-# --- PRIMME (optional) ----------------------------------------------------
-primme_dep = dependency('', required : false)  # dummy init
+# --- PRIMME (optional, but REQUIRED when enabled) --------------------------
+primme_dep = disabler()
 
 if get_option('primme').enabled()
   primme_root = get_option('primme_root')
 
   if primme_root != ''
     primme_incdir = include_directories(join_paths(primme_root, 'include'))
-    primme_libdir = join_paths(primme_root, 'lib')
+
+    primme_libdir64 = join_paths(primme_root, 'lib64')
+    primme_libdir   = join_paths(primme_root, 'lib')
+    primme_libdirs  = fs.is_dir(primme_libdir64) ? [primme_libdir64] : [primme_libdir]
 
     primme_lib = cc.find_library(
       'primme',
-      dirs : [primme_libdir],
+      dirs : primme_libdirs,
       required : true
     )
 
@@ -155,17 +158,13 @@ if get_option('primme').enabled()
       dependencies        : [primme_lib]
     )
   else
-    # If you ever install primme system-wide and/or add a .pc file:
-    primme_dep = dependency('primme', required : false)
+    # Requires a primme.pc in PKG_CONFIG_PATH
+    primme_dep = dependency('primme', required : true)
   endif
 
-  if primme_dep.found()
-    message('PRIMME found — enabling primme_svds backend')
-    add_project_arguments('-DBF_HAVE_PRIMME_SVDS', language : 'c')
-    butterfly_dependencies += [primme_dep]
-  else
-    message('PRIMME requested but not found — building without primme_svds')
-  endif
+  message('PRIMME found — enabling primme_svds backend')
+  add_project_arguments('-DBF_HAVE_PRIMME_SVDS', language : 'c')
+  butterfly_dependencies += [primme_dep]
 endif
 # --------------------------------------------------------------------------
 
@@ -261,10 +260,6 @@ if get_option('python').enabled()
   butterfly_lib_src += ['src/mat_python.c']
 endif
 
-#if arpack_dep.found()
-#  butterfly_lib_src += ['src/linalg.c']   # and 'src/lbo.c' if applicable
-#endif
-
 butterfly_inc = include_directories('include')
 
 butterfly_include_directories = [
@@ -289,32 +284,16 @@ install_subdir('include/bf', install_dir : 'include', install_tag : 'devel')
 pkg.generate(butterfly_lib)
 
 if get_option('python').enabled()
-  # PCC: absolute paths OK for now (but consider vendoring/copying later)
-  pcc_inc = include_directories('/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc')
+  # ---- PCC (vendored) ----
+  pcc_dir = get_option('pcc_dir')
+  pcc_root = join_paths(meson.project_source_root(), pcc_dir)
+
+  pcc_inc = include_directories(pcc_root)
 
   pcc_src = files(
-    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/conductionQ.c',
-    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/conductionT.c',
-    '/home/sberton2/nobackup/illumrad/python-flux/src/flux/pcc/tridag.c'
-  )
-
-  python3.extension_module(
-    'thermal_bf',
-    sources : [
-      'wrappers/python/thermal_bf.pyx',
-      pcc_src,
-    ],
-    include_directories : [
-      butterfly_inc,
-      pcc_inc,
-      # numpy include is already in numpy_dep, so not needed explicitly
-    ],
-    dependencies : [
-      butterfly_dep,
-      python3_dep,
-      numpy_dep,
-    ],
-    install : true,
+    join_paths(pcc_root, 'conductionQ.c'),
+    join_paths(pcc_root, 'conductionT.c'),
+    join_paths(pcc_root, 'tridag.c'),
   )
 endif
 

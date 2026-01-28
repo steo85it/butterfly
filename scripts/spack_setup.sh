@@ -2,7 +2,7 @@
 # . /path/to/spack/share/spack/setup-env.sh
 
 #spack env create butterfly
-. /panfs/ccds02/nobackup/people/sberton2/.spack_repo/share/spack/setup-env.sh
+. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
 spack env activate butterfly
 
 # Core toolchain
@@ -33,7 +33,7 @@ spack install
 
 
 # when installed
-. /panfs/ccds02/nobackup/people/sberton2/.spack_repo/share/spack/setup-env.sh
+. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
 spack env activate butterfly
 
 #spack load openblas suite-sparse arpack-ng gsl
@@ -41,22 +41,22 @@ spack env activate butterfly
 #spack load py-numpy py-cython
 #spack load /rbonybh ninja meson pkgconf
 #spack load suite-sparse openblas arpack-ng gsl embree
-spack load /k5oyloa /rbonybh /yz4faop /kg47p7y /mpuudue py-cython ninja meson suite-sparse arpack-ng embree
+spack load /k5oyloa /rbonybh /yz4faop /kg47p7y /mpuudue py-cython ninja meson suite-sparse embree
 ml load gcc/12.1.0
 
-python3 -m venv ~/nobackup/venvs/butterfly
-source ~/nobackup/venvs/butterfly/bin/activate
+python3 -m venv $HOME/nobackup/venvs/butterfly
+source $HOME/nobackup/venvs/butterfly/bin/activate
 pip install --upgrade pip wheel
 pip install numpy cython scipy  # use venv’s NumPy for headers
 pip install matplotlib cached_property
 
-# add deps
-cd ~/nobackup/illumrad/python-flux
-pip install .
-
-source ~/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
-cd ~/nobackup/illumrad/python-embree
-pip install .
+## add deps
+#cd $HOME/nobackup/illumrad/python-flux
+#pip install .
+#
+#source $HOME/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
+#cd $HOME/nobackup/illumrad/python-embree
+#pip install .
 
 # go back to pwd
 cd ~/nobackup/butterfly
@@ -72,7 +72,7 @@ OB=$(spack location -i openblas)
 for d in "$SS/lib64" "$SS/lib"; do [ -d "$d" ] && LIBDIR="$d" && break; done
 
 # PRIMME (built in-tree under primme/)
-PRIMME_ROOT="$PWD/../primme"
+PRIMME_ROOT="$HOME/nobackup/primme"
 
 # headers (adjust if you copied them into include/ already)
 PRIMME_INC="$PRIMME_ROOT/include"
@@ -122,9 +122,8 @@ ninja -C build -v
 meson install -C build
 
 # this should now work with both active
-. /panfs/ccds02/nobackup/people/sberton2/.spack_repo/share/spack/setup-env.sh
+. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
 spack env activate butterfly # (needed for blas, gsl, etc)
-source ~/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
-source ~/nobackup/venvs/butterfly/bin/activate # (needed to import butterfly)
+source $HOME/nobackup/venvs/butterfly/bin/activate # (needed to import butterfly)
 python -c "import butterfly; print('butterfly OK')"
 

@@ -27,7 +27,7 @@ option('tests', type : 'feature', value : 'disabled',
 option(
   'primme',
   type : 'feature',
-  value : 'disabled',
+  value : 'enabled',
   description : 'Enable PRIMME (primme_svds) in butterfly'
 )
 option(
@@ -35,4 +35,11 @@ option(
   type : 'string',
   value : '',
   description : 'Root directory of PRIMME source/build tree (with include/ and lib/)'
+)
+
+option(
+  'pcc_dir',
+  type : 'string',
+  value : 'third_party/flux_pcc',
+  description : 'Path (relative to project root) containing PCC sources (thrmlLib.h, conductionQ.c, conductionT.c, tridag.c)'
 )

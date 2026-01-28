@@ -687,7 +687,7 @@ cdef class MatCsrReal(Mat):
                 if j >= n:
                     if ff_debug:
                         printf("[ff-debug] MatCsrReal.to_dense_ndarray: "
-                               "col index %zu out of range for shape (%zu, %zu) "
+                               "col index %zu expected of range for shape (%zu, %zu) "
                                "(row i=%zu, k=%zu, row_start=%zu, row_end=%zu)\n",
                                j, m, n, i, k, row_start, row_end)
                         fflush(stdout)
@@ -2055,7 +2055,7 @@ cdef bint _check_index_range(SizeArray idx,
         v = ptr[i]
         if v >= nFaces:
             if ff_debug:
-                printf("[ff-debug] %s index out of range: %zu >= %zu (pos=%zu)\n",
+                printf("[ff-debug] %s index expected of range: %zu >= %zu (pos=%zu)\n",
                        label, v, nFaces, i)
                 fflush(stdout)
             return 0
@@ -2135,7 +2135,7 @@ cdef FFBlock _build_ff_block(Trimesh tm,
             printf("[ff-debug] ERROR: mi=%zu mj=%zu > nFaces=%zu\n",
                    mi, mj, nFaces)
             fflush(stdout)
-        raise RuntimeError("hierarchical block size out of range")
+        raise RuntimeError("hierarchical block size expected of range")
 
     cdef bint small = (mi <= leaf_max) and (mj <= leaf_max)  # check if ok or restate OR
 
@@ -2335,7 +2335,7 @@ cdef FFBlock _build_ff_block(Trimesh tm,
                                     leaf_max, leaf_min,
                                     min_svd_size, max_svd_rank_frac))
 
-    # Filter out any empty children
+    # Filter expected any empty children
     children = [c for c in children if c is not None]
     if not children:
         if ff_debug:
