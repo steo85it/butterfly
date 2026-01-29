@@ -105,9 +105,17 @@ else
 endif
 
 if host_machine.system() == 'linux'
-  blas_dep = dependency('flexiblas', required : true)
+  # Prefer flexiblas (runtime-selectable BLAS backend) if available.
+  blas_dep = dependency('flexiblas', required : false)
+
+  if not blas_dep.found()
+    message('FlexiBLAS not found — falling back to OpenBLAS')
+    blas_dep = cc.find_library('openblas', required : true)
+  endif
+
   lapacke_dep = dependency('lapacke', required : true)
-  butterfly_dependencies += [blas_dep, lapacke_dep]
+  lapack_dep  = dependency('lapack', required : true)  # Fortran LAPACK (dsyevx_, dgetrf_, ...)
+  butterfly_dependencies += [blas_dep, lapacke_dep, lapack_dep]
   add_project_arguments('-D_DEFAULT_SOURCE', language : 'c')
 elif host_machine.system() == 'darwin'
   blas_dep = cc.find_library('openblas', required : true)
@@ -163,8 +171,12 @@ if get_option('primme').enabled()
   endif
 
   message('PRIMME found — enabling primme_svds backend')
-  add_project_arguments('-DBF_HAVE_PRIMME_SVDS', language : 'c')
+  add_project_arguments('-DBF_HAVE_PRIMME_SVDS=1', language : 'c')
   butterfly_dependencies += [primme_dep]
+else
+  # Build-system truth for PRIMME backend availability:
+  # default to 0, set to 1 only when primme option is enabled AND found.
+  add_project_arguments('-DBF_HAVE_PRIMME_SVDS=0', language : 'c')
 endif
 # --------------------------------------------------------------------------
 
@@ -286,14 +298,15 @@ pkg.generate(butterfly_lib)
 if get_option('python').enabled()
   # ---- PCC (vendored) ----
   pcc_dir = get_option('pcc_dir')
-  pcc_root = join_paths(meson.project_source_root(), pcc_dir)
 
-  pcc_inc = include_directories(pcc_root)
+  # pcc_dir is meant to be a path *relative to the project root*.
+  # Keep it relative so Meson can map source/build dirs correctly.
+  pcc_inc = include_directories(pcc_dir)
 
   pcc_src = files(
-    join_paths(pcc_root, 'conductionQ.c'),
-    join_paths(pcc_root, 'conductionT.c'),
-    join_paths(pcc_root, 'tridag.c'),
+    join_paths(pcc_dir, 'conductionQ.c'),
+    join_paths(pcc_dir, 'conductionT.c'),
+    join_paths(pcc_dir, 'tridag.c'),
   )
 endif
 

@@ -1,6 +1,3 @@
-# If Spack isn’t on your PATH, source it first
-# . /path/to/spack/share/spack/setup-env.sh
-
 #spack env create butterfly
 . $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
 spack env activate butterfly
@@ -11,24 +8,21 @@ spack add cmake ninja meson pkgconf
 # Math stack
 spack add openblas  # (or intel-oneapi-mkl if you prefer)
 spack add suite-sparse   # (CHOLMOD/UMFPACK come from here)
-spack add arpack-ng +icb
+#spack add arpack-ng +icb
 spack add gsl
 
 # Geometry & ray tracing
 #spack add onetbb         # Embree’s threading backend
-#spack add embree@4:
+spack add embree@4:
 
 # Optional (tests / CLI parsing)
 #spack add argtable3
 spack add cmocka
 
 # Python bits (build the wrapper inside your venv, but these help if needed)
-spack add py-numpy py-cython py-pip py-setuptools py-scipy
+spack add py-numpy py-cython py-pip py-setuptools py-scipy netlib-lapack
 
-# Optional: OpenMP (usually provided by compiler, but make sure we can link it)
-#spack add llvm-openmp  # if using clang; for GCC you don’t need this
-
-#spack concretize -f
+spack concretize -f
 spack install
 
 
@@ -50,19 +44,9 @@ pip install --upgrade pip wheel
 pip install numpy cython scipy  # use venv’s NumPy for headers
 pip install matplotlib cached_property
 
-## add deps
-#cd $HOME/nobackup/illumrad/python-flux
-#pip install .
-#
-#source $HOME/nobackup/illumrad/embree-3.12.1.x86_64.linux/embree-vars.sh
-#cd $HOME/nobackup/illumrad/python-embree
-#pip install .
-
 # go back to pwd
 cd ~/nobackup/butterfly
 
-# (1) Load everything you need:
-# if you use clang+OpenMP, also: spack load llvm-openmp
 ### from here also fine if env already loaded
 # 0) Vars
 INC="$PWD/include"
@@ -107,7 +91,7 @@ meson setup build \
   -Dbuildtype=release \
   -Dembree=enabled \
   -Dpython=enabled \
-  -Dc_args="-DBF_DOUBLE -I$INC -I$SS/include -I$OB/include -I$LAP/include -I$PWD/build/ss-compat -include $INC/bf/blas.h" \
+  -Dc_args="-DBF_DOUBLE -I$INC -I$SS/include -I$LAP/include -I$OB/include -I$PWD/build/ss-compat -include $INC/bf/blas.h" \
   -Dc_link_args="\
       -L$LIBDIR   -Wl,-rpath,$LIBDIR \
       -L$FLEXLIB  -Wl,-rpath,$FLEXLIB \
