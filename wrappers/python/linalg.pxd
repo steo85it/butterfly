@@ -11,7 +11,7 @@ from mat_diag_real cimport BfMatDiagReal
 cdef extern from "bf/linalg.h":
     ctypedef enum BfBackend:
         BF_BACKEND_LAPACK
-        BF_BACKEND_ARPACK
+        BF_BACKEND_SVDS
 
     cdef struct BfTruncSpec:
         bint usingTol

@@ -20,17 +20,41 @@
 #include <bf/vec_real.h>
 #include <bf/mat_csr_real.h>
 
+#ifndef BF_HAVE_ARPACK
+#define BF_HAVE_ARPACK 0
+#endif
+
+/* -------------------------------------------------------------------------
+ * Backend policy for SVD/SVDS:
+ *  - PRIMME_SVDS is the preferred/fast sparse SVD backend.
+ *  - ARPACK/LAPACK SVD paths are disabled by default (opt-in only).
+ *
+ * Rationale: ARPACK-based svds (via A^T A) and dense LAPACK svd are
+ * too slow for your intended workflow; keep them behind explicit flags.
+ * ------------------------------------------------------------------------- */
+#ifndef BF_ENABLE_ARPACK_SVDS
+#define BF_ENABLE_ARPACK_SVDS 0
+#endif
+
+#ifndef BF_ENABLE_LAPACK_SVD
+#define BF_ENABLE_LAPACK_SVD 0
+#endif
+
 #if BF_DEBUG
 #include <bf/vec_complex.h>
 #endif
 
-#include <arpack.h>
+#if BF_HAVE_ARPACK
+#  include <arpack.h>
+#endif
 
 #include <stdio.h>  /* make sure this is present near the top of the file */
-#include <stdlib.h>  /* atexit */
+#include <stdlib.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #ifndef BF_HAVE_PRIMME_SVDS
-#define BF_HAVE_PRIMME_SVDS 1
+#define BF_HAVE_PRIMME_SVDS 0
 #endif
 
 #if BF_HAVE_PRIMME_SVDS
@@ -38,9 +62,13 @@
 #  include <primme_svds.h>
 #endif
 
-/* ARPACK backend assumes BfReal is double precision */
+/* Sparse SVD backends assume BfReal is double precision.
+ * Only assert this when a double-only backend is actually enabled.
+ */
+#if BF_HAVE_PRIMME_SVDS || (BF_ENABLE_ARPACK_SVDS && BF_HAVE_ARPACK)
 _Static_assert(sizeof(BfReal) == sizeof(double),
-               "ARPACK and PRIMME backends require BfReal == double");
+               "PRIMME_SVDS/ARPACK backends require BfReal == double");
+#endif
 
 /* ---- CSR SVD debug logging ----------------------------------------- */
 
@@ -152,9 +180,12 @@ static void bfSparseSvdPrintStatsNow(char const *tag) {
 static void bfSparseSvdMaybePrintStats(void) {
 #if BF_SPARSE_SVD_STATS
   long long t = gSparseSvd_leafTotal;
-  if (BF_SPARSE_SVD_STATS_EVERY <= 0) return;
+#if BF_SPARSE_SVD_STATS_EVERY > 0
   if (t > 0 && (t % (long long)BF_SPARSE_SVD_STATS_EVERY) == 0)
     bfSparseSvdPrintStatsNow("");
+#else
+  (void)t;
+#endif
 #endif
 }
 
@@ -231,51 +262,56 @@ static void bfPrimmeSvdsCappedMonitor(
   (void)event;
   (void)stage;
 
-  /* IMPORTANT: never signal error via *err; that triggers an assert in PRIMME.
-   * We only steer via maxMatvecs, as suggested in primme#51.
-   */
   if (err) *err = 0;
-
   if (primme_svds == NULL)
     return;
 
-  /* 1) Respect the normal maxMatvecs cap (optional log) */
-  if (primme_svds->maxMatvecs > 0 &&
-      primme_svds->stats.numMatvecs >= primme_svds->maxMatvecs &&
-      !bfSparseSvdsMonitorWarned) {
+  /* IMPORTANT:
+   * Do NOT mutate maxMatvecs to 0 inside the monitor.
+   * Some PRIMME builds may divide by maxMatvecs internally (progress, rates),
+   * and setting it to 0 can trigger SIGFPE.
+   *
+   * To abort cleanly, signal via *err and return.
+   */
 
-    SPARSE_SVD_LOG(
-      "[bf] sparse SVD: PRIMME monitor: hit maxMatvecs=%lld (numMatvecs=%lld)\n",
-      (long long)primme_svds->maxMatvecs,
-      (long long)primme_svds->stats.numMatvecs);
+  /* 1) Matvec-cap abort */
+  /* IMPORTANT: in this codebase/setup, signalling abort via *err has been
+     observed to core-dump. Instead, steer PRIMME toward termination by
+     shrinking maxMatvecs to the current count (keeping it nonzero). */
+  if (err) *err = 0;
 
-    bfSparseSvdsMonitorWarned = 1;
+  if (primme_svds != NULL && primme_svds->maxMatvecs > 0 &&
+      primme_svds->stats.numMatvecs >= primme_svds->maxMatvecs) {
+
+    if (!bfSparseSvdsMonitorWarned) {
+      SPARSE_SVD_LOG(
+        "[bf] sparse SVD: PRIMME monitor: hit maxMatvecs=%lld "
+        "(numMatvecs=%lld); steering termination.\n",
+        (long long)primme_svds->maxMatvecs,
+        (long long)primme_svds->stats.numMatvecs);
+      bfSparseSvdsMonitorWarned = 1;
+    }
+
+    PRIMME_INT cur = primme_svds->stats.numMatvecs;
+    if (cur < 1) cur = 1; /* keep nonzero to avoid PRIMME FPE paths */
+
+    primme_svds->maxMatvecs = cur;
+    primme_svds->primme.maxMatvecs = cur;
+    primme_svds->primmeStage2.maxMatvecs = cur;
   }
 
-  /* 2) Time-based abort: when elapsedTime > BF_PRIMME_SVDS_MAX_WALLTIME,
-   *    force maxMatvecs=0 so PRIMME exits with PRIMME_MAIN_ITER_FAILURE (-3).
-   *
-   *    This is exactly the pattern suggested in:
-   *      https://github.com/primme/primme/issues/51
-   */
+  /* 2) Walltime abort (only if wall > 0) */
   {
     double wall = bfPrimmeSvdsMaxWalltime();
-    if (wall > 0.0 &&
-        primme_svds->stats.elapsedTime > wall &&
-        primme_svds->maxMatvecs != 0) {
+    if (wall > 0.0 && primme_svds->stats.elapsedTime > wall) {
 
-    SPARSE_SVD_LOG(
-      "[bf] sparse SVD: PRIMME monitor: elapsedTime=%.3e > %.3e s, "
-      "forcing maxMatvecs=0 to abort\n",
-      primme_svds->stats.elapsedTime,
-      wall);
+      SPARSE_SVD_LOG(
+        "[bf] sparse SVD: PRIMME monitor: elapsedTime=%.3e > %.3e s -> abort via err\n",
+        primme_svds->stats.elapsedTime,
+        wall);
 
-    /* Outer SVDS matvec budget */
-    primme_svds->maxMatvecs = 0;
-
-    /* Inner eigensolvers as well, for safety */
-    primme_svds->primme.maxMatvecs       = 0;
-    primme_svds->primmeStage2.maxMatvecs = 0;
+      if (err) *err = 1;
+      return;
     }
   }
 }
@@ -519,12 +555,19 @@ static bool bfSparseSvdCheckRowSums(
     BfVecReal ones_view;
     bfVecRealInitView(&ones_view, n, BF_DEFAULT_STRIDE, ones);
 
-    BfVecReal *vvec =
-      bfVecToVecReal(
-        bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)VT),
-                    bfVecRealToVec(&ones_view)));
+    BfVec *vtmp =
+      bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)VT),
+                  bfVecRealToVec(&ones_view));
 
     bfMemFree(ones);
+
+    if (vtmp == NULL) {
+      bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+      return false;
+    }
+
+    BfVecReal *vvec = bfVecToVecReal(vtmp);
+    bfVecDelete(&vtmp);
 
     if (vvec == NULL) {
       bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
@@ -546,10 +589,17 @@ static bool bfSparseSvdCheckRowSums(
     BfVecReal t_view;
     bfVecRealInitView(&t_view, k, BF_DEFAULT_STRIDE, t);
 
-    BfVecReal *rsvec =
-      bfVecToVecReal(
-        bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)U),
-                    bfVecRealToVec(&t_view)));
+    BfVec *rstmp =
+      bfMatMulVec(bfMatDenseRealToMat((BfMatDenseReal *)U),
+                  bfVecRealToVec(&t_view));
+
+    if (rstmp == NULL) {
+      bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
+      return false;
+    }
+
+    BfVecReal *rsvec = bfVecToVecReal(rstmp);
+    bfVecDelete(&rstmp);
 
     if (rsvec == NULL) {
       bfMemFree(rs_csr); bfMemFree(rs_svd); bfMemFree(v); bfMemFree(t);
@@ -1038,6 +1088,7 @@ static BfSize estimateNcv(BfSize nev, BfSize N) {
   return ncv;
 }
 
+#if BF_HAVE_ARPACK
 BfReal bfGetMaxEigenvalue(BfMat const *L, BfMat const *M) {
   /* TODO: this is a work in progress! This does NOT work for any type
    * of BfMat yet. Just real ones... */
@@ -1751,6 +1802,32 @@ void bfGetEigenband(BfMat const *A, BfMat const *M, BfInterval const *interval,
   }
 }
 
+#else  /* !BF_HAVE_ARPACK */
+
+BfReal bfGetMaxEigenvalue(BfMat const *L, BfMat const *M) {
+  (void)L; (void)M;
+  bfSetError(BF_ERROR_NOT_IMPLEMENTED);
+  return NAN;
+}
+
+void bfGetShiftedEigs(BfMat const *A, BfMat const *M, BfReal sigma, BfSize k,
+                      BfMat **PhiTransposePtr, BfVecReal **LambdaPtr) {
+  (void)A; (void)M; (void)sigma; (void)k;
+  if (PhiTransposePtr) *PhiTransposePtr = NULL;
+  if (LambdaPtr) *LambdaPtr = NULL;
+  bfSetError(BF_ERROR_NOT_IMPLEMENTED);
+}
+
+void bfGetEigenband(BfMat const *A, BfMat const *M, BfInterval const *interval,
+                    BfEigenbandMethod method, BfMat **PhiTransposePtr, BfVecReal **LambdaPtr) {
+  (void)A; (void)M; (void)interval; (void)method;
+  if (PhiTransposePtr) *PhiTransposePtr = NULL;
+  if (LambdaPtr) *LambdaPtr = NULL;
+  bfSetError(BF_ERROR_NOT_IMPLEMENTED);
+}
+
+#endif /* BF_HAVE_ARPACK */
+
 bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfMat **VTPtr,
                        BfTruncSpec const *truncSpec, BfBackend backend) {
   BF_ERROR_BEGIN();
@@ -1758,7 +1835,18 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
   bool truncated = true;
 
   if (backend == BF_BACKEND_LAPACK) {
-    /* Existing dense LAPACK path (unchanged) */
+
+#if !BF_ENABLE_LAPACK_SVD
+    /* Guarded: dense LAPACK SVD disabled by default */
+    (void)mat;
+    if (UPtr)  *UPtr  = NULL;
+    if (SPtr)  *SPtr  = NULL;
+    if (VTPtr) *VTPtr = NULL;
+    bfSetError(BF_ERROR_NOT_IMPLEMENTED);
+    truncated = false;
+    goto done_backend;
+#else
+    /* Dense LAPACK SVD path (explicit opt-in via BF_ENABLE_LAPACK_SVD=1) */
 
     /* Cast to `MatDenseReal` if we can, otherwise we'll need to convert
      * and allocate later. */
@@ -1830,10 +1918,13 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
     U = NULL;
     VT = NULL;
     S = NULL;
+#endif /* BF_ENABLE_LAPACK_SVD */
   }
 
-  else if (backend == BF_BACKEND_ARPACK) {
-    /* New sparse CSR+ARPACK backend */
+  else if (backend == BF_BACKEND_SVDS) {
+    /* Sparse SVD/SVDS backend:
+     * Prefer PRIMME_SVDS. Do NOT fall back to ARPACK unless explicitly enabled.
+     */
 
     if (bfMatGetType(mat) != BF_TYPE_MAT_CSR_REAL)
       RAISE_ERROR(BF_ERROR_TYPE_ERROR);
@@ -1847,61 +1938,63 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
     /* Maximum possible numerical rank */
     BfSize maxPossibleRank = m < n ? m : n;
 
-    if (n <= 2 || maxPossibleRank == 0) {
-      /* Too small for ARPACK: just report “no SVD compression” and
-       * let caller fall back to plain CSR.
-       */
+    if (maxPossibleRank == 0) {
       *UPtr  = NULL;
       *SPtr  = NULL;
       *VTPtr = NULL;
       truncated = false;
     } else {
-      /* Heuristic NEV choice:
-       *
-       *  - For large tol (e.g. 0.9 like your fluxpy runs), we expect
-       *    very low rank, so cap NEV aggressively (<= 64).
-       *  - For more stringent tolerances, allow more singular values
-       *    but never anywhere near full rank.
-       *
-       *  This mirrors the Python pattern “estimate_rank -> svds(A, k)”
-       *  where k is small compared to min(m, n).
-       */
+      /* Heuristic NEV choice (still fine for PRIMME; it’s just a cap): */
       BfSize targetMaxRank = maxPossibleRank;
 
       if (truncSpec != NULL && truncSpec->usingTol) {
         BfReal t = truncSpec->tol;
 
         if (t >= 0.5) {
-          /* Very loose tolerance: only need a handful of modes */
           if (targetMaxRank > 64) targetMaxRank = 64;
         } else if (t >= 0.1) {
-          /* Moderate tolerance */
           if (targetMaxRank > 128) targetMaxRank = 128;
         } else {
-          /* Tight tolerance: still cap to avoid near-full SVDs */
           if (targetMaxRank > 256) targetMaxRank = 256;
         }
       } else {
-        /* No tol provided: use a conservative cap */
         if (targetMaxRank > 128) targetMaxRank = 128;
       }
 
-      /* ARPACK eigenproblem dimension is N = n (for A^T A) and
-       * requires 1 <= NEV <= N - 2.
-       */
       BfSize nev = targetMaxRank;
-      if (nev > n - 2)
-        nev = n - 2;
 
-      if (nev < 1) {
+#if BF_HAVE_PRIMME_SVDS
+      /* PRIMME_SVDS: can request up to min(m,n); NO ARPACK n-2 restriction. */
+      if (nev > maxPossibleRank)
+        nev = maxPossibleRank;
+#else
+      /* ARPACK_SVDS fallback (A^T A): requires 1 <= nev <= n-2, and n must be >= 3. */
+      if (n <= 2) {
+        nev = 0;
+      } else if (nev > n - 2) {
+        nev = n - 2;
+      }
+#endif
+
+      if (nev < 1 || truncSpec == NULL) {
+        /* If truncSpec is NULL, we cannot select k safely in the sparse SVD path.
+         * Keep CSR (no compression) rather than crashing.
+         */
         *UPtr  = NULL;
         *SPtr  = NULL;
         *VTPtr = NULL;
         truncated = false;
       } else {
+#if BF_HAVE_PRIMME_SVDS
         truncated =
           bfMatCsrRealSparseTruncatedSvd(Acsr, nev, truncSpec,
                                          UPtr, SPtr, VTPtr);
+#else
+        *UPtr  = NULL;
+        *SPtr  = NULL;
+        *VTPtr = NULL;
+        truncated = false;
+#endif
       }
     }
   }
@@ -1909,9 +2002,11 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
     RAISE_ERROR(BF_ERROR_NOT_IMPLEMENTED);
   }
 
+done_backend:
   BF_ERROR_END() {
     BF_DIE();
   }
+
 
 //  fprintf(stderr, "[bf] bfGetTruncatedSvd: returning (backend=%d)\n",
 //          (int)backend);
@@ -1920,7 +2015,7 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
 
 }
 
-/* ---- NEW: CSR transpose MVP and ARPACK-based top-k SVD ---- */
+/* ---- NEW: CSR transpose MVP and sparse top-k SVD helpers (PRIMME/ARPACK) ---- */
 
 /* y <- A^T * x  (A is m×n CSR, x is length m, y length n)
  *
@@ -1930,6 +2025,7 @@ bool bfGetTruncatedSvd(BfMat const *mat, BfMat **UPtr, BfMatDiagReal **SPtr, BfM
  */
 static void csrMulVecTransOnly(BfMatCsrReal const *A,
                                BfReal const *x,
+                               BfSize        xStride,
                                BfReal       *y)
 {
   BF_ERROR_BEGIN();
@@ -1954,7 +2050,7 @@ static void csrMulVecTransOnly(BfMatCsrReal const *A,
 
   /* classic CSR transpose MVP */
   for (BfSize i = 0; i < m; ++i) {
-    BfReal xi = x[i];
+    BfReal xi = x[i*xStride];
     if (xi == 0)
       continue;
     for (BfSize k = rowptr[i]; k < rowptr[i + 1]; ++k) {
@@ -2021,8 +2117,13 @@ static void bfPrimmeCsrMatrixMatvec(
       BfVecReal x_view;
       bfVecRealInitView(&x_view, n, BF_DEFAULT_STRIDE, (BfReal *)xcol);
 
-      BfVecReal *y_real =
-        bfVecToVecReal(bfMatMulVec(Amat, bfVecRealToVec(&x_view)));
+      /* bfMatMulVec returns a heap-allocated vector. bfVecToVecReal casts it.
+         Do NOT bfVecDelete(y_tmp) after casting, or you'll free the storage
+         backing y_real (use-after-free / double-free). */
+      BfVecReal *y_real = bfVecToVecReal(
+        bfMatMulVec(Amat, bfVecRealToVec(&x_view))
+      );
+      if (y_real == NULL) { *ierr = 1; return; }
 
       for (BfSize i = 0; i < m; ++i)
         ycol[i] = y_real->data[i*y_real->stride];
@@ -2030,8 +2131,8 @@ static void bfPrimmeCsrMatrixMatvec(
       bfVecRealDeinitAndDealloc(&y_real);
     }
     else {
-      /* ycol = A^T * xcol (x length m, y length n) */
-      csrMulVecTransOnly(Acsr, xcol, ycol);
+      /* ycol = A^T * xcol (x length m, stride=1, y length n) */
+      csrMulVecTransOnly(Acsr, xcol, 1, ycol);
     }
   }
 
@@ -2053,7 +2154,7 @@ static void bfPrimmeCsrMatrixMatvec(
  *   - zero-fill the remaining entries/columns so callers can safely
  *     treat them as “nonexistent / zero singular values”.
  */
-#if !BF_HAVE_PRIMME_SVDS
+#if (!BF_HAVE_PRIMME_SVDS) && BF_ENABLE_ARPACK_SVDS && BF_HAVE_ARPACK
 static int csrAtA_top_eigs_arpack(BfMatCsrReal const *Acsr,
                                   BfSize               nev,
                                   BfReal              *dr_out,
@@ -2191,11 +2292,23 @@ if (ido == 1 || ido == -1) {
     bfVecRealInitView(&x_view, (BfSize)N, BF_DEFAULT_STRIDE, x);
 
     /* tmp = A * x  (length m) */
-    BfVecReal *tmp_real =
-      bfVecToVecReal(bfMatMulVec(Amat, bfVecRealToVec(&x_view)));
+    BfVec *tmp_vec = bfMatMulVec(Amat, bfVecRealToVec(&x_view));
+    if (tmp_vec == NULL) {
+      SPARSE_SVD_LOG("[bf] sparse SVD: OP-mv: bfMatMulVec returned NULL\n");
+      status = -1;
+      goto cleanup;
+    }
+
+    BfVecReal *tmp_real = bfVecToVecReal(tmp_vec);
+    bfVecDelete(&tmp_vec);
+    if (tmp_real == NULL) {
+      SPARSE_SVD_LOG("[bf] sparse SVD: OP-mv: bfVecToVecReal returned NULL\n");
+      status = -1;
+      goto cleanup;
+    }
 
     /* y = A^T * tmp */
-    csrMulVecTransOnly(Acsr, tmp_real->data, y);
+    csrMulVecTransOnly(Acsr, tmp_real->data, tmp_real->stride, y);
 
 #if BF_SPARSE_SVD_DEBUG
     /* Debug norms */
@@ -2353,7 +2466,7 @@ cleanup:
 
   return status;
 }
-#endif /* !BF_HAVE_PRIMME_SVDS */
+#endif /* (!BF_HAVE_PRIMME_SVDS) && BF_ENABLE_ARPACK_SVDS && BF_HAVE_ARPACK */
 
 /* Compute a truncated SVD of a CSR real matrix A using ARPACK on A^T A.
  *
@@ -2380,7 +2493,14 @@ static bool bfMatCsrRealSparseTruncatedSvd(BfMatCsrReal const *Acsr,
 {
   BF_ERROR_BEGIN();
 
-  BF_ASSERT(truncSpec != NULL);
+  if (truncSpec == NULL) {
+    /* In release builds BF_ASSERT is compiled out; do not dereference NULL. */
+    SPARSE_SVD_LOG("[bf] sparse SVD: truncSpec == NULL -> keep CSR\n");
+    *UPtr  = NULL;
+    *SPtr  = NULL;
+    *VTPtr = NULL;
+    return false;
+  }
 
   /* Always initialize anything that may be freed in cleanup: */
   BfReal *lambda = NULL;
@@ -2494,11 +2614,26 @@ if (maxAbs < 1e-11) {
       BfVecReal x_view;
       bfVecRealInitView(&x_view, n, BF_DEFAULT_STRIDE, test_x);
 
-      BfVecReal *tmp_real =
-        bfVecToVecReal(bfMatMulVec(bfMatCsrRealConstToMatConst(Acsr),
-                                   bfVecRealToVec(&x_view)));
+      BfMat const *Amat_dbg = bfMatCsrRealConstToMatConst(Acsr);
 
-      csrMulVecTransOnly(Acsr, tmp_real->data, test_y);
+      BfVec *tmp_vec =
+        bfMatMulVec(Amat_dbg, bfVecRealToVec(&x_view));
+
+      if (tmp_vec != NULL) {
+        BfVecReal *tmp_real = bfVecToVecReal(tmp_vec);
+        bfVecDelete(&tmp_vec);
+
+        if (tmp_real != NULL) {
+          csrMulVecTransOnly(Acsr, tmp_real->data, tmp_real->stride, test_y);
+          bfVecRealDeinitAndDealloc(&tmp_real);
+        } else {
+          /* If conversion fails, just skip the debug check */
+          for (BfSize j = 0; j < n; ++j) test_y[j] = 0.0;
+        }
+      } else {
+        /* If matvec fails, just skip the debug check */
+        for (BfSize j = 0; j < n; ++j) test_y[j] = 0.0;
+      }
 
       double nAx2 = 0.0;
       for (BfSize j = 0; j < n; ++j)
@@ -2506,7 +2641,7 @@ if (maxAbs < 1e-11) {
       double nAx = sqrt(nAx2);
 
       SPARSE_SVD_LOG(
-        "[bf] sparse SVD: pre-ARPACK check: ||A^T A * 1|| = %.3e (m=%lu, n=%lu, nnz=%lu)\n",
+        "[bf] sparse SVD: pre-SVDS check: ||A^T A * 1|| = %.3e (m=%lu, n=%lu, nnz=%lu)\n",
         nAx, (unsigned long)m, (unsigned long)n, (unsigned long)nnz);
 
       bfVecRealDeinitAndDealloc(&tmp_real);
@@ -2547,9 +2682,11 @@ if (maxAbs < 1e-11) {
                    (unsigned long)maxRank);
   }
 
-  /* ARPACK constraints */
+#if (!BF_HAVE_PRIMME_SVDS) && BF_ENABLE_ARPACK_SVDS && BF_HAVE_ARPACK
+  /* ARPACK_SVDS via A^T A requires 1 <= nev <= n-2 */
   if (n > 2 && maxRank > n - 2)
     maxRank = n - 2;
+#endif
 
   if (maxRank == 0)
     maxRank = 1;
@@ -2567,7 +2704,7 @@ if (maxAbs < 1e-11) {
 //    }
 //  }
 
-  SPARSE_SVD_LOG("[bf] sparse SVD: final ARPACK maxRank(nev)=%lu (m=%lu n=%lu)\n",
+    SPARSE_SVD_LOG("[bf] sparse SVD: final SVDS maxRank=%lu (m=%lu n=%lu)\n",
                  (unsigned long)maxRank,
                  (unsigned long)m,
                  (unsigned long)n);
@@ -2608,9 +2745,9 @@ if (maxAbs < 1e-11) {
   primme_svds_params primme;
   primme_svds_initialize(&primme);
 
-  /* A) Fix PRIMME svecs parsing first: be explicit */
+  /* No initial guesses provided in svecs */
   primme.numOrthoConst = 0;
-  primme.initSize      = initSize_in;
+  primme.initSize      = 0;
 
   /* Reasonable global matvec cap for this leaf */
   {
@@ -2619,11 +2756,14 @@ if (maxAbs < 1e-11) {
     if (mvBudget < 2000)  mvBudget = 2000;       /* don’t be absurdly small */
     if (mvBudget > 10000) mvBudget = 10000;      /* hard cap */
 
-    /* SVD-level budget */
+    /* Budgets:
+     * - primme_svds->maxMatvecs caps the outer SVDS iterations
+     * - the stage solvers can also run substantial matvecs; cap them too
+     *   to avoid “budget looks ignored” behavior.
+     */
     primme.maxMatvecs = mvBudget;
-    /* Let the wrapper manage the inner eigensolvers */
-    primme.primme.maxMatvecs       = 0;
-    primme.primmeStage2.maxMatvecs = 0;
+    primme.primme.maxMatvecs       = mvBudget;
+    primme.primmeStage2.maxMatvecs = mvBudget;
 
     SPARSE_SVD_LOG(
       "[bf] sparse SVD: PRIMME maxMatvecs set to %d (maxRank=%lu, m=%lu, n=%lu)\n",
@@ -2667,6 +2807,7 @@ if (maxAbs < 1e-11) {
       primme.eps = t;
   }
 
+  /* Reset per-call monitor state (do not make this static-per-process). */
   bfSparseSvdsMonitorWarned = 0;
 
   /* Snapshot CSR matvec counters before calling PRIMME */
@@ -2784,47 +2925,26 @@ if (maxAbs < 1e-11) {
   if (Z == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
-  /* A) Parse svecs as two contiguous blocks:
-   *   leftBlock:  m x initSize_in (U)
-   *   rightBlock: n x initSize_in (V)
-   * both stored column-major (each vector contiguous).
+  /* PRIMME returns each singular vector pair as one (m+n)-vector per column:
+   * column j = [u_j (m entries); v_j (n entries)], with ld = m+n.
+   * We only need v_j here.
    */
-  const BfReal *leftBlock  = (const BfReal *)svecs;
-  const BfReal *rightBlock = (const BfReal *)svecs + (BfSize)initSize_in * (BfSize)m;
+  const BfSize ldsv = m + n;
 
   for (BfSize j = 0; j < maxRank; ++j) {
     BfReal sj = svals[j];
-
-    if (!bfIsFiniteReal(sj)) {
-      SPARSE_SVD_LOG(
-        "[bf] sparse SVD: PRIMME returned non-finite s[%lu]=%g; keeping CSR leaf\n",
-        (unsigned long)j, (double)sj);
+    if (!bfIsFiniteReal(sj) || sj <= 0) {
       truncated = false;
       goto cleanup;
     }
-
-    /* Allow tiny negative s relative to the largest one */
-    BfReal s0 = svals[0];
-    BfReal relTol = 1e-4;
-    BfReal absTol = 100*DBL_EPSILON;
-    BfReal negTol = relTol*fabs(s0) + absTol;
-
-    if (sj < 0 && fabs(sj) <= negTol) {
-      sj = 0;
-    } else if (sj < 0) {
-      SPARSE_SVD_LOG(
-        "[bf] sparse SVD: PRIMME returned significantly negative s[%lu]=%.3e (s0=%.3e); keeping CSR leaf\n",
-        (unsigned long)j, (double)sj, (double)s0);
-      truncated = false;
-      goto cleanup;
-    }
-
     lambda[j] = sj*sj;
 
-    /* Right singular vector v_j is column j of rightBlock (length n) */
-    const BfReal *vj = rightBlock + (BfSize)j*(BfSize)n;
+    const BfReal *col = svecs + j*ldsv;
+    const BfReal *vj  = col + m;
+
+    BfReal *Zcol = Z + j*(BfSize)n;
     for (BfSize i = 0; i < n; ++i)
-      Z[j*n + i] = vj[i];
+      Zcol[i] = vj[i];
   }
 
   SPARSE_SVD_LOG(
@@ -2836,7 +2956,17 @@ if (maxAbs < 1e-11) {
 
 #else /* !BF_HAVE_PRIMME_SVDS */
 
-  /* Fallback: original ARPACK route */
+#if !BF_ENABLE_ARPACK_SVDS
+  /* Guarded: sparse SVD disabled when PRIMME_SVDS is unavailable. */
+  SPARSE_SVD_LOG("[bf][sparse_svd] PRIMME_SVDS not available; ARPACK_SVDS disabled -> keep CSR\n");
+#if BF_SPARSE_SVD_STATS
+  BF_SVDSTAT_INC(gSparseSvd_reject_solver);
+  bfSparseSvdMaybePrintStats();
+#endif
+  truncated = false;
+  goto cleanup;
+#else
+  /* Optional opt-in fallback: ARPACK route (slow) */
   lambda = bfMemAlloc(maxRank, sizeof(BfReal));
   if (lambda == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
@@ -2857,8 +2987,7 @@ if (maxAbs < 1e-11) {
 
   if (arpack_info != 0) {
     SPARSE_SVD_LOG(
-      "[bf] sparse SVD: ARPACK stage failed (status=%d) for m=%lu n=%lu nnz=%lu nev=%lu; "
-      "keeping CSR leaf\n",
+      "[bf][sparse_svd] ARPACK_SVDS failed (status=%d) m=%lu n=%lu nnz=%lu nev=%lu; keep CSR\n",
       arpack_info,
       (unsigned long)m,
       (unsigned long)n,
@@ -2873,14 +3002,17 @@ if (maxAbs < 1e-11) {
     goto cleanup;
   }
 
-  SPARSE_SVD_LOG("[bf] sparse SVD: ARPACK completed for m=%lu n=%lu nnz=%lu nev=%lu\n",
+  SPARSE_SVD_LOG("[bf][sparse_svd] ARPACK_SVDS completed m=%lu n=%lu nnz=%lu nev=%lu\n",
                  (unsigned long)m,
                  (unsigned long)n,
                  (unsigned long)nnz,
                  (unsigned long)maxRank);
+#endif /* BF_ENABLE_ARPACK_SVDS */
 
 #endif /* BF_HAVE_PRIMME_SVDS */
 
+  /* NOTE: lambda/Z are produced either by PRIMME_SVDS (preferred) or by
+   * ARPACK_SVDS (optional fallback when enabled). Do not run both. */
 
   /* Step 2: singular values = sqrt(lambda_i) */
   sigma = bfMemAlloc(maxRank, sizeof(BfReal));

@@ -1051,7 +1051,7 @@ static BfVfHierBlock *makeLeafFromCsrWithOptionalSvd(
   BfMat *U = NULL, *VT = NULL;
   BfMatDiagReal *S = NULL;
 
-  BfBackend backend = BF_BACKEND_ARPACK;
+  BfBackend backend = BF_BACKEND_SVDS;
   BfBool truncated;
 
   truncated =
@@ -1715,7 +1715,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     double t_svd_start = bfVfHierNowSecs();
   #endif
 
-  BfBackend backend = BF_BACKEND_ARPACK;
+  BfBackend backend = BF_BACKEND_SVDS;
   BfBool truncated;
 
     truncated =
@@ -2364,7 +2364,7 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   BfMatDiagReal *S = NULL;
 
 
-  BfBackend backend = BF_BACKEND_ARPACK;
+  BfBackend backend = BF_BACKEND_SVDS;
   BfBool truncated;
 
     truncated =

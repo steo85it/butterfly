@@ -511,7 +511,7 @@ cdef class Mat:
         # Choose backend; for now only LAPACK is implemented on the C side
         if backend is None:
             # backend_c = BF_BACKEND_LAPACK
-            backend_c = BF_BACKEND_ARPACK
+            backend_c = BF_BACKEND_SVDS
         else:
             backend_c = <BfBackend> backend
 
