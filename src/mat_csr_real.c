@@ -16,6 +16,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>   /* strcmp/strcasecmp */
+#include <stdint.h>   /* uint64_t */
 
 #ifdef BF_OPENMP
 #include <omp.h>
@@ -417,7 +419,7 @@ static BfReal integrateViewFactorMidpointRule(BfTrimesh const *trimesh, BfSize s
     if (!(dotSrc > 0) || !(dotTgt > 0)) {
       const char *si = getenv("BF_VF_DOT_I");
       if (si) {
-        BfSize srcFilter = (BfSize)strtoull(si, NULL, 10);  /* <-- rename (no 'I') */
+        BfSize srcFilter = (BfSize)strtoull(si, NULL, 10);
         if (srcInd == srcFilter) {
           fprintf(stderr,
             "[bf] dotDiag src=%zu tgt=%zu dotSrc=%g dotTgt=%g r2=%g\n",
@@ -429,6 +431,286 @@ static BfReal integrateViewFactorMidpointRule(BfTrimesh const *trimesh, BfSize s
   }
 
   return areaTgt*fmax(0, dotSrc)*fmax(0, dotTgt)/(BF_PI*rSquared*rSquared);
+}
+
+/* ---------------------------
+ * View-factor upgrade (midpoint -> gauss) for near-field pairs
+ * Controlled by env vars:
+ *   BF_VF_METHOD=midpoint|gauss|adaptive
+ *   BF_VF_GAUSS_ORDER=1|3|7     (1->1pt, 3->7pt, 7->13pt)
+ *   BF_VF_NEAR_RATIO=2.0        (refine if d/h < nearRatio)
+ *   BF_VF_MIN_MIDPOINT_TO_REFINE=1e-6
+ *   BF_VF_STATS=1              (prints refinedPairs)
+ * --------------------------- */
+
+typedef enum {
+  BF_VF_METHOD_MIDPOINT = 0,
+  BF_VF_METHOD_GAUSS    = 1,
+  BF_VF_METHOD_ADAPTIVE = 2,
+} BfVfMethod;
+
+typedef struct {
+  BfVfMethod method;
+  int gaussOrder;             /* 1, 3, 7 -> {1pt, 7pt, 13pt} */
+  BfReal nearRatio;           /* refine if d/h < nearRatio */
+  BfReal minMidpointToRefine; /* refine if F_mid > this */
+  int adaptiveMaxLevels;      /* reserved/debug */
+  bool stats;                 /* BF_VF_STATS=1 */
+} BfVfParams;
+
+static BfVfParams g_vfParams;
+static bool g_vfParamsInitialized = false;
+
+static BfVfMethod parseMethod(char const *s) {
+  if (s == NULL || s[0] == '\0') return BF_VF_METHOD_MIDPOINT;
+  if (!strcmp(s, "midpoint")) return BF_VF_METHOD_MIDPOINT;
+  if (!strcmp(s, "gauss"))    return BF_VF_METHOD_GAUSS;
+  if (!strcmp(s, "adaptive")) return BF_VF_METHOD_ADAPTIVE;
+  return BF_VF_METHOD_MIDPOINT;
+}
+
+static int parseIntEnv(char const *name, int def) {
+  char const *s = getenv(name);
+  if (s == NULL || s[0] == '\0') return def;
+  char *end = NULL;
+  long v = strtol(s, &end, 10);
+  if (end == s) return def;
+  return (int)v;
+}
+
+static BfReal parseRealEnv(char const *name, BfReal def) {
+  char const *s = getenv(name);
+  if (s == NULL || s[0] == '\0') return def;
+  char *end = NULL;
+  double v = strtod(s, &end);
+  if (end == s) return def;
+  return (BfReal)v;
+}
+
+static bool parseBoolEnv(char const *name, bool def) {
+  char const *s = getenv(name);
+  if (s == NULL || s[0] == '\0') return def;
+  if (!strcmp(s, "0")) return false;
+  if (!strcasecmp(s, "false") || !strcasecmp(s, "no")) return false;
+  return true;
+}
+
+static void initVfParamsOnce(void) {
+  if (g_vfParamsInitialized) return;
+
+  g_vfParams.method = parseMethod(getenv("BF_VF_METHOD"));
+
+  g_vfParams.gaussOrder = parseIntEnv("BF_VF_GAUSS_ORDER", 3);
+  if (!(g_vfParams.gaussOrder == 1 || g_vfParams.gaussOrder == 3 || g_vfParams.gaussOrder == 7))
+    g_vfParams.gaussOrder = 3;
+
+  g_vfParams.nearRatio = parseRealEnv("BF_VF_NEAR_RATIO", (BfReal)2.0);
+  g_vfParams.minMidpointToRefine = parseRealEnv("BF_VF_MIN_MIDPOINT_TO_REFINE", (BfReal)1e-6);
+
+  g_vfParams.adaptiveMaxLevels = parseIntEnv("BF_VF_ADAPTIVE_MAX_LEVELS", 2);
+  g_vfParams.stats = parseBoolEnv("BF_VF_STATS", false);
+
+  g_vfParamsInitialized = true;
+}
+
+/* --- triangle quadrature rules on reference triangle (u,v), u>=0, v>=0, u+v<=1 --- */
+typedef struct {
+  int n;
+  BfReal const *w;   /* length n */
+  BfReal const *uv;  /* length 2n: (u0,v0,u1,v1,...) */
+} BfTriQuadRule;
+
+static BfReal const W1[]  = { (BfReal)1.0 };
+static BfReal const UV1[] = { (BfReal)(1.0/3.0), (BfReal)(1.0/3.0) };
+
+/* Dunavant 7-point (degree 5) */
+static BfReal const W7[] = {
+  (BfReal)0.225,
+  (BfReal)0.132394152788506, (BfReal)0.132394152788506, (BfReal)0.132394152788506,
+  (BfReal)0.125939180544827, (BfReal)0.125939180544827, (BfReal)0.125939180544827
+};
+static BfReal const UV7[] = {
+  (BfReal)(1.0/3.0), (BfReal)(1.0/3.0),
+  (BfReal)0.059715871789770, (BfReal)0.059715871789770,
+  (BfReal)(1.0 - 2.0*0.059715871789770), (BfReal)0.059715871789770,
+  (BfReal)0.059715871789770, (BfReal)(1.0 - 2.0*0.059715871789770),
+  (BfReal)0.470142064105115, (BfReal)0.470142064105115,
+  (BfReal)(1.0 - 2.0*0.470142064105115), (BfReal)0.470142064105115,
+  (BfReal)0.470142064105115, (BfReal)(1.0 - 2.0*0.470142064105115),
+};
+
+/* Dunavant 13-point (degree 7) */
+static BfReal const W13[] = {
+  (BfReal)-0.149570044467670,
+  (BfReal)0.175615257433204, (BfReal)0.175615257433204, (BfReal)0.175615257433204,
+  (BfReal)0.053347235608839, (BfReal)0.053347235608839, (BfReal)0.053347235608839,
+  (BfReal)0.077113760890257, (BfReal)0.077113760890257, (BfReal)0.077113760890257,
+  (BfReal)0.077113760890257, (BfReal)0.077113760890257, (BfReal)0.077113760890257
+};
+static BfReal const UV13[] = {
+  (BfReal)(1.0/3.0), (BfReal)(1.0/3.0),
+  (BfReal)0.260345966079038, (BfReal)0.260345966079038,
+  (BfReal)0.479308067841923, (BfReal)0.260345966079038,
+  (BfReal)0.260345966079038, (BfReal)0.479308067841923,
+  (BfReal)0.065130102902216, (BfReal)0.065130102902216,
+  (BfReal)0.869739794195568, (BfReal)0.065130102902216,
+  (BfReal)0.065130102902216, (BfReal)0.869739794195568,
+  (BfReal)0.312865496004875, (BfReal)0.048690315425316,
+  (BfReal)0.638444188569809, (BfReal)0.312865496004875,
+  (BfReal)0.048690315425316, (BfReal)0.638444188569809,
+  (BfReal)0.048690315425316, (BfReal)0.312865496004875,
+  (BfReal)0.312865496004875, (BfReal)0.638444188569809,
+  (BfReal)0.638444188569809, (BfReal)0.048690315425316,
+};
+
+static BfTriQuadRule getRule(int order) {
+  if (order == 1) return (BfTriQuadRule){ .n = 1,  .w = W1,  .uv = UV1 };
+  if (order == 3) return (BfTriQuadRule){ .n = 7,  .w = W7,  .uv = UV7 };
+  return (BfTriQuadRule){ .n = 13, .w = W13, .uv = UV13 };
+}
+
+static inline void getFaceVerts(BfTrimesh const *trimesh, BfSize faceInd,
+                                BfReal const **x0, BfReal const **x1, BfReal const **x2) {
+  BfSize const *F = bfTrimeshGetFaceConstPtr(trimesh, faceInd);
+  *x0 = bfTrimeshGetVertPtrConst(trimesh, F[0]);
+  *x1 = bfTrimeshGetVertPtrConst(trimesh, F[1]);
+  *x2 = bfTrimeshGetVertPtrConst(trimesh, F[2]);
+}
+
+/* p(u,v) = x0*(1-u-v) + x1*u + x2*v */
+static inline void sampleFacePoint(BfTrimesh const *trimesh, BfSize faceInd,
+                                   BfReal u, BfReal v, BfReal p[3]) {
+  BfReal const *x0, *x1, *x2;
+  getFaceVerts(trimesh, faceInd, &x0, &x1, &x2);
+
+  BfReal w = (BfReal)1.0 - u - v;
+
+  p[0] = w*x0[0] + u*x1[0] + v*x2[0];
+  p[1] = w*x0[1] + u*x1[1] + v*x2[1];
+  p[2] = w*x0[2] + u*x1[2] + v*x2[2];
+}
+
+/* robust characteristic length: max edge length */
+static BfReal computeFaceCharLen(BfTrimesh const *trimesh, BfSize faceInd) {
+  BfReal const *x0, *x1, *x2;
+  getFaceVerts(trimesh, faceInd, &x0, &x1, &x2);
+
+  BfVector3 e01, e12, e20;
+  bfPoint3Sub(x1, x0, e01);
+  bfPoint3Sub(x2, x1, e12);
+  bfPoint3Sub(x0, x2, e20);
+
+  BfReal l01 = bfVector3Norm(e01);
+  BfReal l12 = bfVector3Norm(e12);
+  BfReal l20 = bfVector3Norm(e20);
+
+  BfReal h = l01;
+  if (l12 > h) h = l12;
+  if (l20 > h) h = l20;
+  return h;
+}
+
+static BfReal integrateViewFactorGauss(BfTrimesh const *trimesh,
+                                       BfSize srcInd, BfSize tgtInd,
+                                       int gaussOrder) {
+  BfTriQuadRule rule = getRule(gaussOrder);
+
+  BfReal const *nSrc = bfTrimeshGetFaceUnitNormalConstPtr(trimesh, srcInd);
+  BfReal const *nTgt = bfTrimeshGetFaceUnitNormalConstPtr(trimesh, tgtInd);
+
+  BfReal areaTgt = bfTrimeshGetFaceArea(trimesh, tgtInd);
+
+  BfReal sum = 0;
+
+  for (int si = 0; si < rule.n; ++si) {
+    BfReal uS = rule.uv[2*si + 0];
+    BfReal vS = rule.uv[2*si + 1];
+    BfReal wS = rule.w[si];
+
+    BfReal pSrc[3];
+    sampleFacePoint(trimesh, srcInd, uS, vS, pSrc);
+
+    for (int ti = 0; ti < rule.n; ++ti) {
+      BfReal uT = rule.uv[2*ti + 0];
+      BfReal vT = rule.uv[2*ti + 1];
+      BfReal wT = rule.w[ti];
+
+      BfReal pTgt[3];
+      sampleFacePoint(trimesh, tgtInd, uT, vT, pTgt);
+
+      BfVector3 dp;
+      bfPoint3Sub(pSrc, pTgt, dp);
+
+      BfReal r2 = bfVector3Dot(dp, dp);
+      if (r2 <= 0) continue;
+
+      /* Match midpoint convention:
+         dotSrc = -nSrc·(pSrc-pTgt), dotTgt = +nTgt·(pSrc-pTgt) */
+      BfReal dotSrc = -bfVector3Dot(nSrc, dp);
+      BfReal dotTgt =  bfVector3Dot(nTgt, dp);
+
+      if (dotSrc <= 0 || dotTgt <= 0) continue;
+
+      BfReal r4 = r2*r2;
+      BfReal kernel = (dotSrc*dotTgt)/(BF_PI*r4);
+
+      sum += (wS*wT)*kernel;
+    }
+  }
+
+  return areaTgt*sum;
+}
+
+static BfReal integrateViewFactorHybrid(BfTrimesh const *trimesh,
+                                        BfReal const *faceCharLen,
+                                        BfSize srcInd, BfSize tgtInd,
+                                        BfVfParams const *p,
+                                        uint64_t *numRefined) {
+  /* Midpoint intermediates */
+  BfReal const *pSrcC = bfTrimeshGetFaceCentroidConstPtr(trimesh, srcInd);
+  BfReal const *pTgtC = bfTrimeshGetFaceCentroidConstPtr(trimesh, tgtInd);
+
+  BfReal const *nSrc = bfTrimeshGetFaceUnitNormalConstPtr(trimesh, srcInd);
+  BfReal const *nTgt = bfTrimeshGetFaceUnitNormalConstPtr(trimesh, tgtInd);
+
+  BfReal areaTgt = bfTrimeshGetFaceArea(trimesh, tgtInd);
+
+  BfVector3 dp;
+  bfPoint3Sub(pSrcC, pTgtC, dp);
+
+  BfReal r2 = bfVector3Dot(dp, dp);
+  if (r2 <= 0) return 0;
+
+  BfReal dotSrc = -bfVector3Dot(nSrc, dp);
+  BfReal dotTgt =  bfVector3Dot(nTgt, dp);
+
+  BfReal posDotSrc = fmax((BfReal)0, dotSrc);
+  BfReal posDotTgt = fmax((BfReal)0, dotTgt);
+
+  BfReal F_mid = areaTgt*posDotSrc*posDotTgt/(BF_PI*r2*r2);
+
+  if (p->method == BF_VF_METHOD_MIDPOINT)
+    return F_mid;
+
+  if (F_mid <= p->minMidpointToRefine)
+    return F_mid;
+
+  BfReal hSrc = faceCharLen[srcInd];
+  BfReal hTgt = faceCharLen[tgtInd];
+  BfReal h = (hSrc > hTgt ? hSrc : hTgt);
+  if (h <= 0) return F_mid;
+
+  BfReal d = sqrt(r2);
+  if (d/h >= p->nearRatio)
+    return F_mid;
+
+  if (p->method == BF_VF_METHOD_GAUSS) {
+    if (numRefined) ++(*numRefined);
+    return integrateViewFactorGauss(trimesh, srcInd, tgtInd, p->gaussOrder);
+  }
+
+  /* ADAPTIVE reserved/debug: fall back for now */
+  return F_mid;
 }
 
 #ifdef BF_EMBREE
@@ -482,6 +764,22 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(
     if (endptr != eps_env) eps = (BfReal)tmp;
   }
 
+  /* Optional near-field refinement of the view-factor kernel */
+  initVfParamsOnce();
+
+  /* Precompute per-face characteristic length for d/h gate */
+  BfReal *faceCharLen = bfMemAlloc(nFaces, sizeof(BfReal));
+  HANDLE_ERROR();
+
+#ifdef BF_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (BfSize f = 0; f < nFaces; ++f)
+    faceCharLen[f] = computeFaceCharLen(trimesh, f);
+
+  uint64_t refinedTotal = 0;
+
+
 #ifdef BF_OPENMP
 #pragma omp parallel for schedule(dynamic,8)
 #endif
@@ -523,7 +821,23 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(
       /* Flux-like: force diagonal to 0 */
       if (colGlobal == rowGlobal) continue;
 
-      BfReal value = integrateViewFactorMidpointRule(trimesh, rowGlobal, colGlobal);
+#ifdef BF_OPENMP
+      /* count refinements per-thread then atomically accumulate */
+      uint64_t refinedLocal = 0;
+      BfReal value = integrateViewFactorHybrid(trimesh, faceCharLen,
+                                               rowGlobal, colGlobal,
+                                               &g_vfParams,
+                                               g_vfParams.stats ? &refinedLocal : NULL);
+      if (g_vfParams.stats && refinedLocal) {
+#pragma omp atomic
+        refinedTotal += refinedLocal;
+      }
+#else
+      BfReal value = integrateViewFactorHybrid(trimesh, faceCharLen,
+                                               rowGlobal, colGlobal,
+                                               &g_vfParams,
+                                               g_vfParams.stats ? &refinedTotal : NULL);
+#endif
 
       /* Defensive + optional cutoff */
       if (!isfinite(value)) continue;
@@ -559,6 +873,17 @@ BfMatCsrReal *bfMatCsrRealNewViewFactorMatrixFromTrimesh(
   bfMemFree(row_colind);
   bfMemFree(row_data);
   bfMemFree(colGlobalToLocal);
+
+  if (g_vfParams.stats) {
+    fprintf(stderr,
+            "[bf] vf refine: method=%d gaussOrder=%d nearRatio=%g minMid=%g refinedPairs=%llu\n",
+            (int)g_vfParams.method, g_vfParams.gaussOrder,
+            (double)g_vfParams.nearRatio, (double)g_vfParams.minMidpointToRefine,
+            (unsigned long long)refinedTotal);
+  }
+
+  bfMemFree(faceCharLen);
+
 
   BfMatCsrReal *matCsrReal =
     bfMatCsrRealNewFromArrays(numRows, numCols, rowptr, colind, data, BF_POLICY_STEAL);
