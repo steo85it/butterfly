@@ -2,6 +2,15 @@
 
 *Overview to come...*
 
+## Quick start (Python extension)
+
+If you want the Python modules (`butterfly`, `thermal_bf`) on a Linux/HPC system, use:
+
+    bash scripts/build_install_butterfly.sh
+
+The script can (optionally) activate a Spack env, create/use a venv, build with Meson+Ninja,
+install into the venv prefix, and verify imports.
+
 ## Documentation
 
 Woefully incomplete documentation for butterfly is available [here](https://sampotter.github.io/butterfly).
@@ -13,7 +22,7 @@ Additionally:
 
 ## Compilation
 
-### Generic build (Meson)
+### Generic build (Meson only)
 
 Use [Meson](https://mesonbuild.com/) to compile this library:
 
@@ -31,65 +40,149 @@ For Mac machines using homebrew, it may be necessary to specify paths to depende
 meson setup builddir -Dc_args='-I/opt/homebrew/Cellar/suite-sparse/7.1.0/include/ -I/opt/homebrew/Cellar/openblas/0.3.24/include/'
 ```
 
-### HPC build (Spack + Python venv)
+### HPC / Linux build (Spack + Python venv) — recommended
 
-On our HPC systems we typically manage native dependencies with **Spack** and install the Python extensions into a **Python virtualenv**.
+On Linux/HPC we typically manage native dependencies with Spack and install the Python
+extensions into a Python virtualenv. The recommended entry point is:
+
+    bash scripts/build_install_butterfly.sh
+
+The script can (optionally):
+
+* load a compiler module (COMPILER_MODULE=...)
+* activate a Spack env (USE_SPACK=1, SPACK_SETUP=..., SPACK_ENV_NAME=...)
+* create/use a Python venv (VENV_DIR=...)
+* build with Meson+Ninja and install into the venv prefix
+* verify imports: butterfly and (if enabled) thermal_bf
 
 #### 1) Spack environment (one-time)
 
-If this repo includes `spack.yaml` / `spack.lock` (recommended), you can reproduce the dependency environment like this:
+If this repo includes spack.yaml / spack.lock (recommended), you can reproduce the dependency
+environment like this:
 
-```bash
-. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
-spack env activate butterfly
-spack concretize -f
-spack install
-```
+    . $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
+    spack env activate butterfly
+    spack concretize -f
+    spack install
 
 Notes:
 
 * `spack.yaml` describes the dependency intent (packages/variants).
 * `spack.lock` pins a concretized solution for a given platform/compiler stack. On the same HPC (same OS/arch/compiler), using the lock file helps colleagues get the same dependency DAG.
 
-#### 2) Build + install butterfly into a venv (repeatable)
+If the Spack environment does not exist yet on a given system, you can create/provision it using:
 
-Use the repo script:
+    bash scripts/spack_bootstrap_env.sh
 
-```bash
-. $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
-spack env activate butterfly
-bash scripts/build_install_butterfly.sh
-```
+This is a one-time step that:
+* creates the Spack env (default name: butterfly) if missing
+* adds the dependency set (no hardcoded hashes)
+* concretizes + installs
+* leaves spack.yaml + spack.lock in the env directory
 
-By default this does an incremental rebuild (keeps `build/`). To force a clean reconfigure/rebuild:
-
-```bash
-CLEAN=1 bash scripts/build_install_butterfly.sh
-```
-
-The script installs into:
-
-* `VENV_DIR=$HOME/nobackup/venvs/butterfly` (override via env var)
-
-and verifies imports:
-
-```bash
-python -c "import butterfly; print('butterfly OK')"
-python -c "import thermal_bf; print('thermal_bf OK')"
-```
+Defaults: WITH_EMBREE=1, WITH_PYTHON=1, WITH_LAPACKE=0, WITH_FLEXIBLAS=0.
 
 Common overrides:
 
-```bash
-# disable embree features
-WITH_EMBREE=0 bash scripts/build_install_butterfly.sh
+    COMPILER_MODULE=gcc/12.1.0 SPACK_ENV_NAME=butterfly bash scripts/spack_bootstrap_env.sh
 
-# build C library only (no Python extensions)
-WITH_PYTHON=0 bash scripts/build_install_butterfly.sh
+The bootstrap script does NOT build butterfly; after it finishes, build/install with:
 
-# set a non-default primme location
-PRIMME_ROOT=/path/to/primme bash scripts/build_install_butterfly.sh
-```
+    bash scripts/build_install_butterfly.sh
+
+#### 2) Build + install into a venv (repeatable)
+
+    . $HOME/nobackup/.spack_repo/share/spack/setup-env.sh
+    spack env activate butterfly
+    bash scripts/build_install_butterfly.sh
+
+By default this does an incremental rebuild (keeps build/). To force a clean reconfigure/rebuild:
+
+    CLEAN=1 bash scripts/build_install_butterfly.sh
+
+The script installs into:
+
+* VENV_DIR=$HOME/nobackup/venvs/butterfly (override via env var)
+
+and verifies imports:
+
+    python -c "import butterfly; print('butterfly OK')"
+    python -c "import thermal_bf; print('thermal_bf OK')"
+
+#### 3) PGDA / local HPC example (validated)
+
+Adapt paths to your account:
+
+    git clone -b develop /home/sberton2/git/butterfly.git
+    cd butterfly
+
+    COMPILER_MODULE=gcc/12.1.0 \
+    USE_SPACK=1 \
+    SPACK_SETUP="/home/sberton2/nobackup/.spack_repo/share/spack/setup-env.sh" \
+    SPACK_ENV_NAME=butterfly \
+    PRIMME_ROOT="/home/sberton2/nobackup/primme" \
+    WITH_EMBREE=1 \
+    WITH_PYTHON=1 \
+    CLEAN=1 \
+    bash scripts/build_install_butterfly.sh
+
+For subsequent incremental rebuilds:
+
+    COMPILER_MODULE=gcc/12.1.0 USE_SPACK=1 CLEAN=0 bash scripts/build_install_butterfly.sh
+
+#### 4) Script configuration reference (env vars)
+
+Spack:
+
+* USE_SPACK=1 (default): activate/load from Spack
+* SPACK_SETUP=/path/to/spack/share/spack/setup-env.sh
+* SPACK_ENV_NAME=butterfly
+
+Compiler module (HPC):
+
+* COMPILER_MODULE=gcc/12.1.0 (optional)
+
+Build/install locations:
+
+* BUILD_DIR=$PWD/build (default)
+* VENV_DIR=$HOME/nobackup/venvs/butterfly (default)
+
+Features:
+
+* WITH_PYTHON=1 (default): build/install Python extensions
+* WITH_EMBREE=1 (default): enable Embree integration when available
+
+Rebuild behavior:
+
+* CLEAN=0 (default): incremental rebuild
+* CLEAN=1: wipe build dir and reconfigure
+
+Python deps:
+
+* SKIP_PIP=0 (default): ensure numpy/cython/scipy are installed in the venv
+* SKIP_PIP=1: skip pip unless missing
+
+PRIMME (required for this fork):
+
+* PRIMME_ROOT=/path/to/primme (required)
+
+The script expects:
+
+* $PRIMME_ROOT/include exists
+* $PRIMME_ROOT/lib exists (if you only have lib64/, the script creates lib -> lib64)
+* if PRIMME only provides a versioned shared object (e.g. libprimme.so.3) without an
+  unversioned linker name, the script will create the libprimme.so symlink.
+
+#### 5) Common overrides / recipes
+
+    # disable embree features
+    WITH_EMBREE=0 bash scripts/build_install_butterfly.sh
+
+    # build C library only (no Python extensions)
+    WITH_PYTHON=0 bash scripts/build_install_butterfly.sh
+
+    # set a non-default primme location
+    PRIMME_ROOT=/path/to/primme bash scripts/build_install_butterfly.sh
 
 ## Error handling
 

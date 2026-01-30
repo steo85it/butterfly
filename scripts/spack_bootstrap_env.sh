@@ -39,8 +39,8 @@ WITH_EMBREE="${WITH_EMBREE:-1}"
 WITH_PYTHON="${WITH_PYTHON:-1}"
 
 # These match your Meson expectations on Linux (pkg-config deps)
-WITH_FLEXIBLAS="${WITH_FLEXIBLAS:-1}"
-WITH_LAPACKE="${WITH_LAPACKE:-1}"
+WITH_FLEXIBLAS="${WITH_FLEXIBLAS:-0}"
+WITH_LAPACKE="${WITH_LAPACKE:-0}"
 
 # Optional: add arpack (your current meson.build treats it optional)
 WITH_ARPACK="${WITH_ARPACK:-0}"
