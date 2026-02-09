@@ -96,10 +96,10 @@ export PIP_USER=0
 python -m pip install --isolated --no-user -U pip wheel >/dev/null
 
 if [ "$SKIP_PIP" = "0" ]; then
-  python -m pip install --isolated --no-user -U numpy cython scipy >/dev/null
+  python -m pip install --isolated --no-user -U numpy cython scipy matplotlib >/dev/null
 else
-  python - <<'PY' >/dev/null 2>&1 || python -m pip install --isolated --no-user -U numpy cython scipy >/dev/null
-import numpy, Cython, scipy
+  python - <<'PY' >/dev/null 2>&1 || python -m pip install --isolated --no-user -U numpy cython scipy matplotlib >/dev/null
+import numpy, Cython, scipy, matplotlib
 PY
 fi
 
