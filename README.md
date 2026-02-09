@@ -184,6 +184,71 @@ The script expects:
     # set a non-default primme location
     PRIMME_ROOT=/path/to/primme bash scripts/build_install_butterfly.sh
 
+
+## Ubuntu / Mint build (APT + Python venv, no Spack)
+
+On Ubuntu/Mint systems where you have admin rights and prefer not to use Spack, you can install
+native dependencies with `apt` and build/install the Python extensions into a virtualenv.
+
+### 0) Install PRIMME (required for this fork)
+
+This fork requires PRIMME. Install it manually first (you only need to do this once):
+
+```bash
+# choose where you want PRIMME installed
+export PRIMME_ROOT="$HOME/opt/primme"
+
+git clone https://github.com/primme/primme.git "$PRIMME_ROOT"
+cd $PRIMME_ROOT
+make lib     #  builds lib/libprimme.a
+make solib   #  builds lib/libprimme.so (or lib/libprimme.dylib)
+```
+
+The build/install script expects:
+
+* `$PRIMME_ROOT/include` exists
+* `$PRIMME_ROOT/lib` exists (if PRIMME uses `lib64/`, the script will create `lib -> lib64`)
+* if PRIMME only provides a versioned shared object (e.g. `libprimme.so.3`) without an
+  unversioned linker name, the script will create a `libprimme.so` symlink.
+
+### 1) Build + install butterfly into a venv (repeatable)
+
+Use the Ubuntu/Mint installer:
+
+```bash
+PRIMME_ROOT="$HOME/opt/primme" \
+VENV_DIR="$HOME/venvs/butterfly" \
+CLEAN=1 \
+bash scripts/build_install_butterfly_ubuntu.sh
+```
+
+This script will:
+
+* install system dependencies via `apt` (can be disabled with `APT_INSTALL=0`)
+* create/use a Python virtualenv (`VENV_DIR=...`)
+* install Python deps into the venv (default includes `numpy`, `cython`, `scipy`, `matplotlib`)
+* build with Meson+Ninja and install into the venv prefix
+* ensure runtime `.so` resolution on Ubuntu multiarch installs
+* verify imports:
+
+```bash
+python -c "import butterfly; print('butterfly OK')"
+python -c "import thermal_bf; print('thermal_bf OK')"
+```
+
+For subsequent incremental rebuilds:
+
+```bash
+APT_INSTALL=0 CLEAN=0 bash scripts/build_install_butterfly_ubuntu.sh
+```
+
+Notes:
+
+* On Ubuntu/Mint, Meson commonly installs libraries under a multiarch directory
+  like `$VENV_DIR/lib/x86_64-linux-gnu`. The script handles this so `import butterfly`
+  works without manual `LD_LIBRARY_PATH` tweaking.
+
+
 ## Error handling
 
 This library features "OpenGL-style" error handling (e.g., [see this page](https://www.khronos.org/opengl/wiki/OpenGL_Error)). The guiding principles are three-fold:
