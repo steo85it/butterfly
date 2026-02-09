@@ -92,12 +92,13 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-python -m pip install -U pip wheel >/dev/null
+export PIP_USER=0
+python -m pip install --isolated --no-user -U pip wheel >/dev/null
 
 if [ "$SKIP_PIP" = "0" ]; then
-  python -m pip install -U numpy cython scipy >/dev/null
+  python -m pip install --isolated --no-user -U numpy cython scipy >/dev/null
 else
-  python - <<'PY' >/dev/null 2>&1 || python -m pip install -U numpy cython scipy >/dev/null
+  python - <<'PY' >/dev/null 2>&1 || python -m pip install --isolated --no-user -U numpy cython scipy >/dev/null
 import numpy, Cython, scipy
 PY
 fi
