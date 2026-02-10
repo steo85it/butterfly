@@ -459,6 +459,18 @@ void bfVectors3Deinit(BfVectors3 *vectors) {
   vectors->data = NULL;
 }
 
+
+void bfVectors3Dealloc(BfVectors3 **vectors) {
+  bfMemFree(*vectors);
+  *vectors = NULL;
+}
+
+void bfVectors3DeinitAndDealloc(BfVectors3 **vectors) {
+  if (*vectors == NULL) return;
+  bfVectors3Deinit(*vectors);
+  bfVectors3Dealloc(vectors);
+}
+
 void bfVectors3GetByIndex(BfVectors3 const *vectors, BfSize numInds, BfSize const *inds, BfVectors3 *indexedVectors) {
   BF_ERROR_BEGIN();
 
@@ -497,4 +509,8 @@ void bfVectors3Append(BfVectors3 *vectors, BfVector3 const v) {
 
 BfReal const *bfVectors3GetConstPtr(BfVectors3 const *vectors, BfSize i) {
   return vectors->data[i];
+}
+
+BfSize bfVectors3GetSize(BfVectors3 const *vectors) {
+  return vectors->size;
 }

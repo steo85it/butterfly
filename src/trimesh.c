@@ -237,9 +237,18 @@ static void initVf(BfTrimesh *trimesh) {
       ++trimesh->vfOffset[trimesh->faces[i][j] + 1];
 
   /* Raise an error if there are any isolated vertices. */
+  BfSize nIso = 0;
   for (BfSize i = 0; i < numVerts; ++i)
     if (trimesh->vfOffset[i + 1] == 0)
-      RAISE_ERROR(BF_ERROR_RUNTIME_ERROR);
+      ++nIso;
+
+  if (nIso > 0) {
+    fprintf(stderr,
+            "[bf] invalid mesh: %zu isolated vertices (not referenced by any face). "
+            "Consider pruning unused vertices.\n",
+            (size_t)nIso);
+    RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
+  }
 
   /* Cumsum vfOffset to convert counts to offsets. */
   for (BfSize i = 0; i < numVerts; ++i)
@@ -426,6 +435,123 @@ static void initEdges(BfTrimesh *trimesh) {
   BF_ERROR_END() {
     BF_DIE();
   }
+}
+
+/* ---------------------------
+ * Prune unused vertices
+ * --------------------------- */
+
+static void bfTrimeshPruneUnusedVerts(BfTrimesh *trimesh) {
+  BfSize numVerts = bfTrimeshGetNumVerts(trimesh);
+  BfSize numFaces = bfTrimeshGetNumFaces(trimesh);
+
+  bool *used = bfMemAllocAndZero(numVerts, sizeof(bool));
+  if (!used) { bfSetError(BF_ERROR_MEMORY_ERROR); return; }
+
+  for (BfSize f = 0; f < numFaces; ++f) {
+    for (BfSize k = 0; k < 3; ++k) {
+      BfSize v = trimesh->faces[f][k];
+      if (v >= numVerts) {
+        bfMemFree(used);
+        bfSetError(BF_ERROR_OUT_OF_RANGE);
+        return;
+      }
+      used[v] = true;
+    }
+  }
+
+  BfSize nUsed = 0;
+  for (BfSize i = 0; i < numVerts; ++i)
+    if (used[i]) ++nUsed;
+
+  if (nUsed == numVerts) {
+    bfMemFree(used);
+    return; /* OK, no error */
+  }
+
+  BfSize *newInd = bfMemAlloc(numVerts, sizeof(BfSize));
+  if (!newInd) {
+    bfMemFree(used);
+    bfSetError(BF_ERROR_MEMORY_ERROR);
+    return;
+  }
+
+  BfSize cur = 0;
+  for (BfSize i = 0; i < numVerts; ++i)
+    newInd[i] = used[i] ? cur++ : BF_SIZE_BAD_VALUE;
+
+  BfPoints3 *vertsNew = bfPoints3NewWithDefaultCapacity();
+  if (vertsNew == NULL) {
+    bfMemFree(used);
+    bfMemFree(newInd);
+    bfSetError(BF_ERROR_MEMORY_ERROR);
+    return;
+  }
+
+  for (BfSize i = 0; i < numVerts; ++i) {
+    if (!used[i]) continue;
+    BfPoint3 x;
+    bfMemCopy(trimesh->verts->data[i], 1, sizeof(BfPoint3), x);
+    bfPoints3Append(vertsNew, x);
+    if (bfGetError() != BF_ERROR_NONE) {
+      bfPoints3DeinitAndDealloc(&vertsNew);
+      bfMemFree(used);
+      bfMemFree(newInd);
+      return;
+    }
+  }
+
+  /* Optional remap of vertex normals */
+  BfVectors3 *vnsNew = NULL;
+  if (trimesh->vertexNormals != NULL &&
+      bfVectors3GetSize(trimesh->vertexNormals) == numVerts) {
+    vnsNew = bfVectors3NewWithCapacity(nUsed);
+    if (vnsNew == NULL) {
+      bfPoints3DeinitAndDealloc(&vertsNew);
+      bfMemFree(used);
+      bfMemFree(newInd);
+      bfSetError(BF_ERROR_MEMORY_ERROR);
+      return;
+    }
+
+    for (BfSize i = 0; i < numVerts; ++i) {
+      if (!used[i]) continue;
+      BfVector3 n;
+      bfMemCopy(bfVectors3GetConstPtr(trimesh->vertexNormals, i),
+                1, sizeof(BfVector3), n);
+      bfVectors3Append(vnsNew, n);
+      if (bfGetError() != BF_ERROR_NONE) {
+        bfVectors3DeinitAndDealloc(&vnsNew);
+        bfPoints3DeinitAndDealloc(&vertsNew);
+        bfMemFree(used);
+        bfMemFree(newInd);
+        return;
+      }
+    }
+  }
+
+  /* Remap faces */
+  for (BfSize f = 0; f < numFaces; ++f)
+    for (BfSize k = 0; k < 3; ++k)
+      trimesh->faces[f][k] = newInd[trimesh->faces[f][k]];
+
+  BfSize oldNumVerts = numVerts;
+
+  bfPoints3DeinitAndDealloc(&trimesh->verts);
+  trimesh->verts = vertsNew;
+
+  if (vnsNew) {
+    bfVectors3Deinit(trimesh->vertexNormals);
+    bfMemFree(trimesh->vertexNormals);
+    trimesh->vertexNormals = vnsNew;
+  }
+
+  fprintf(stderr,
+          "[bf] warning: pruned %zu unreferenced vertices (%zu -> %zu)\n",
+          (size_t)(oldNumVerts - nUsed), (size_t)oldNumVerts, (size_t)nUsed);
+
+  bfMemFree(used);
+  bfMemFree(newInd);
 }
 
 static void initEf(BfTrimesh *trimesh) {
@@ -959,6 +1085,9 @@ void bfTrimeshInitFromObjFile(BfTrimesh *trimesh, char const *objPath) {
 
   BF_ASSERT(bfTrimeshGetNumVerts(trimesh) == num_verts);
 
+  bfTrimeshPruneUnusedVerts(trimesh);
+  HANDLE_ERROR();
+
   initCommon(trimesh);
   HANDLE_ERROR();
 
@@ -983,17 +1112,18 @@ void bfTrimeshInitFromVertsAndFaces(BfTrimesh *trimesh, BfPoints3 const *verts, 
   if (anyFaceIndexOutOfBounds)
     RAISE_ERROR(BF_ERROR_OUT_OF_RANGE);
 
-  /* Make sure all vertices are used in the mesh: */
-  bool *vertInMesh = bfMemAllocAndZero(verts->size, sizeof(bool));
-  for (BfSize i = 0; i < numFaces; ++i)
-    for (BfSize j = 0; j < 3; ++j)
-      vertInMesh[faces[i][j]] = true;
-  bool allVertsUsed = true;
-  for (BfSize i = 0; i < verts->size; ++i)
-    if (!vertInMesh[i])
-      allVertsUsed = false;
-  if (!allVertsUsed)
-    RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
+//  /* Make sure all vertices are used in the mesh: */
+//  bool *vertInMesh = bfMemAllocAndZero(verts->size, sizeof(bool));
+//  for (BfSize i = 0; i < numFaces; ++i)
+//    for (BfSize j = 0; j < 3; ++j)
+//      vertInMesh[faces[i][j]] = true;
+//  bool allVertsUsed = true;
+//  for (BfSize i = 0; i < verts->size; ++i)
+//    if (!vertInMesh[i])
+//      allVertsUsed = false;
+//  if (!allVertsUsed)
+//    RAISE_ERROR(BF_ERROR_INVALID_ARGUMENTS);
+  /* Allow unused vertices (common); we’ll prune after copying. */
 
   trimesh->verts = bfPoints3Copy(verts);
   HANDLE_ERROR();
@@ -1005,6 +1135,9 @@ void bfTrimeshInitFromVertsAndFaces(BfTrimesh *trimesh, BfPoints3 const *verts, 
 
   trimesh->numFaces = numFaces;
 
+  bfTrimeshPruneUnusedVerts(trimesh);
+  HANDLE_ERROR();
+
   initCommon(trimesh);
   HANDLE_ERROR();
 
@@ -1014,7 +1147,7 @@ void bfTrimeshInitFromVertsAndFaces(BfTrimesh *trimesh, BfPoints3 const *verts, 
     BF_DIE();
   }
 
-  bfMemFree(vertInMesh);
+//  bfMemFree(vertInMesh);
 }
 
 #ifdef BF_EMBREE

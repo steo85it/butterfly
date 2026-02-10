@@ -64,3 +64,4 @@ void bfVectors3DeinitAndDealloc(BfVectors3 **vectors);
 void bfVectors3GetByIndex(BfVectors3 const *vectors, BfSize numInds, BfSize const *inds, BfVectors3 *indexedVectors);
 void bfVectors3Append(BfVectors3 *vectors, BfVector3 const v);
 BfReal const *bfVectors3GetConstPtr(BfVectors3 const *vectors, BfSize i);
+BfSize bfVectors3GetSize(BfVectors3 const *vectors);
