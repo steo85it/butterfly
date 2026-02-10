@@ -2017,11 +2017,49 @@ done_backend:
 
 /* ---- NEW: CSR transpose MVP and sparse top-k SVD helpers (PRIMME/ARPACK) ---- */
 
+/* y <- A * x  (A is m×n CSR, x is length n, y length m)
+ *
+ * NOTE: This intentionally bypasses bfMatMulVec/bfMatMul in the PRIMME
+ * callback because those paths may touch non-thread-safe global state
+ * (and have been implicated in OMP>1 segfaults).
+ */
+static void csrMulVecOnly(BfMatCsrReal const *A,
+                          BfReal const *x,
+                          BfSize        xStride,
+                          BfReal       *y)
+{
+  BF_ERROR_BEGIN();
+
+  BfMat const *Amat = bfMatCsrRealConstToMatConst(A);
+  HANDLE_ERROR();
+
+  BfSize m = bfMatGetNumRows(Amat);
+
+  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(A);
+  BfSize const *colind = bfMatCsrRealGetColindConstPtr(A);
+  BfReal const *data   = bfMatCsrRealGetDataConstPtr(A);
+
+  BF_ASSERT(rowptr != NULL);
+  BF_ASSERT(colind != NULL);
+  BF_ASSERT(data   != NULL);
+
+  for (BfSize i = 0; i < m; ++i) {
+    BfReal sum = 0;
+    for (BfSize p = rowptr[i]; p < rowptr[i + 1]; ++p) {
+      sum += data[p] * x[colind[p]*xStride];
+    }
+    y[i] = sum;
+  }
+
+  BF_ERROR_END() {
+    BF_DIE();
+  }
+}
+
 /* y <- A^T * x  (A is m×n CSR, x is length m, y length n)
  *
- * NOTE: We do NOT reimplement A*x here: that is already provided by
- * bfMatCsrRealMulVec via bfMatMulVec. This kernel only covers A^T*x,
- * for which there is no high-level BF API yet.
+ * NOTE: This kernel only covers A^T*x, for which there is no high-level
+ * BF API yet. (A*x is handled by csrMulVecOnly above.)
  */
 static void csrMulVecTransOnly(BfMatCsrReal const *A,
                                BfReal const *x,
@@ -2075,6 +2113,9 @@ static void csrMulVecTransOnly(BfMatCsrReal const *A,
  *
  * We support blockSize >= 1, treating x,y as column-major (ldx, ldy)
  * with leading dimensions *ldx, *ldy.
+ *
+ * IMPORTANT: This callback must be thread-safe under OMP. Do NOT call
+ * bfMatMulVec/bfMatMul here; use raw CSR kernels only.
  */
 static void bfPrimmeCsrMatrixMatvec(
     void *x, PRIMME_INT *ldx,
@@ -2113,22 +2154,7 @@ static void bfPrimmeCsrMatrixMatvec(
 
     if (*transpose == 0) {
       /* ycol = A * xcol (x length n, y length m) */
-
-      BfVecReal x_view;
-      bfVecRealInitView(&x_view, n, BF_DEFAULT_STRIDE, (BfReal *)xcol);
-
-      /* bfMatMulVec returns a heap-allocated vector. bfVecToVecReal casts it.
-         Do NOT bfVecDelete(y_tmp) after casting, or you'll free the storage
-         backing y_real (use-after-free / double-free). */
-      BfVecReal *y_real = bfVecToVecReal(
-        bfMatMulVec(Amat, bfVecRealToVec(&x_view))
-      );
-      if (y_real == NULL) { *ierr = 1; return; }
-
-      for (BfSize i = 0; i < m; ++i)
-        ycol[i] = y_real->data[i*y_real->stride];
-
-      bfVecRealDeinitAndDealloc(&y_real);
+      csrMulVecOnly(Acsr, xcol, 1, ycol);
     }
     else {
       /* ycol = A^T * xcol (x length m, stride=1, y length n) */
@@ -2727,6 +2753,10 @@ if (maxAbs < 1e-11) {
 
   /* --- PRIMME_SVDS backend: get singular values & right singular vectors --- */
 
+  /* Make sure PRIMME internal allocations are freed on *all* exits. */
+  primme_svds_params primme;
+  bool primme_inited = false;
+
   /* Use an explicit initSize so we can parse svecs deterministically as:
    *   leftBlock  = U  (m x initSize_in)
    *   rightBlock = V  (n x initSize_in)
@@ -2742,8 +2772,8 @@ if (maxAbs < 1e-11) {
   if (svals == NULL || svecs == NULL || resNorms == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
-  primme_svds_params primme;
   primme_svds_initialize(&primme);
+  primme_inited = true;
 
   /* No initial guesses provided in svecs */
   primme.numOrthoConst = 0;
@@ -2773,10 +2803,10 @@ if (maxAbs < 1e-11) {
       (unsigned long)n);
   }
 
-  primme.monitorFun      = bfPrimmeSvdsCappedMonitor;
+  primme.monitorFun      = NULL; // bfPrimmeSvdsCappedMonitor;
   primme.monitorFun_type = primme_op_double;
   #if BF_SPARSE_SVD_DEBUG
-    primme.printLevel = 2;
+    primme.printLevel = 0; // 2
   #endif
 
   primme.m       = (PRIMME_INT)m;
@@ -2829,6 +2859,13 @@ if (maxAbs < 1e-11) {
                                 (double *)resNorms,
                                 &primme);
   (void)primme_ret;
+
+  /* Free PRIMME-owned internal allocations ASAP (stack 'primme' persists,
+   * but PRIMME may allocate work arrays that otherwise accumulate per leaf). */
+  if (primme_inited) {
+    primme_svds_free(&primme);
+    primme_inited = false;
+  }
 
   /* Snapshot counters after call */
   long long csrA_after  = gPrimmeCsrMatvecCalls_A;
@@ -3809,6 +3846,15 @@ probe_after:
 
   /* Cleanup */
   cleanup:
+#if BF_HAVE_PRIMME_SVDS
+      /* If we exit early before the dprimme_svds() path frees internals,
+       * make sure we still release PRIMME-owned memory. */
+      if (primme_inited) {
+        primme_svds_free(&primme);
+        primme_inited = false;
+      }
+#endif
+
       if (U)  bfMatDenseRealDeinitAndDealloc(&U);
       if (VT) bfMatDenseRealDeinitAndDealloc(&VT);
       if (S)  bfMatDiagRealDeinitAndDealloc(&S);
@@ -3827,6 +3873,7 @@ probe_after:
       if (resNormsSorted) bfMemFree(resNormsSorted);
       if (resNorms) bfMemFree(resNorms);
 
+      /* PRIMME output buffers: MUST be freed on all paths (OMP=1 RAM climb). */
       if (svals) bfMemFree(svals);
       if (svecs) bfMemFree(svecs);
 
