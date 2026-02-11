@@ -266,6 +266,8 @@ butterfly_lib_src = [
   'src/vec_zero.c',
   'src/vectors.c',
   'src/vf_hier.c',
+  'src/vf_hier_io.c',
+  'src/vf_hier_apply.c',
   'src/xoshiro256plus.c',
 ]
 if get_option('python').enabled()
