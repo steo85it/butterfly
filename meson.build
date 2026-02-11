@@ -265,7 +265,7 @@ butterfly_lib_src = [
   'src/vec_real.c',
   'src/vec_zero.c',
   'src/vectors.c',
-  'src/vf_hier.c',
+  'src/vf_hier_build.c',
   'src/vf_hier_io.c',
   'src/vf_hier_apply.c',
   'src/xoshiro256plus.c',

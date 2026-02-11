@@ -1,3 +1,17 @@
+/*
+ * vf_hier_internal.h
+ * ------------------
+ * Private (non-installed) header shared by vf_hier_build.c / vf_hier_apply.c /
+ * vf_hier_io.c.
+ *
+ * Contains:
+ *   - internal structs (face maps, apply plan/task)
+ *   - internal helper prototypes used across translation units
+ *   - build/apply tuning macros (BF_VF_HIER_*)
+ *
+ * Does NOT contain public API: that lives in vf_hier.h.
+ */
+
 #pragma once
 
 #include <bf/def.h>
@@ -224,6 +238,31 @@ void           bfVfHierBlockDeinitAndDealloc(BfVfHierBlock **blockPtr); /* NEW *
 
 typedef struct { BfSize row; BfSize col; } ChildPair;
 
+/* ============================================================
+ * Optional build progress counters
+ *
+ * Goal: a single monotonic progress counter for “how far through
+ * building/compressing the FF hierarchy are we?”.
+ *
+ * Rationale:
+ *   Counting SVD tries is noisy (many leaves end up sparse), and can
+ *   exceed 100% if totals are computed for a subset while “done”
+ *   keeps accumulating across multiple builds.
+ *
+ * This “leaf” counter increments exactly when buildBlockFromCsrMidlevel
+ * stops recursion and materializes a final leaf block (sparse OR SVD).
+ *
+ * Enable with:
+ *   BF_VF_HIER_PROGRESS=1
+ *   BF_VF_HIER_COUNT_LEAVES=1
+ *
+ * Tune printing frequency with:
+ *   BF_VF_HIER_PROGRESS_EVERY=N
+ * ============================================================ */
+extern unsigned long long g_vf_leaf_total;
+extern unsigned long long g_vf_leaf_done;
+
+/* Optional SVD progress reporting (CSR-midlevel only) */
 extern unsigned long long g_svd_tries_total;
 extern unsigned long long g_svd_tries_done;
 
@@ -233,13 +272,74 @@ void vfHierMaybePrintProgress_(unsigned long long done, unsigned long long total
 BfBool isFar(BfQuadtreeNode const *rowNode, BfQuadtreeNode const *colNode, BfReal eta);
 void getNodeInds(BfQuadtreeNode *node, BfQuadtree const *qt, BfSizeArray *inds);
 
-BfVfHierBlock *buildBlockHybrid(/* full args */);
-BfVfHierBlock *buildBlockFromCsrMidlevel(/* full args */);
-void countSvdTriesFromCsrMidlevel(/* full args */);
+/* ------------------------------------------------------------
+ * Cross-TU internal entry points (real signatures; no placeholders)
+ * ------------------------------------------------------------ */
+
+/* Hybrid builder: geometric recursion + mid-level CSR builder */
+BfVfHierBlock *buildBlockHybrid(
+    BfTrimesh const *tm,
+    BfQuadtreeNode  *rowNode,
+    BfQuadtreeNode  *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac);
+
+/* Mid-level CSR recursive builder */
+BfVfHierBlock *buildBlockFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfSizeArray  const *rowFaces_par,
+    BfSizeArray  const *colFaces_par,
+    BfVfFaceMap  const *faceMap,
+    BfQuadtreeNode *rowNode,
+    BfQuadtreeNode *colNode,
+    BfReal eta,
+    BfSize leafMax,
+    BfSize leafMin,
+    BfSize minArea,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac,
+    int depth);
+
+/* Dry-run counter for “would-attempt SVD” leaves (for progress reporting) */
+void countSvdTriesFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfVfFaceMap  const *faceMap,
+    BfQuadtreeNode *rowNode,
+    BfQuadtreeNode *colNode,
+    BfReal eta,
+    BfSize leafMax,
+    BfSize leafMin,
+    BfSize minArea,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac,
+    int depth,
+    unsigned long long *counter);
+
+/* Dry-run counter for “final” leaves produced by buildBlockFromCsrMidlevel.
+ * Used to report overall build progress (g_vf_leaf_total / g_vf_leaf_done). */
+void countLeavesFromCsrMidlevel(
+    BfMatCsrReal const *A_par,
+    BfVfFaceMap  const *faceMap,
+    BfQuadtreeNode *rowNode,
+    BfQuadtreeNode *colNode,
+    BfReal eta,
+    BfSize leafMax,
+    BfSize leafMin,
+    BfSize minArea,
+    BfReal tol,
+    BfSize minSvdSize,
+    BfReal maxSvdRankFrac,
+    int depth,
+    unsigned long long *counter);
 
 void bfVfSvdLeafApply(BfVfSvdLeaf const *leaf, BfReal const *x, BfReal *y, BfSize n);
-void bfVfSvdLeafApplyMany(BfVfSvdLeaf const *leaf, BfReal const *X, BfSize ldX,
-                          BfReal *Y, BfSize ldY, BfSize n, BfSize r);
 
 void reindexCsrColsToLocal(BfMatCsrReal *A, BfSizeArray const *colFaces, BfSize nFaces);
 void collect_leaf_blocks(BfVfHierBlock const *root, BfPtrArray *leaves);

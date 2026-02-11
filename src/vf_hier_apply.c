@@ -1,6 +1,21 @@
+/*
+ * vf_hier_apply.c
+ * --------------
+ * Application (matvec) code for BfVfHier.
+ *
+ * Responsibilities:
+ *   - bfVfHierApply / bfVfHierApplyMany
+ *   - apply-plan construction (tiling + per-leaf tasks)
+ *   - optimized kernels for CSR leaves and SVD leaves
+ *
+ * Legacy:
+ *   - Any legacy apply paths should be guarded by BF_VF_HIER_ENABLE_LEGACY_BUILD
+ *     and live here (not in vf_hier_io.c).
+ */
+
 #include <bf/def.h>
 #include <bf/vf_hier.h>
-
+ 
 #include <bf/mem.h>
 #include <bf/error.h>
 #include <bf/tree.h>
@@ -414,6 +429,247 @@ void bfVfHierApply(BfVfHier const *vfHier,
                    BfReal         *y)
 {
   bfVfHierApplyMany(vfHier, x, vfHier->n, y, vfHier->n, 1);
+}
+
+/* ============================================================
+ * ApplyMany implementation (moved from vf_hier_io.c)
+ * ============================================================ */
+
+/* Local helper: unpack MatProduct factors (U, S, VT) */
+static BfBool unpack_matproduct_usvt_(BfMat *P,
+                                     BfMatDenseReal **U,
+                                     BfMatDiagReal **S,
+                                     BfMatDenseReal **VT)
+{
+  *U = NULL; *S = NULL; *VT = NULL;
+
+  BfMatProduct *prod = bfMatToMatProduct(P);
+  if (prod == NULL) return BF_FALSE;
+  if (bfMatProductNumFactors(prod) != 3) return BF_FALSE;
+
+  BfMat *f0 = bfMatProductGetFactor(prod, 0);
+  BfMat *f1 = bfMatProductGetFactor(prod, 1);
+  BfMat *f2 = bfMatProductGetFactor(prod, 2);
+
+  BfMatDenseReal *Udr  = bfMatToMatDenseReal(f0);
+  BfMatDiagReal  *Sdg  = bfMatToMatDiagReal(f1);
+  BfMatDenseReal *VTdr = bfMatToMatDenseReal(f2);
+  if (Udr == NULL || Sdg == NULL || VTdr == NULL) return BF_FALSE;
+
+  *U = Udr; *S = Sdg; *VT = VTdr;
+  return BF_TRUE;
+}
+
+static void bfVfSparseLeafApplyManyRange(BfVfSparseLeaf const *leaf,
+                                        BfReal const         *X, BfSize ldX,
+                                        BfReal               *Y, BfSize ldY,
+                                        BfSize                n,
+                                        BfSize                nrhs,
+                                        BfSize                iBegin,
+                                        BfSize                iEnd)
+{
+  BfMat const *A_mat = bfMatCsrRealToMat(leaf->mat);
+  BfSize mA = bfMatGetNumRows(A_mat);
+  BF_ASSERT(iEnd <= mA);
+
+  BfSize const *rowptr = bfMatCsrRealGetRowptrConstPtr(leaf->mat);
+  BfSize const *colind = bfMatCsrRealGetColindConstPtr(leaf->mat);
+  BfReal const *data   = bfMatCsrRealGetDataConstPtr(leaf->mat);
+  BF_ASSERT(rowptr && colind && data);
+
+  BfSizeArray const *rowInds = &leaf->rowInds;
+  BfSizeArray const *colInds = &leaf->colInds;
+
+  if (leaf->colsAreLocal) {
+    for (BfSize i = iBegin; i < iEnd; ++i) {
+      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
+      BfReal *yRow = Y + globalRow;
+
+      BfSize rs = rowptr[i], re = rowptr[i + 1];
+      for (BfSize k = rs; k < re; ++k) {
+        BfSize cLocal = colind[k];
+        BfSize globalCol = bfSizeArrayGet((BfSizeArray *)colInds, cLocal);
+        BfReal a = data[k];
+
+        BfReal const *xCol = X + globalCol;
+        for (BfSize r = 0; r < nrhs; ++r)
+          yRow[r*ldY] += a * xCol[r*ldX];
+      }
+    }
+  } else {
+    for (BfSize i = iBegin; i < iEnd; ++i) {
+      BfSize globalRow = bfSizeArrayGet((BfSizeArray *)rowInds, i);
+      BfReal *yRow = Y + globalRow;
+
+      BfSize rs = rowptr[i], re = rowptr[i + 1];
+      for (BfSize k = rs; k < re; ++k) {
+        BfSize globalCol = colind[k];
+        BfReal a = data[k];
+
+        BfReal const *xCol = X + globalCol;
+        for (BfSize r = 0; r < nrhs; ++r)
+          yRow[r*ldY] += a * xCol[r*ldX];
+      }
+    }
+  }
+}
+
+static void ensure_svd_cache_(BfVfSvdLeaf const *leaf) {
+  if (leaf->U_cache && leaf->S_cache && leaf->VT_cache) return;
+
+  #pragma omp critical(bf_vf_svd_cache_init)
+  {
+    if (!(leaf->U_cache && leaf->S_cache && leaf->VT_cache)) {
+      BfVfSvdLeaf *m = (BfVfSvdLeaf *)leaf;
+      BfMatDenseReal *U = NULL, *VT = NULL;
+      BfMatDiagReal *S = NULL;
+      BF_ASSERT(unpack_matproduct_usvt_(leaf->mat, &U, &S, &VT));
+      m->U_cache  = U;
+      m->S_cache  = S;
+      m->VT_cache = VT;
+    }
+  }
+}
+
+static void svd_precompute_Z_(BfVfSvdLeaf const *leaf,
+                            BfReal const      *X, BfSize ldX,
+                            BfSize             n,
+                            BfSize             nrhs,
+                            BfReal            *Z /* len = nrhs*rank */)
+{
+  ensure_svd_cache_(leaf);
+
+  BfSize mj   = bfSizeArrayGetSize((BfSizeArray *)&leaf->colInds);
+  BfSize rank = leaf->rank;
+
+  BfMatDenseReal const *VTm = leaf->VT_cache; /* rank x mj */
+  BfMatDiagReal  const *Sm  = leaf->S_cache;
+
+  BfReal const *VT = VTm->data;
+  BfSize rsVT = VTm->super.rowStride;
+  BfSize csVT = VTm->super.colStride;
+  BfReal const *S = Sm->data; /* length rank */
+
+  for (BfSize r = 0; r < nrhs*rank; ++r) Z[r] = 0;
+
+  for (BfSize j = 0; j < mj; ++j) {
+    BfSize globalCol = bfSizeArrayGet((BfSizeArray *)&leaf->colInds, j);
+    BF_ASSERT(globalCol < n);
+
+    BfReal const *xCol = X + globalCol;
+    for (BfSize k = 0; k < rank; ++k) {
+      BfReal vt = VT[k*rsVT + j*csVT];
+      for (BfSize rhs = 0; rhs < nrhs; ++rhs)
+        Z[rhs*rank + k] += vt * xCol[rhs*ldX];
+    }
+  }
+
+  for (BfSize rhs = 0; rhs < nrhs; ++rhs)
+    for (BfSize k = 0; k < rank; ++k)
+      Z[rhs*rank + k] *= S[k];
+}
+
+static void svd_accumulate_rows_from_Z_(BfVfSvdLeaf const *leaf,
+                                      BfReal const      *Z,
+                                      BfReal            *Y, BfSize ldY,
+                                      BfSize             n,
+                                      BfSize             nrhs,
+                                      BfSize             iBegin,
+                                      BfSize             iEnd)
+{
+  ensure_svd_cache_(leaf);
+
+  BfSize m    = bfSizeArrayGetSize((BfSizeArray *)&leaf->rowInds);
+  BfSize rank = leaf->rank;
+  BF_ASSERT(iEnd <= m);
+
+  BfMatDenseReal const *Um = leaf->U_cache; /* m x rank */
+  BfReal const *U = Um->data;
+  BfSize rsU = Um->super.rowStride;
+  BfSize csU = Um->super.colStride;
+
+  for (BfSize i = iBegin; i < iEnd; ++i) {
+    BfSize globalRow = bfSizeArrayGet((BfSizeArray *)&leaf->rowInds, i);
+    BF_ASSERT(globalRow < n);
+    BfReal *yRow = Y + globalRow;
+
+    for (BfSize rhs = 0; rhs < nrhs; ++rhs) {
+      BfReal const *z = Z + rhs*rank;
+      BfReal acc = 0;
+      for (BfSize k = 0; k < rank; ++k)
+        acc += U[i*rsU + k*csU] * z[k];
+      yRow[rhs*ldY] += acc;
+    }
+  }
+}
+
+void bfVfHierApplyMany(BfVfHier const *vfHier,
+                       BfReal const   *X,   BfSize ldX,
+                       BfReal         *Y,   BfSize ldY,
+                       BfSize          nrhs)
+{
+  BF_ASSERT(vfHier && vfHier->root);
+  BF_ASSERT(X && Y);
+  BF_ASSERT(ldX >= vfHier->n);
+  BF_ASSERT(ldY >= vfHier->n);
+
+  if (vfHier->applyPlan == NULL) {
+    bfVfHierBuildApplyPlan((BfVfHier *)vfHier, 1024);
+  }
+
+  BfVfApplyPlan const *p = vfHier->applyPlan;
+  BfSize n = vfHier->n;
+
+  BfReal **Zptr = NULL;
+  BfReal  *Zbuf = NULL;
+
+  if (p->numSvdBlocks > 0) {
+    Zptr = bfMemAlloc(p->numSvdBlocks, sizeof(BfReal *));
+
+    BfSize total = 0;
+    for (BfSize i = 0; i < p->numSvdBlocks; ++i) {
+      BfVfSvdLeaf const *leaf = &p->svdBlocks[i]->data.svd;
+      total += leaf->rank * nrhs;
+    }
+    Zbuf = bfMemAlloc(total, sizeof(BfReal));
+
+    BfSize off = 0;
+    for (BfSize i = 0; i < p->numSvdBlocks; ++i) {
+      BfVfSvdLeaf const *leaf = &p->svdBlocks[i]->data.svd;
+      Zptr[i] = Zbuf + off;
+      off += leaf->rank * nrhs;
+    }
+
+    #pragma omp parallel for schedule(dynamic) if(!omp_in_parallel())
+    for (BfSize i = 0; i < p->numSvdBlocks; ++i) {
+      BfVfSvdLeaf const *leaf = &p->svdBlocks[i]->data.svd;
+      svd_precompute_Z_(leaf, X, ldX, n, nrhs, Zptr[i]);
+    }
+  }
+
+  #pragma omp parallel for schedule(dynamic) if(!omp_in_parallel())
+  for (BfSize t = 0; t < p->numTiles; ++t) {
+    BfSize start = p->tilePtr[t];
+    BfSize end   = p->tilePtr[t + 1];
+
+    for (BfSize q = start; q < end; ++q) {
+      BfVfApplyTask const *task = &p->tasks[q];
+      BfVfHierBlock const *b = task->leafBlock;
+
+      if (b->kind == BF_VF_HIER_BLOCK_SPARSE) {
+        bfVfSparseLeafApplyManyRange(&b->data.sparse, X, ldX, Y, ldY,
+                                     n, nrhs, task->iBegin, task->iEnd);
+      } else if (b->kind == BF_VF_HIER_BLOCK_SVD) {
+        BfSize sid = task->svdIndex;
+        BF_ASSERT(sid != BF_SIZE_BAD_VALUE);
+        svd_accumulate_rows_from_Z_(&b->data.svd, Zptr[sid], Y, ldY,
+                                   n, nrhs, task->iBegin, task->iEnd);
+      }
+    }
+  }
+
+  if (Zptr) bfMemFree(Zptr);
+  if (Zbuf) bfMemFree(Zbuf);
 }
 
 
@@ -1450,6 +1706,15 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
       (area <= (unsigned long long)minArea);
 
   if (forceLeaf) {
+    /* Final leaf: this is where recursion stops and a block is materialized
+     * (sparse OR SVD). Use this as a proxy for overall build completion.
+     *
+     * NOTE: flatBlock may be NULL for exactly-zero blocks; we still count it
+     * so “done” reaches “total” in the dry-run model. */
+    #pragma omp atomic
+    g_vf_leaf_done++;
+    vfHierMaybePrintLeafProgress_(g_vf_leaf_done, g_vf_leaf_total);
+
     return flatBlock;  /* may be NULL for exactly-zero block */
   }
 

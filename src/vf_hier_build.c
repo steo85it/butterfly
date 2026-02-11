@@ -1,3 +1,19 @@
+/*
+ * vf_hier_build.c
+ * --------------
+ * Construction of the VfHier block tree from either:
+ *   - direct geometric traversal / raytracing, and/or
+ *   - mid-level CSR blocks (parent CSR -> recursively sliced children)
+ *
+ * Responsibilities:
+ *   - all hierarchy building logic and heuristics (SVD gating, flattening, etc.)
+ *   - progress instrumentation for SVD attempts (g_svd_tries_total / done)
+ *
+ * Legacy:
+ *   - older builders are kept under BF_VF_HIER_ENABLE_LEGACY_BUILD and are
+ *     contained in this file (not exported via public headers).
+ */
+
 #include <bf/def.h>
 #include <bf/vf_hier.h>
 
@@ -48,6 +64,13 @@ double g_vf_leaf_map_time     = 0.0;
 
 unsigned long long g_svd_tries_total = 0ull;  /* computed by dry-run */
 unsigned long long g_svd_tries_done  = 0ull;  /* incremented before bfGetTruncatedSvd */
+
+/* “Final leaf” progress: counts how many leaf blocks have been materialized.
+ * This tracks overall build completion better than SVD tries alone, since
+ * most leaves may remain sparse (no SVD attempt). Total is computed by an
+ * optional dry-run (countLeavesFromCsrMidlevel). */
+unsigned long long g_vf_leaf_total = 0ull;
+unsigned long long g_vf_leaf_done  = 0ull;
 
 static int g_svd_progress_enabled = -1;  /* -1 unknown, 0 off, 1 on */
 static unsigned long long g_svd_progress_every = 1ull; /* print every N tries */
@@ -135,6 +158,25 @@ bfVfHierBlockAllSparseLeaves(BfVfHierBlock const *block)
   }
 }
 #endif
+
+void vfHierMaybePrintLeafProgress_(unsigned long long done,
+                                  unsigned long long total)
+{
+  vfHierInitProgressFromEnv_();
+  if (!g_svd_progress_enabled) return;
+  if (total == 0ull) return;
+
+  if (g_svd_progress_every == 0ull) g_svd_progress_every = 1ull;
+  if (done % g_svd_progress_every != 0ull && done != total) return;
+
+  double pct = 100.0 * (double)done / (double)total;
+  fprintf(stderr, "\r[vf_hier] leaves: %llu / %llu (%.1f%%)",
+          (unsigned long long)done,
+          (unsigned long long)total,
+          pct);
+  if (done == total) fprintf(stderr, "\n");
+  fflush(stderr);
+}
 
 void bfVfFaceMapInitFromParentFaces(
     BfVfFaceMap      *map,
@@ -1075,6 +1117,12 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
 {
   BF_ASSERT(vfHier && Afull && quadtree);
 
+  /* Reset progress counters for this build invocation (avoid >100% across runs). */
+  g_svd_tries_total = 0ull;
+  g_svd_tries_done  = 0ull;
+  g_vf_leaf_total   = 0ull;
+  g_vf_leaf_done    = 0ull;
+
   BfMat *A_base = bfMatCsrRealToMat(Afull);
   BfSize nRows  = bfMatGetNumRows(A_base);
   BfSize nCols  = bfMatGetNumCols(A_base);
@@ -1141,6 +1189,24 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
             (unsigned long long)g_svd_tries_total);
   }
 
+
+  /* Optional dry-run: count how many “final leaves” will be materialized.
+   * This gives a single monotonic progress counter for the overall build. */
+  const char *doLeafCount = getenv("BF_VF_HIER_COUNT_LEAVES");
+  if (doLeafCount && atoi(doLeafCount) != 0) {
+    unsigned long long totalLeaves = 0ull;
+    countLeavesFromCsrMidlevel(
+        (BfMatCsrReal const *)Afull,
+        (BfVfFaceMap  const *)&faceMap,
+        rootQt, rootQt,
+        eta, leafMax, leafMin, (BfSize)minArea,
+        tol, minSvdSize, maxSvdRankFrac,
+        0, &totalLeaves);
+    g_vf_leaf_total = totalLeaves;
+    g_vf_leaf_done  = 0ull;
+    fprintf(stderr, "[vf_hier] dry-run: total leaves (final blocks) = %llu\n",
+            (unsigned long long)g_vf_leaf_total);
+  }
 
   /* Use the same mid-level CSR + unified leaf policy as the hybrid path. */
   vfHier->root = buildBlockFromCsrMidlevel(
