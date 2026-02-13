@@ -19,7 +19,6 @@
 
 #include <bf/size_array.h>
 #include <stdbool.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <math.h>
 #include <bf/ptr_array.h>
@@ -105,6 +104,32 @@ extern double g_vf_svd_time          ;
 extern double g_vf_csr_slice_time    ;  /* bfMatCsrRealNewSubmatrixFromIndices */
 extern double g_vf_leaf_map_time     ;  /* build childRowFaces + global→parent maps */
 #endif
+
+/* ============================================================
+ * Progress counters (SVD tries + leaf materialization)
+ * ============================================================ */
+extern unsigned long long g_svd_tries_total;
+extern unsigned long long g_svd_tries_done;
+extern unsigned long long g_vf_leaf_total;
+extern unsigned long long g_vf_leaf_done;
+
+/* Implemented in vf_hier_build.c (printing is shared by build+apply codepaths) */
+void vfHierInitProgressFromEnv_(void);
+void vfHierMaybePrintProgress_(unsigned long long done, unsigned long long total);
+void vfHierMaybePrintLeafProgress_(unsigned long long done, unsigned long long total);
+
+/* Call this exactly once for each *final* leaf materialized (sparse or SVD).
+ * NOTE: call even if the chosen leaf pointer is NULL (exactly-zero block),
+ * so that dry-run totals still match runtime progress. */
+static inline void vfHierOnLeafMaterialized_(void) {
+  /* Ensure env is parsed before printing */
+  vfHierInitProgressFromEnv_();
+#if defined(_OPENMP)
+#pragma omp atomic
+#endif
+  g_vf_leaf_done++;
+  vfHierMaybePrintLeafProgress_(g_vf_leaf_done, g_vf_leaf_total);
+}
 
 /* ------------------------------------------------------------
  * Optional lightweight logging for vf_hier.
@@ -349,3 +374,5 @@ double bfVfHierBlockMemBytes(BfVfHierBlock const *block);
 BfSize get_leaf_num_rows(BfVfHierBlock const *b);
 BfSize get_leaf_row_i0(BfVfHierBlock const *b);
 BfSize get_leaf_row_i1(BfVfHierBlock const *b);
+
+static inline void vfHierOnLeafMaterialized_(void);

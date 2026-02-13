@@ -13,6 +13,20 @@ python3.extension_module(
 )
 
 python3.extension_module(
+  'butterfly_hier',
+  'butterfly_hier.pyx',
+  dependencies : [python3_dep, butterfly_dep, numpy_dep],
+  install : true
+)
+
+python3.extension_module(
+  'butterfly_dev',
+  'butterfly_dev.pyx',
+  dependencies : [python3_dep, butterfly_dep, numpy_dep],
+  install : true
+)
+
+python3.extension_module(
   'thermal_bf',
   sources : [
     'thermal_bf.pyx',

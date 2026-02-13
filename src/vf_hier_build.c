@@ -74,6 +74,7 @@ unsigned long long g_vf_leaf_done  = 0ull;
 
 static int g_svd_progress_enabled = -1;  /* -1 unknown, 0 off, 1 on */
 static unsigned long long g_svd_progress_every = 1ull; /* print every N tries */
+static int g_progress_printed_any = 0;   /* used to cleanly end '\r' progress lines */
 
 void vfHierInitProgressFromEnv_(void) {
   if (g_svd_progress_enabled != -1) return;
@@ -83,6 +84,17 @@ void vfHierInitProgressFromEnv_(void) {
 
   const char *k = getenv("BF_VF_HIER_PROGRESS_EVERY");
   if (k && atoll(k) > 0) g_svd_progress_every = (unsigned long long)atoll(k);
+}
+
+/* If we've been printing carriage-return progress, ensure we end on a clean line
+ * before any other stderr logging. Safe to call multiple times. */
+static void vfHierProgressFinalizeLine_(void) {
+  vfHierInitProgressFromEnv_();
+  if (!g_svd_progress_enabled) return;
+  if (!g_progress_printed_any) return;
+  fprintf(stderr, "\n");
+  fflush(stderr);
+  g_progress_printed_any = 0;
 }
 
 void vfHierMaybePrintProgress_(unsigned long long done, unsigned long long total) {
@@ -98,6 +110,7 @@ void vfHierMaybePrintProgress_(unsigned long long done, unsigned long long total
           (unsigned long long)done,
           (unsigned long long)total,
           pct);
+  g_progress_printed_any = 1;
   if (done == total) fprintf(stderr, "\n");
   fflush(stderr);
 }
@@ -164,9 +177,19 @@ void vfHierMaybePrintLeafProgress_(unsigned long long done,
 {
   vfHierInitProgressFromEnv_();
   if (!g_svd_progress_enabled) return;
-  if (total == 0ull) return;
 
   if (g_svd_progress_every == 0ull) g_svd_progress_every = 1ull;
+  /* If we don't know the total (no dry-run), still print a single global
+   * monotonically increasing counter. */
+  if (total == 0ull) {
+    if (done % g_svd_progress_every != 0ull) return;
+    fprintf(stderr, "\r[vf_hier] leaves: %llu",
+            (unsigned long long)done);
+    g_progress_printed_any = 1;
+    fflush(stderr);
+    return;
+  }
+
   if (done % g_svd_progress_every != 0ull && done != total) return;
 
   double pct = 100.0 * (double)done / (double)total;
@@ -174,6 +197,7 @@ void vfHierMaybePrintLeafProgress_(unsigned long long done,
           (unsigned long long)done,
           (unsigned long long)total,
           pct);
+  g_progress_printed_any = 1;
   if (done == total) fprintf(stderr, "\n");
   fflush(stderr);
 }
@@ -726,6 +750,9 @@ void bfVfHierInitFromQuadtree(BfVfHier        *vfHier,
                                   eta, leafMax, leafMin, minArea,
                                   tol, minSvdSize, maxSvdRankFrac);
 
+  /* If build printed '\r' progress, end on a clean line before any other logs. */
+  vfHierProgressFinalizeLine_();
+
   #if BF_VF_HIER_TIME_SVD
 fprintf(stderr,
         "[vf_hier] timing (sum over leaves): CSR->dense=%.6f s, SVD=%.6f s\n",
@@ -1185,8 +1212,13 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
 
     g_svd_tries_total = total;
     g_svd_tries_done  = 0ull;
-    fprintf(stderr, "[vf_hier] dry-run: total SVD tries (by gates) = %llu\n",
-            (unsigned long long)g_svd_tries_total);
+    /* Gate dry-run printing separately so you can suppress it while still
+     * keeping runtime leaf progress. Default: OFF. */
+    const char *p = getenv("BF_VF_HIER_PROGRESS_DRYRUN");
+    if (p && atoi(p) != 0) {
+      fprintf(stderr, "[vf_hier] dry-run: total SVD tries (by gates) = %llu\n",
+              (unsigned long long)g_svd_tries_total);
+    }
   }
 
 
@@ -1204,8 +1236,13 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
         0, &totalLeaves);
     g_vf_leaf_total = totalLeaves;
     g_vf_leaf_done  = 0ull;
-    fprintf(stderr, "[vf_hier] dry-run: total leaves (final blocks) = %llu\n",
-            (unsigned long long)g_vf_leaf_total);
+    {
+      const char *p = getenv("BF_VF_HIER_PROGRESS_DRYRUN");
+      if (p && atoi(p) != 0) {
+        fprintf(stderr, "[vf_hier] dry-run: total leaves (final blocks) = %llu\n",
+                (unsigned long long)g_vf_leaf_total);
+      }
+    }
   }
 
   /* Use the same mid-level CSR + unified leaf policy as the hybrid path. */
@@ -1224,6 +1261,13 @@ void bfVfHierInitFromCsrAndQuadtree(BfVfHier     *vfHier,
       minSvdSize,
       maxSvdRankFrac,
       0);  /* depth = 0 */
+
+  /* If build printed '\r' progress, end on a clean line before any other logs. */
+  vfHierProgressFinalizeLine_();
+
+  /* In case no total was known (no dry-run), ensure we still finish cleanly
+   * even if the last leaf printed wasn't "done==total". */
+  vfHierProgressFinalizeLine_();
 
   if (vfHier->root == NULL) {
     fprintf(stderr,

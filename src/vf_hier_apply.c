@@ -39,7 +39,8 @@
 
 #include <stdint.h>
 #include <errno.h>
-
+#include <stdbool.h>
+#include <stdlib.h>  /* getenv, atoi */
 #include <stdio.h>
 #include <math.h>
 #include <time.h>  /* for timing instrumentation */
@@ -47,6 +48,10 @@
 #include <bf/real_array.h>  /* for BfRealArray, bfRealArrayNewWithDefaultCapacity, etc */
 #include <bf/ptr_array.h>
 #include <bf/vf_hier_internal.h>
+
+#ifdef BF_OPENMP
+#include <omp.h>
+#endif
 
 // Prototypes
 
@@ -688,7 +693,6 @@ void bfVfHierDeinit(BfVfHier *vfHier) {
       bfMemFree(p);
       vfHier->applyPlan = NULL;
     }
-
 }
 
 void bfVfHierDealloc(BfVfHier **vfHierPtr) {
@@ -1711,9 +1715,9 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
      *
      * NOTE: flatBlock may be NULL for exactly-zero blocks; we still count it
      * so “done” reaches “total” in the dry-run model. */
-    #pragma omp atomic
-    g_vf_leaf_done++;
-    vfHierMaybePrintLeafProgress_(g_vf_leaf_done, g_vf_leaf_total);
+
+    /* NEW: record/cache anything needed once the final leaf is chosen */
+    vfHierOnLeafMaterialized_();  /* OK if flatBlock == NULL */
 
     return flatBlock;  /* may be NULL for exactly-zero block */
   }
@@ -1985,8 +1989,11 @@ BfVfHierBlock *buildBlockHybrid(
                               leafMin,
                               minSvdSize,
                               maxSvdRankFrac);
-    if (leaf != NULL)
+    if (leaf != NULL) {
+      /* NEW: leaf materialized via early-stop path */
+      vfHierOnLeafMaterialized_();
       return leaf;
+    }
     /* If leaf creation fails (e.g. dimensions < leafMin),
      * fall back to the usual logic below.
      */
@@ -2287,6 +2294,9 @@ BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
 
       block->data.sparse.row_i0 = i0;
       block->data.sparse.row_i1 = i1;
+
+      /* NEW: parent CSR heuristic returns a final leaf */
+      vfHierOnLeafMaterialized_();
 
       return block;  /* NOTE: no deinit of rowFaces_par/colFaces_par/A_par here */
     }
