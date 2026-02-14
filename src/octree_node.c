@@ -9,6 +9,7 @@
 #include <bf/mem.h>
 #include <bf/points.h>
 #include <bf/vectors.h>
+#include <bf/bbox.h>
 
 #include "macros.h"
 
@@ -377,4 +378,9 @@ bool bfOctreeNodesAreSeparated(BfOctreeNode const *node1, BfOctreeNode const *no
   BfReal R = bfPoint3Dist(sphere1.center, sphere2.center);
 
   return R > sphere1.r + sphere2.r + 1e1*BF_EPS_MACH;
+}
+
+BfBoundingBox3 bfOctreeNodeGetBoundingBox(BfOctreeNode const *node) {
+  BF_ASSERT(node != NULL);
+  return node->boundingBox;
 }

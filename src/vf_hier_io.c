@@ -53,8 +53,8 @@
 void countSvdTriesFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -889,8 +889,8 @@ cleanup_faces:
 void countSvdTriesFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -924,8 +924,8 @@ void countSvdTriesFromCsrMidlevel(
   if (forceLeaf) return;
 
   /* recurse exactly like buildBlockFromCsrMidlevel’s splitting cases */
-  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = rowNode;
+  BfTreeNode *nj = rowNode;
 
   if (!leafI && !leafJ) {
     BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
@@ -976,8 +976,8 @@ void countSvdTriesFromCsrMidlevel(
 void countLeavesFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -1016,8 +1016,8 @@ void countLeavesFromCsrMidlevel(
     return;
   }
 
-  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = rowNode;
+  BfTreeNode *nj = rowNode;
 
   if (!leafI && !leafJ) {
     BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);

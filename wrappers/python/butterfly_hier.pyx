@@ -57,6 +57,7 @@ from mat_product cimport *
 from mat_python cimport *
 from mat_vf_hier cimport *
 from node_span cimport *
+from octree cimport *
 from perm cimport *
 from points cimport *
 from ptr_array cimport *
@@ -971,15 +972,24 @@ cdef void _collect_leaves(FFBlock block,
 
 ## C hier impl
 
+cdef class Octree:
+    cdef BfOctree *octree
+
+    def __cinit__(self):
+        self.octree = NULL
+
+    def __dealloc__(self):
+        if self.octree != NULL:
+            bfOctreeDelete(&self.octree)
+            self.octree = NULL
+
+
 cdef class VfHier:
-    # cdef BfVfHier *vfHier
-    # cdef BfSize     _n
-    # cdef object     _qt_owner  # keep Quadtree alive if C stores pointer
 
     def __cinit__(self):
         self.vfHier = NULL
         self._n = 0
-        self._qt_owner = None
+        self._tree_owner = None
 
     cdef inline void _apply_ptr(self,
                                 const double *x,
@@ -996,7 +1006,10 @@ cdef class VfHier:
 
     @staticmethod
     def from_trimesh(Trimesh tm,
+                     *,
+                     topology="auto",
                      object quadtree=None,
+                     object octree=None,
                      double eta=2.0,
                      BfSize leaf_max=128,
                      BfSize leaf_min=1,
@@ -1020,32 +1033,63 @@ cdef class VfHier:
         """
         cdef VfHier H = VfHier.__new__(VfHier)
         cdef Quadtree qt
+        cdef Octree ot
 
         if ensure_geometry:
             tm.ensure_face_geometry()
         if init_embree_scene:
             tm.init_embree()
 
-        if quadtree is None:
-            qt = _quadtree_from_trimesh_xy(tm)
-        else:
+        # Normalize topology string
+        cdef object topo = topology
+        if topo is None:
+            topo = "auto"
+        topo = (<str> topo).lower()
+
+        # Priority: explicit tree objects win
+        if quadtree is not None:
             if not isinstance(quadtree, Quadtree):
-                raise TypeError(
-                    "VfHier.from_trimesh: quadtree must be a butterfly.Quadtree (or None)"
-                )
+                raise TypeError("VfHier.from_trimesh: quadtree must be a butterfly.Quadtree (or None)")
             qt = <Quadtree> quadtree
+            H._tree_owner = qt
+            H.vfHier = bfVfHierNewFromQuadtree(
+                tm.trimesh, qt.quadtree,
+                eta, leaf_max, leaf_min, min_area,
+                tol, min_svd_size, max_svd_rank_frac)
 
-        # Keep the quadtree alive in case the C object stores the pointer.
-        H._qt_owner = qt
+        elif octree is not None:
+            if not isinstance(octree, Octree):
+                raise TypeError("VfHier.from_trimesh: octree must be a butterfly.Octree (or None)")
+            ot = <Octree> octree
+            H._tree_owner = ot
+            H.vfHier = bfVfHierNewFromOctree(
+                tm.trimesh, ot.octree,
+                eta, leaf_max, leaf_min, min_area,
+                tol, min_svd_size, max_svd_rank_frac)
 
-        H.vfHier = bfVfHierNewFromQuadtree(
-            tm.trimesh,
-            qt.quadtree,
-            eta, leaf_max, leaf_min, min_area,
-            tol, min_svd_size, max_svd_rank_frac)
+        else:
+            # Backward compatible default: "auto" -> quadtree-from-XY
+            if topo in ("auto", "quadtree", "quad", "2d"):
+                qt = _quadtree_from_trimesh_xy(tm)
+                H._tree_owner = qt
+                H.vfHier = bfVfHierNewFromQuadtree(
+                    tm.trimesh, qt.quadtree,
+                    eta, leaf_max, leaf_min, min_area,
+                    tol, min_svd_size, max_svd_rank_frac)
+            elif topo in ("octree", "oct", "3d"):
+                # Let C build internal octree from face centroids
+                H.vfHier = bfVfHierNewFromTrimeshAndAutoTree(
+                    tm.trimesh,
+                    BF_VF_TOPO_OCTREE,
+                    <BfQuadtree *> NULL,
+                    <BfOctree *> NULL,
+                    eta, leaf_max, leaf_min, min_area,
+                    tol, min_svd_size, max_svd_rank_frac)
+            else:
+                raise ValueError("topology must be one of: 'auto', 'quadtree', 'octree'")
 
         if H.vfHier == NULL:
-            raise RuntimeError("bfVfHierNewFromQuadtree failed")
+            raise RuntimeError("bfVfHier constructor failed")
 
         H._n = tm.num_faces
         return H
@@ -1101,7 +1145,7 @@ cdef class VfHier:
         cdef Quadtree qt = _quadtree_from_trimesh_xy(tm)
 
         # Keep alive for same reason as from_trimesh
-        H._qt_owner = qt
+        H._tree_owner = qt
 
         H.vfHier = bfVfHierNewFromCsrAndQuadtree(
             Afull.mat_csr_real,
@@ -1117,6 +1161,46 @@ cdef class VfHier:
         if H.vfHier == NULL:
             raise RuntimeError("bfVfHierNewFromCsrAndQuadtree failed")
 
+        H._n = tm.num_faces
+        return H
+
+    @staticmethod
+    def from_csr_and_octree(MatCsrReal Afull,
+                            object octree,
+                            Trimesh tm,
+                            double eta=2.0,
+                            BfSize leaf_max=128,
+                            BfSize leaf_min=1,
+                            BfReal min_area=0.0,
+                            double tol=1e-2,
+                            BfSize min_svd_size=16384,
+                            double max_svd_rank_frac=0.9):
+        cdef VfHier H = VfHier.__new__(VfHier)
+        cdef Octree ot
+        if not isinstance(octree, Octree):
+            raise TypeError("octree must be a butterfly.Octree")
+        ot = <Octree> octree
+        H._tree_owner = ot
+
+        H.vfHier = bfVfHierNew()
+        if H.vfHier == NULL:
+            raise RuntimeError("bfVfHierNew failed")
+
+        bfVfHierInitFromCsrAndAutoTree(
+            H.vfHier,
+            Afull.mat_csr_real,
+            <BfQuadtree *> NULL,
+            ot.octree,
+            eta,
+            leaf_max,
+            leaf_min,
+            min_area,
+            tol,
+            min_svd_size,
+            max_svd_rank_frac)
+
+        if H.vfHier == NULL:
+            raise RuntimeError("bfVfHierNewFromCsrAndOctree failed")
         H._n = tm.num_faces
         return H
 
@@ -1197,7 +1281,7 @@ cdef class VfHier:
                             <double *> y.data)
         return y
 
-    cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y):
+    cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y, bint accumulate=False):
         cdef cnp.ndarray x_flat = np.ascontiguousarray(x, dtype=np.float64)
         if x_flat.ndim != 1 or x_flat.shape[0] != self._n:
             raise ValueError(f"x must be 1D of length {self._n}")
@@ -1207,6 +1291,8 @@ cdef class VfHier:
         if y.ndim != 1 or y.shape[0] != self._n:
             raise ValueError(f"y must be 1D of length {self._n}")
 
+        if not accumulate:
+            y.fill(0.0)
         with nogil:
             self._apply_ptr(<const double *> x_flat.data,
                             <double *> y.data)
@@ -1246,6 +1332,7 @@ cdef class VfHier:
         cdef Py_ssize_t k_py = Xf.shape[1]
         cdef BfSize k = <BfSize> k_py
 
+        # IMPORTANT: C side accumulates into Y (+=), so start from zeros.
         cdef cnp.ndarray Yf = np.empty((self._n, k_py), dtype=np.float64, order='F')
 
         with nogil:
@@ -1254,7 +1341,7 @@ cdef class VfHier:
                                 k)
         return Yf
 
-    cpdef apply_mat_inplace(self, cnp.ndarray X, cnp.ndarray Y):
+    cpdef apply_mat_inplace(self, cnp.ndarray X, cnp.ndarray Y, bint accumulate=False):
         """
         In-place: Y[:] = H * X  (or Y += ... if your C function accumulates).
         Requires Fortran-contiguous X and Y (or we copy X).
@@ -1273,6 +1360,8 @@ cdef class VfHier:
 
         cdef BfSize k = <BfSize> Xf.shape[1]
 
+        if not accumulate:
+            Y.fill(0.0)
         with nogil:
             self._apply_mat_ptr(<const double *> Xf.data,
                                 <double *> Y.data,

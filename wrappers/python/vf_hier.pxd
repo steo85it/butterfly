@@ -54,6 +54,51 @@ cdef extern from "bf/vf_hier.h":
                                             BfSize minSvdSize,
                                             BfReal maxSvdRankFrac)
 
+    ctypedef enum BfVfTopology:
+        BF_VF_TOPO_AUTO
+        BF_VF_TOPO_QUADTREE
+        BF_VF_TOPO_OCTREE
+
+    cdef struct BfOctree  # if not already declared
+
+    BfVfHier *bfVfHierNewFromOctree(const BfTrimesh *trimesh,
+                                    BfOctree *octree,
+                                    BfReal eta,
+                                    BfSize leafMax,
+                                    BfSize leafMin,
+                                    BfReal minArea,
+                                    BfReal tol,
+                                    BfSize minSvdSize,
+                                    BfReal maxSvdRankFrac)
+
+    BfVfHier *bfVfHierNewFromTrimeshAndAutoTree(const BfTrimesh *trimesh,
+                                                BfVfTopology topo,
+                                                BfQuadtree *quadtree,  # nullable
+                                                BfOctree *octree,  # nullable
+                                                BfReal eta,
+                                                BfSize leafMax,
+                                                BfSize leafMin,
+                                                BfReal minArea,
+                                                BfReal tol,
+                                                BfSize minSvdSize,
+                                                BfReal maxSvdRankFrac)
+
+    # add near the top with other constructors:
+    BfVfHier *bfVfHierNew()
+
+    void bfVfHierInitFromCsrAndAutoTree(
+            BfVfHier *vfHier,
+            BfMatCsrReal *Afull,
+            BfQuadtree *quadtree,  # nullable
+            BfOctree *octree,  # nullable
+            BfReal        eta,
+            BfSize        leafMax,
+            BfSize        leafMin,
+            BfReal        minArea,
+            BfReal        tol,
+            BfSize        minSvdSize,
+            BfReal        maxSvdRankFrac)
+
     void bfVfHierApply(const BfVfHier *vfHier,
                        const BfReal *x,
                        BfReal *y) nogil

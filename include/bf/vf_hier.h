@@ -8,6 +8,7 @@
 #include <bf/size_array.h>
 #include <bf/ptr_array.h>
 #include <bf/quadtree.h>
+#include <bf/octree.h>
 #include <bf/trimesh.h>
 #include <bf/mat.h>
 #include <bf/mat_csr_real.h>
@@ -135,6 +136,76 @@ void bfVfHierInitFromQuadtree(BfVfHier        *vfHier,
                               BfSize           minSvdSize,
                               BfReal           maxSvdRankFrac);
 
+void bfVfHierInitFromOctree(BfVfHier        *vfHier,
+                            BfTrimesh const *trimesh,
+                            BfOctree        *octree,
+                            BfReal           eta,
+                            BfSize           leafMax,
+                            BfSize           leafMin,
+                            BfReal           minArea,          /* ignored for octree (keep signature stable) */
+                            BfReal           tol,
+                            BfSize           minSvdSize,
+                            BfReal           maxSvdRankFrac);
+
+BfVfHier *bfVfHierNewFromOctree(BfTrimesh const *trimesh,
+                                BfOctree        *octree,
+                                BfReal           eta,
+                                BfSize           leafMax,
+                                BfSize           leafMin,
+                                BfReal           minArea,       /* ignored for octree */
+                                BfReal           tol,
+                                BfSize           minSvdSize,
+                                BfReal           maxSvdRankFrac);
+
+/* Auto-select topology:
+ * - if quadtree != NULL => use it
+ * - else if octree != NULL => use it
+ * - else => error/assert
+ */
+void bfVfHierInitFromCsrAndAutoTree(
+    BfVfHier     *vfHier,
+    BfMatCsrReal *Afull,
+    BfQuadtree   *quadtree,  /* nullable */
+    BfOctree     *octree,    /* nullable */
+    BfReal        eta,
+    BfSize        leafMax,
+    BfSize        leafMin,
+    BfReal        minArea,
+    BfReal        tol,
+    BfSize        minSvdSize,
+    BfReal        maxSvdRankFrac);
+
+typedef enum BfVfTopology {
+  BF_VF_TOPO_AUTO = 0,
+  BF_VF_TOPO_QUADTREE,
+  BF_VF_TOPO_OCTREE
+} BfVfTopology;
+
+void bfVfHierInitFromTrimeshAndAutoTree(BfVfHier        *vfHier,
+                                        BfTrimesh const *trimesh,
+                                        BfVfTopology     topo,
+                                        BfQuadtree      *quadtree, /* nullable */
+                                        BfOctree        *octree,   /* nullable */
+                                        BfReal           eta,
+                                        BfSize           leafMax,
+                                        BfSize           leafMin,
+                                        BfReal           minArea,
+                                        BfReal           tol,
+                                        BfSize           minSvdSize,
+                                        BfReal           maxSvdRankFrac);
+
+BfVfHier *bfVfHierNewFromTrimeshAndAutoTree(BfTrimesh const *trimesh,
+                                            BfVfTopology     topo,
+                                            BfQuadtree      *quadtree,
+                                            BfOctree        *octree,
+                                            BfReal           eta,
+                                            BfSize           leafMax,
+                                            BfSize           leafMin,
+                                            BfReal           minArea,
+                                            BfReal           tol,
+                                            BfSize           minSvdSize,
+                                            BfReal           maxSvdRankFrac);
+
 BfVfHier *bfVfHierNewFromQuadtree(BfTrimesh const *trimesh,
                                   BfQuadtree      *quadtree,
                                   BfReal           eta,
@@ -167,6 +238,7 @@ BfVfHier *bfVfHierNewFromCsrAndQuadtree(BfMatCsrReal *Afull,
                                          BfReal        tol,
                                          BfSize        minSvdSize,
                                          BfReal        maxSvdRankFrac);
+
 
 /* Application: y <- y + F x  (size n) */
 void bfVfHierApply(BfVfHier const *vfHier,

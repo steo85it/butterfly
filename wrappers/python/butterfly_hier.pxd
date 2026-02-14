@@ -78,19 +78,19 @@ cdef class HierarchicalFormFactor:
 cdef class VfHier:
     cdef BfVfHier *vfHier
     cdef BfSize     _n
-    cdef object     _qt_owner  # keep Quadtree alive if C stores pointer
+    cdef object _tree_owner
     cdef inline void _apply_ptr(self,
                                 const double *x,
                                 double *y) noexcept nogil
     cpdef dump_leaf_blocks(self)
     cpdef cnp.ndarray apply_vec(self, cnp.ndarray x)
-    cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y)
+    cpdef apply_inplace(self, cnp.ndarray x, cnp.ndarray y, bint accumulate=?)
     cdef inline void _apply_mat_ptr(self,
                                     const double *X,
                                     double *Y,
                                     BfSize k) noexcept nogil
     cpdef cnp.ndarray apply_mat(self, cnp.ndarray X)
-    cpdef apply_mat_inplace(self, cnp.ndarray X, cnp.ndarray Y)
+    cpdef apply_mat_inplace(self, cnp.ndarray X, cnp.ndarray Y, bint accumulate=?)
     cpdef apply(self, object x)
     @staticmethod
     cdef VfHier from_ptr(BfVfHier *ptr)

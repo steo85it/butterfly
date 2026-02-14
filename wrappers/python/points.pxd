@@ -5,6 +5,8 @@ from geom cimport BfPoint2
 cdef extern from "bf/points.h":
     struct BfPoints2:
         pass
+    struct BfPoints3:
+        pass
 
 cdef extern from "bf/poisson_disk_sampling.h":
     BfPoints2 *bfPoints2NewWithCapacity(BfSize capacity)

@@ -8,9 +8,6 @@
  *   - apply-plan construction (tiling + per-leaf tasks)
  *   - optimized kernels for CSR leaves and SVD leaves
  *
- * Legacy:
- *   - Any legacy apply paths should be guarded by BF_VF_HIER_ENABLE_LEGACY_BUILD
- *     and live here (not in vf_hier_io.c).
  */
 
 #include <bf/def.h>
@@ -21,6 +18,7 @@
 #include <bf/tree.h>
 #include <bf/tree_node.h>
 #include <bf/quadtree_node.h>
+#include <bf/octree_node.h>
 #include <bf/vec_real.h>
 #include <bf/mat_dense_real.h>
 #include <bf/points.h>
@@ -67,6 +65,16 @@ bfMatCsrRealNewSubmatrixFromIndices(BfMatCsrReal const *A_par,
                                     BfSizeArray  const *rowIdx,
                                     BfSizeArray  const *colIdx);
 
+/* topology-agnostic far test: uses your generic helper in vf_hier_build.c */
+extern BfBool bfVfIsFarTreeNodes_(BfTreeNode const *rowNode,
+                                  BfTreeNode const *colNode,
+                                  BfReal eta);
+
+/* topology-agnostic index extraction: already defined in vf_hier_build.c */
+extern void bfVfGetNodeIndsFromTreeNode_(BfTreeNode *node,
+                                        BfTree const *tree,
+                                        BfSizeArray *inds);
+
 /* NEW: unified CSR leaf policy, using parent face lists.
  *
  * Geometry (leafMin/leafMax) is handled by the caller. This function
@@ -79,32 +87,22 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfSizeArray  const *rowFaces_par,
     BfSizeArray  const *colFaces_par,
-    BfVfFaceMap  const *faceMap,          /* NEW */
-    BfQuadtreeNode const *rowNode,
-    BfQuadtreeNode const *colNode,
+    BfVfFaceMap  const *faceMap,
+    BfTree const *tree,
+    BfTreeNode const *rowNode,
+    BfTreeNode const *colNode,
     BfVfBlockMeta const *meta,
     BfReal eta,
     BfReal tol,
     BfSize minSvdSize,
     BfReal maxSvdRankFrac);
 
+/* Quadtree-only pairing used by buildBlockHybrid (raytrace/topology path) */
+typedef struct {
+  BfQuadtreeNode *row;
+  BfQuadtreeNode *col;
+} QuadChildPair;
 
-/* NEW: mid-level CSR recursive builder (keeps using same A_par + face lists) */
-BfVfHierBlock *buildBlockFromCsrMidlevel(
-    BfMatCsrReal const *A_par,
-    BfSizeArray  const *rowFaces_par,
-    BfSizeArray  const *colFaces_par,
-    BfVfFaceMap  const *faceMap,          /* NEW */
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
-    BfReal eta,
-    BfSize leafMax,
-    BfSize leafMin,
-    BfSize minArea,
-    BfReal tol,
-    BfSize minSvdSize,
-    BfReal maxSvdRankFrac,
-    int depth);
 
 BfVfHierBlock *buildBlockHybrid(
     BfTrimesh const *tm,
@@ -746,8 +744,7 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
     BfSize minSvdSize,
     BfReal maxSvdRankFrac)
 {
-  BfQuadtree const *qt =
-    bfQuadtreeNodeGetQuadtree((BfQuadtreeNode *)rowNode);
+  BfQuadtree const *qt = bfQuadtreeNodeGetQuadtree((BfQuadtreeNode *)rowNode);
 //  /* Compute index ranges and sizes exactly as getBlockMeta does */
 //  BfVfBlockMeta meta = getBlockMeta((BfQuadtreeNode *)rowNode,
 //                                    (BfQuadtreeNode *)colNode,
@@ -993,161 +990,6 @@ static BfVfHierBlock *makeLeafWithOptionalSvd(
 }
 
 /* ============================================================
- * CSR SUBMATRIX BUILDER (from an existing parent CSR)
- * ============================================================ */
-
-#if BF_VF_HIER_ENABLE_LEGACY_BUILD
-/* Build a CSR submatrix A_sub = A_par[rowFaces, colFaces], with
- * LOCAL column indexing 0..|colFaces|-1.
- *
- * NOTE: this assumes the usual BF CSR construction helpers
- *   - bfMatCsrRealNew
- *   - bfMatCsrRealInitEmpty(A, m, n, nnz_hint)
- *   - bfMatCsrRealAppendEntry(A, i, j, value)
- *   - bfMatCsrRealCompress(A)
- * If your names differ slightly, just adapt them.
- */
-/* Build a CSR submatrix A_sub = A_par[rowFaces, colFaces], with
- * LOCAL column indexing 0..|colFaces|-1.
- *
- * This version uses BfSizeArray / BfRealArray and bfMatCsrRealNewFromArrays,
- * matching the pattern used in bfMatCsrRealNewViewFactorMatrixFromTrimesh.
- */
-static BfMatCsrReal *
-bfMatCsrRealNewSubmatrixFromFaces(BfMatCsrReal const *A_par,
-                                  BfSizeArray  const *rowFaces,
-                                  BfSizeArray  const *colFaces)
-{
-  BF_ASSERT(A_par    != NULL);
-  BF_ASSERT(rowFaces != NULL);
-  BF_ASSERT(colFaces != NULL);
-
-  /* Block dimensions: how many selected rows/cols */
-  BfSize m = bfSizeArrayGetSize((BfSizeArray *)rowFaces);
-  BfSize n = bfSizeArrayGetSize((BfSizeArray *)colFaces);
-
-  /* Parent matrix info */
-  BfMat *A_base = bfMatCsrRealToMat((BfMatCsrReal *)A_par);
-  BfSize nRows  = bfMatGetNumRows(A_base);
-  BfSize nCols  = bfMatGetNumCols(A_base);  /* assume square FF */
-
-  /* Trivial empty block */
-  if (m == 0 || n == 0)
-    return bfMatCsrRealNewFromArrays(0, 0,
-                                     bfSizeArrayNewWithDefaultCapacity(),
-                                     bfSizeArrayNewWithDefaultCapacity(),
-                                     bfRealArrayNewWithDefaultCapacity(),
-                                     BF_POLICY_STEAL);
-
-  /* Quick sanity: faces indices must be < dims */
-  for (BfSize i = 0; i < m; ++i) {
-    BfSize gRow = bfSizeArrayGet((BfSizeArray *)rowFaces, i);
-    if (gRow >= nRows) {
-      fprintf(stderr,
-              "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD row index %lu >= %lu\n",
-              (unsigned long)gRow, (unsigned long)nRows);
-      return NULL;
-    }
-  }
-  for (BfSize j = 0; j < n; ++j) {
-    BfSize gCol = bfSizeArrayGet((BfSizeArray *)colFaces, j);
-    if (gCol >= nCols) {
-      fprintf(stderr,
-              "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD col index %lu >= %lu\n",
-              (unsigned long)gCol, (unsigned long)nCols);
-      return NULL;
-    }
-  }
-
-  /* Build global->local column map: size = nCols, init to BAD */
-  BfSize *globalToLocal = bfMemAlloc(nCols, sizeof(BfSize));
-  if (globalToLocal == NULL)
-    return NULL;
-
-  for (BfSize i = 0; i < nCols; ++i)
-    globalToLocal[i] = BF_SIZE_BAD_VALUE;
-
-  for (BfSize j = 0; j < n; ++j) {
-    BfSize g = bfSizeArrayGet((BfSizeArray *)colFaces, j);
-    BF_ASSERT(g < nCols);
-    globalToLocal[g] = j;  /* global col index -> local col index */
-  }
-
-  /* Parent CSR data */
-  BfSize const *rp_par = bfMatCsrRealGetRowptrConstPtr(A_par);
-  BfSize const *ci_par = bfMatCsrRealGetColindConstPtr(A_par);
-  BfReal const *da_par = bfMatCsrRealGetDataConstPtr(A_par);
-
-  BF_ASSERT(rp_par != NULL);
-  BF_ASSERT(ci_par != NULL);
-  BF_ASSERT(da_par != NULL);
-
-  /* Dynamic CSR arrays for the submatrix */
-  BfSizeArray *rowptr = bfSizeArrayNewWithDefaultCapacity();
-  BfSizeArray *colind = bfSizeArrayNewWithDefaultCapacity();
-  BfRealArray *data   = bfRealArrayNewWithDefaultCapacity();
-
-  /* rowptr[0] = 0 */
-  bfSizeArrayAppend(rowptr, 0);
-
-  BfSize nnz_so_far = 0;
-
-  /* Build each sub-row */
-  for (BfSize i = 0; i < m; ++i) {
-    /* Global row index in parent CSR */
-    BfSize gRow = bfSizeArrayGet((BfSizeArray *)rowFaces, i);
-    if (gRow + 1 > nRows) {
-      fprintf(stderr,
-              "[bf] bfMatCsrRealNewSubmatrixFromFaces: gRow %lu + 1 > nRows %lu\n",
-              (unsigned long)gRow, (unsigned long)nRows);
-      bfMemFree(globalToLocal);
-      bfSizeArrayDeinitAndDealloc(&rowptr);
-      bfSizeArrayDeinitAndDealloc(&colind);
-      bfRealArrayDeinitAndDealloc(&data);
-      return NULL;
-    }
-
-    BfSize r0 = rp_par[gRow];
-    BfSize r1 = rp_par[gRow + 1];
-
-    for (BfSize k = r0; k < r1; ++k) {
-      BfSize gCol = ci_par[k];
-      if (gCol >= nCols) {
-        fprintf(stderr,
-                "[bf] bfMatCsrRealNewSubmatrixFromFaces: BAD gCol %lu >= %lu\n",
-                (unsigned long)gCol, (unsigned long)nCols);
-        bfMemFree(globalToLocal);
-        bfSizeArrayDeinitAndDealloc(&rowptr);
-        bfSizeArrayDeinitAndDealloc(&colind);
-        bfRealArrayDeinitAndDealloc(&data);
-        return NULL;
-      }
-
-      BfSize lCol = globalToLocal[gCol];
-      if (lCol == BF_SIZE_BAD_VALUE)
-        continue;  /* column not in colFaces: skip */
-
-      /* Append entry (i, lCol, value) */
-      bfSizeArrayAppend(colind, lCol);
-      bfRealArrayAppend(data, da_par[k]);
-      ++nnz_so_far;
-    }
-
-    /* rowptr[i+1] = current nnz count */
-    bfSizeArrayAppend(rowptr, nnz_so_far);
-  }
-
-  bfMemFree(globalToLocal);
-
-  /* Convert dynamic arrays to a proper CSR matrix (takes ownership) */
-  BfMatCsrReal *A_sub =
-    bfMatCsrRealNewFromArrays(m, n, rowptr, colind, data, BF_POLICY_STEAL);
-
-  return A_sub;
-}
-#endif
-
-/* ============================================================
  * CSR SUBMATRIX BUILDER FROM LOCAL INDICES (A_par row/col indices)
  * ============================================================ */
 
@@ -1292,15 +1134,19 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfSizeArray  const *rowFaces_par,
     BfSizeArray  const *colFaces_par,
-    BfVfFaceMap  const *faceMap,      /* NEW */
-    BfQuadtreeNode const *rowNode,
-    BfQuadtreeNode const *colNode,
+    BfVfFaceMap  const *faceMap,
+    BfTree const *tree,
+    BfTreeNode const *rowNode,
+    BfTreeNode const *colNode,
     BfVfBlockMeta const *meta,
     BfReal eta,
     BfReal tol,
     BfSize minSvdSize,
     BfReal maxSvdRankFrac)
 {
+  (void)rowFaces_par;
+  (void)colFaces_par;
+
   if (meta->empty)
     return NULL;
 
@@ -1308,16 +1154,15 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   double t_map_start = bfVfHierNowSecs();
 #endif
 
-  BfQuadtree const *qt =
-    bfQuadtreeNodeGetQuadtree((BfQuadtreeNode *)rowNode);
-
+  /* Topology-agnostic node index extraction */
   BfSizeArray childRowFaces;
   BfSizeArray childColFaces;
   bfSizeArrayInitWithDefaultCapacity(&childRowFaces);
   bfSizeArrayInitWithDefaultCapacity(&childColFaces);
 
-  getNodeInds((BfQuadtreeNode *)rowNode, qt, &childRowFaces);
-  getNodeInds((BfQuadtreeNode *)colNode, qt, &childColFaces);
+  BF_ASSERT(tree != NULL);
+  bfVfGetNodeIndsFromTreeNode_((BfTreeNode *)rowNode, tree, &childRowFaces);
+  bfVfGetNodeIndsFromTreeNode_((BfTreeNode *)colNode, tree, &childColFaces);
 
   BfSize mChild = bfSizeArrayGetSize(&childRowFaces);
   BfSize nChild = bfSizeArrayGetSize(&childColFaces);
@@ -1330,9 +1175,9 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
 
   /* Use cached global->parent-local maps */
   BF_ASSERT(faceMap != NULL);
-  BfSize mapSize           = faceMap->mapSize;
-  BfSize const *globalToRow = faceMap->globalToRow;
-  BfSize const *globalToCol = faceMap->globalToCol;
+  BfSize mapSize             = faceMap->mapSize;
+  BfSize const *globalToRow  = faceMap->globalToRow;
+  BfSize const *globalToCol  = faceMap->globalToCol;
 
   BfSizeArray rowIdxPar;
   BfSizeArray colIdxPar;
@@ -1341,21 +1186,17 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
 
   for (BfSize i = 0; i < mChild; ++i) {
     BfSize gRow = bfSizeArrayGet(&childRowFaces, i);
-    if (gRow >= mapSize)
-      continue;
+    if (gRow >= mapSize) continue;
     BfSize rLoc = globalToRow[gRow];
-    if (rLoc == BF_SIZE_BAD_VALUE)
-      continue;
+    if (rLoc == BF_SIZE_BAD_VALUE) continue;
     bfSizeArrayAppend(&rowIdxPar, rLoc);
   }
 
   for (BfSize j = 0; j < nChild; ++j) {
     BfSize gCol = bfSizeArrayGet(&childColFaces, j);
-    if (gCol >= mapSize)
-      continue;
+    if (gCol >= mapSize) continue;
     BfSize cLoc = globalToCol[gCol];
-    if (cLoc == BF_SIZE_BAD_VALUE)
-      continue;
+    if (cLoc == BF_SIZE_BAD_VALUE) continue;
     bfSizeArrayAppend(&colIdxPar, cLoc);
   }
 
@@ -1390,16 +1231,15 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   }
 
   assertCsrColsLocal(Acsr);
-
   BfMat *A = bfMatCsrRealToMat(Acsr);
   BfSize mA = bfMatGetNumRows(A);
   BfSize nA = bfMatGetNumCols(A);
 
+  /* Zero-block elision (as you had) */
   {
     BfSize const *rp = bfMatCsrRealGetRowptrConstPtr(Acsr);
     BfReal const *da = bfMatCsrRealGetDataConstPtr(Acsr);
-    BF_ASSERT(rp != NULL);
-    BF_ASSERT(da != NULL);
+    BF_ASSERT(rp && da);
 
     BfSize nnz = rp[mA];
     BfReal maxAbs = 0;
@@ -1408,11 +1248,7 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
       if (v < 0) v = -v;
       if (v > maxAbs) maxAbs = v;
     }
-
     if (nnz == 0 || maxAbs == 0) {
-      /* This (rowNode, colNode) block is identically zero.
-       * Represent it by *no block* in the hierarchy.
-       */
       bfMatCsrRealDeinitAndDealloc(&Acsr);
       bfSizeArrayDeinit(&childRowFaces);
       bfSizeArrayDeinit(&childColFaces);
@@ -1421,7 +1257,7 @@ static BfVfHierBlock *makeLeafFromCsrMidlevel(
   }
 
   /* Far vs near test based on geometry, exactly like other paths */
-  BfBool far = isFar(rowNode, colNode, eta);
+  BfBool far = bfVfIsFarTreeNodes_(rowNode, colNode, eta);
 
   BfVfHierBlock *block = bfVfHierBlockNew();
 
@@ -1663,8 +1499,9 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
     BfSizeArray  const *rowFaces_par,
     BfSizeArray  const *colFaces_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTree const *tree,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -1693,6 +1530,7 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
       rowFaces_par,
       colFaces_par,
       faceMap,
+      tree,
       rowNode,
       colNode,
       &meta,
@@ -1728,8 +1566,8 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
   nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
   bfInitPtrArray(&nodeBlock->data.node.children, 4);
 
-  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = rowNode;
+  BfTreeNode *nj = colNode;
 
   if (!leafI && !leafJ) {
     /* --- case 1: split both row and col sides --- */
@@ -1744,15 +1582,14 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
     for (BfSize a = 0; a < maxChildrenI; ++a) {
       if (!bfTreeNodeHasChild(ni, a)) continue;
       BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
-      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
 
       for (BfSize b = 0; b < maxChildrenJ; ++b) {
         if (!bfTreeNodeHasChild(nj, b)) continue;
         BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
-        BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
 
-        pairs[numPairs].row = nai;
-        pairs[numPairs].col = nbj;
+        pairs[numPairs].row = ci;
+        pairs[numPairs].col = cj;
+
         ++numPairs;
       }
     }
@@ -1778,6 +1615,7 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
             rowFaces_par,
             colFaces_par,
             faceMap,
+            tree,
             pairs[idx].row,
             pairs[idx].col,
             eta,
@@ -1810,9 +1648,7 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
     for (BfSize a = 0; a < maxChildrenI; ++a) {
       if (!bfTreeNodeHasChild(ni, a)) continue;
       BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
-      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
-
-      pairs[numPairs].row = nai;
+      pairs[numPairs].row = bfTreeNodeToQuadtreeNode(ci);
       pairs[numPairs].col = colNode;
       ++numPairs;
     }
@@ -1836,6 +1672,7 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
             rowFaces_par,
             colFaces_par,
             faceMap,
+            tree,
             pairs[idx].row,
             pairs[idx].col,  /* == colNode */
             eta,
@@ -1867,10 +1704,10 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
     for (BfSize b = 0; b < maxChildrenJ; ++b) {
       if (!bfTreeNodeHasChild(nj, b)) continue;
       BfTreeNode *cj = bfTreeNodeGetChild(nj, b);
-      BfQuadtreeNode *nbj = bfTreeNodeToQuadtreeNode(cj);
 
       pairs[numPairs].row = rowNode;
-      pairs[numPairs].col = nbj;
+      pairs[numPairs].col = cj;
+
       ++numPairs;
     }
 
@@ -1887,22 +1724,23 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
 
     #pragma omp parallel for schedule(dynamic) if (depth < 4)
     for (BfSize idx = 0; idx < numPairs; ++idx) {
-      childBlocks[idx] =
-        buildBlockFromCsrMidlevel(
-            A_par,
-            rowFaces_par,
-            colFaces_par,
-            faceMap,
-            pairs[idx].row,  /* == rowNode */
-            pairs[idx].col,
-            eta,
-            leafMax,
-            leafMin,
-            minArea,
-            tol,
-            minSvdSize,
-            maxSvdRankFrac,
-            childDepth);
+        childBlocks[idx] =
+          buildBlockFromCsrMidlevel(
+              A_par,
+              rowFaces_par,
+              colFaces_par,
+              faceMap,
+              tree,
+              pairs[idx].row,  /* == rowNode */
+              pairs[idx].col,
+              eta,
+              leafMax,
+              leafMin,
+              minArea,
+              tol,
+              minSvdSize,
+              maxSvdRankFrac,
+              childDepth);
     }
 
     for (BfSize idx = 0; idx < numPairs; ++idx) {
@@ -2020,8 +1858,8 @@ BfVfHierBlock *buildBlockHybrid(
   nodeBlock->kind = BF_VF_HIER_BLOCK_NODE;
   bfInitPtrArray(&nodeBlock->data.node.children, 4);
 
-  BfTreeNode *ni = bfQuadtreeNodeToTreeNode(rowNode);
-  BfTreeNode *nj = bfQuadtreeNodeToTreeNode(colNode);
+  BfTreeNode *ni = rowNode;
+  BfTreeNode *nj = colNode;
 
   bool leafI = meta.leafI;
   bool leafJ = meta.leafJ;
@@ -2030,7 +1868,7 @@ BfVfHierBlock *buildBlockHybrid(
     BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
     BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
 
-    ChildPair *pairs = bfMemAlloc(maxChildrenI * maxChildrenJ, sizeof(ChildPair));
+    QuadChildPair *pairs = bfMemAlloc(maxChildrenI * maxChildrenJ, sizeof(QuadChildPair));
     BfSize numPairs = 0;
 
     for (BfSize a = 0; a < maxChildrenI; ++a) {
@@ -2085,16 +1923,16 @@ BfVfHierBlock *buildBlockHybrid(
   } else if (!leafI) {
     BfSize maxChildrenI = bfTreeNodeGetMaxNumChildren(ni);
 
-    ChildPair *pairs = bfMemAlloc(maxChildrenI, sizeof(ChildPair));
+    QuadChildPair *pairs = bfMemAlloc(maxChildrenI, sizeof(QuadChildPair));
     BfSize numPairs = 0;
 
     for (BfSize a = 0; a < maxChildrenI; ++a) {
       if (!bfTreeNodeHasChild(ni, a)) continue;
       BfTreeNode *ci = bfTreeNodeGetChild(ni, a);
-      BfQuadtreeNode *nai = bfTreeNodeToQuadtreeNode(ci);
 
-      pairs[numPairs].row = nai;
+      pairs[numPairs].row = ci;
       pairs[numPairs].col = colNode;
+
       ++numPairs;
     }
 
@@ -2134,7 +1972,7 @@ BfVfHierBlock *buildBlockHybrid(
   } else { /* !leafJ */
     BfSize maxChildrenJ = bfTreeNodeGetMaxNumChildren(nj);
 
-    ChildPair *pairs = bfMemAlloc(maxChildrenJ, sizeof(ChildPair));
+    QuadChildPair *pairs = bfMemAlloc(maxChildrenJ, sizeof(QuadChildPair));
     BfSize numPairs = 0;
 
     for (BfSize b = 0; b < maxChildrenJ; ++b) {
@@ -2315,7 +2153,7 @@ BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
     countSvdTriesFromCsrMidlevel(
         (BfMatCsrReal const *)A_par,
         (BfVfFaceMap  const *)&faceMap,
-        rowNode, colNode,
+        (BfTreeNode *)rowNode, (BfTreeNode *)colNode,
         eta, leafMax, leafMin, (BfSize)minArea,
         tol, minSvdSize, maxSvdRankFrac,
         0, &total);
@@ -2334,8 +2172,9 @@ BfVfHierBlock *buildSubtreeFromTrimeshUsingCsr(
         (BfSizeArray  const *)&rowFaces_par,
         (BfSizeArray  const *)&colFaces_par,
         (BfVfFaceMap  const *)&faceMap,
-        rowNode,
-        colNode,
+        (BfTree const *)qt,
+        (BfTreeNode *)rowNode,
+        (BfTreeNode *)colNode,
         eta,
         leafMax,
         leafMin,

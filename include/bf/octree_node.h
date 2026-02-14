@@ -1,5 +1,6 @@
 #include "octree.h"
 #include "tree_node.h"
+#include "bbox.h"
 
 /** Interface: TreeNode */
 
@@ -37,3 +38,5 @@ BfCircle bfOctreeNodeGetBoundingCircle(BfOctreeNode const *node);
 BfPoints3 bfOctreeNodeGetPoints(BfOctreeNode const *node, BfOctree const *tree);
 BfVectors3 bfOctreeNodeGetUnitNormals(BfOctreeNode const *node, BfOctree const *tree);
 bool bfOctreeNodesAreSeparated(BfOctreeNode const *node1, BfOctreeNode const *node2);
+BfBoundingBox3 bfOctreeNodeGetBoundingBox(BfOctreeNode const *node);
+void bfOctreeNodeGetSplit(BfOctreeNode const *node, BfPoint3 split);

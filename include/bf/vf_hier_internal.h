@@ -17,6 +17,10 @@
 #include <bf/def.h>
 #include <bf/vf_hier.h>
 
+/* For generic node-based helpers (Tree abstraction) */
+typedef struct BfTree      BfTree;
+typedef struct BfTreeNode  BfTreeNode;
+
 #include <bf/size_array.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -26,6 +30,8 @@
 /* Forward declarations */
 typedef struct BfQuadtreeNode BfQuadtreeNode;
 typedef struct BfQuadtree     BfQuadtree;
+typedef struct BfOctreeNode   BfOctreeNode;
+typedef struct BfOctree       BfOctree;
 typedef struct BfTrimesh      BfTrimesh;
 typedef struct BfMatCsrReal   BfMatCsrReal;
 
@@ -86,7 +92,12 @@ typedef struct {
  * totals are "sum of leaf wall-times", which can exceed the overall
  * wall-clock build time when parallelism is used.
  */
-static double bfVfHierNowSecs(void) {
+#if defined(__GNUC__) || defined(__clang__)
+static __attribute__((unused)) double bfVfHierNowSecs(void)
+#else
+static double bfVfHierNowSecs(void)
+#endif
+{
 #  ifdef _OPENMP
   return omp_get_wtime();
 #  else
@@ -224,8 +235,8 @@ void bfVfFaceMapInitFromParentFaces(
 
 void bfVfFaceMapDeinit(BfVfFaceMap *map);
 
-BfVfBlockMeta getBlockMeta(BfQuadtreeNode *rowNode,
-                           BfQuadtreeNode *colNode,
+BfVfBlockMeta getBlockMeta(BfTreeNode *rowNode,
+                           BfTreeNode *colNode,
                            BfSize leafMax);
 
 typedef struct BfVfApplyTask {
@@ -261,7 +272,7 @@ void           bfVfHierBlockDeinit(BfVfHierBlock *block);
 void           bfVfHierBlockDealloc(BfVfHierBlock **blockPtr);
 void           bfVfHierBlockDeinitAndDealloc(BfVfHierBlock **blockPtr); /* NEW */
 
-typedef struct { BfSize row; BfSize col; } ChildPair;
+typedef struct { BfTreeNode *row; BfTreeNode *col; } ChildPair;
 
 /* ============================================================
  * Optional build progress counters
@@ -297,6 +308,21 @@ void vfHierMaybePrintProgress_(unsigned long long done, unsigned long long total
 BfBool isFar(BfQuadtreeNode const *rowNode, BfQuadtreeNode const *colNode, BfReal eta);
 void getNodeInds(BfQuadtreeNode *node, BfQuadtree const *qt, BfSizeArray *inds);
 
+/* ============================================================
+ * NEW: generic TreeNode-based geometry helpers
+ * ============================================================ */
+
+/* Return TRUE iff admissible/far according to eta using either bbox2 (quadtree)
+ * or bbox3 (octree). eta < 0 keeps the existing “disable gating” meaning. */
+BfBool bfVfIsFarTreeNodes_(BfTreeNode const *rowNode,
+                           BfTreeNode const *colNode,
+                           BfReal eta);
+
+/* Fill inds with global indices covered by [first,last) using tree->perm. */
+void bfVfGetNodeIndsFromTreeNode_(BfTreeNode *node,
+                                 BfTree const *tree,
+                                 BfSizeArray *inds);
+
 /* ------------------------------------------------------------
  * Cross-TU internal entry points (real signatures; no placeholders)
  * ------------------------------------------------------------ */
@@ -314,14 +340,29 @@ BfVfHierBlock *buildBlockHybrid(
     BfSize           minSvdSize,
     BfReal           maxSvdRankFrac);
 
+BfVfHierBlock *buildBlockHybridFromTreeNodes(
+    BfTrimesh const *tm,
+    BfTree const    *tree,
+    BfTreeNode      *rowNode,
+    BfTreeNode      *colNode,
+    BfReal           eta,
+    BfSize           leafMax,
+    BfSize           leafMin,
+    BfReal           minArea,
+    BfReal           tol,
+    BfSize           minSvdSize,
+    BfReal           maxSvdRankFrac);
+
+
 /* Mid-level CSR recursive builder */
 BfVfHierBlock *buildBlockFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfSizeArray  const *rowFaces_par,
     BfSizeArray  const *colFaces_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTree       const *tree,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -335,8 +376,8 @@ BfVfHierBlock *buildBlockFromCsrMidlevel(
 void countSvdTriesFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
@@ -352,8 +393,8 @@ void countSvdTriesFromCsrMidlevel(
 void countLeavesFromCsrMidlevel(
     BfMatCsrReal const *A_par,
     BfVfFaceMap  const *faceMap,
-    BfQuadtreeNode *rowNode,
-    BfQuadtreeNode *colNode,
+    BfTreeNode *rowNode,
+    BfTreeNode *colNode,
     BfReal eta,
     BfSize leafMax,
     BfSize leafMin,
