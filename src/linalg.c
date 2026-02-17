@@ -70,6 +70,28 @@ _Static_assert(sizeof(BfReal) == sizeof(double),
                "PRIMME_SVDS/ARPACK backends require BfReal == double");
 #endif
 
+/* ---- Minimal rejSolver tracing ---------------------------------------- */
+
+#ifndef BF_SPARSE_SVD_REJSOLVER_TRACE
+#define BF_SPARSE_SVD_REJSOLVER_TRACE 1
+#endif
+
+#if BF_SPARSE_SVD_REJSOLVER_TRACE
+  #define REJSOLVER_LOG(...) bfLogInfo(__VA_ARGS__)
+#else
+  #define REJSOLVER_LOG(...) do {} while (0)
+#endif
+
+/* One-liner helper: bump rejSolver + log reason (no big frameworks). */
+#define REJECT_SOLVER(reason_fmt, ...) do {                                   \
+  REJSOLVER_LOG("[bf][sparse_svd][rejSolver] " reason_fmt "\n", __VA_ARGS__); \
+  /* Optional: keep your existing counter if present */                       \
+  /* BF_SVDSTAT_INC(gSparseSvd_reject_solver); */                             \
+  truncated = false;                                                         \
+  goto cleanup;                                                              \
+} while (0)
+
+
 /* ---- CSR SVD debug logging ----------------------------------------- */
 
 #ifndef BF_SPARSE_SVD_DEBUG
@@ -2626,6 +2648,11 @@ if (maxAbs < 1e-11) {
   return false;
 }
 
+/* Useful context for rejSolver logs */
+const unsigned long m_ = (unsigned long)m;
+const unsigned long n_ = (unsigned long)n;
+const unsigned long nnz_ = (unsigned long)nnz;
+
 /* Quick sanity check on OP for debugging: apply A^T A to a test vector */
 #if BF_SPARSE_SVD_DEBUG
 {
@@ -2670,7 +2697,6 @@ if (maxAbs < 1e-11) {
         "[bf] sparse SVD: pre-SVDS check: ||A^T A * 1|| = %.3e (m=%lu, n=%lu, nnz=%lu)\n",
         nAx, (unsigned long)m, (unsigned long)n, (unsigned long)nnz);
 
-      bfVecRealDeinitAndDealloc(&tmp_real);
     }
     bfMemFree(test_x);
     bfMemFree(test_y);
@@ -2784,7 +2810,7 @@ if (maxAbs < 1e-11) {
     PRIMME_INT mvBudget = (PRIMME_INT)(500 * (PRIMME_INT)maxRank);
 
     if (mvBudget < 2000)  mvBudget = 2000;       /* don’t be absurdly small */
-    if (mvBudget > 10000) mvBudget = 10000;      /* hard cap */
+    if (mvBudget > 100000) mvBudget = 100000;      /* hard cap */
 
     /* Budgets:
      * - primme_svds->maxMatvecs caps the outer SVDS iterations
@@ -2806,7 +2832,7 @@ if (maxAbs < 1e-11) {
   primme.monitorFun      = NULL; // bfPrimmeSvdsCappedMonitor;
   primme.monitorFun_type = primme_op_double;
   #if BF_SPARSE_SVD_DEBUG
-    primme.printLevel = 0; // 2
+    primme.printLevel = 2;
   #endif
 
   primme.m       = (PRIMME_INT)m;
@@ -2928,25 +2954,19 @@ if (maxAbs < 1e-11) {
   /* Fluxpy-style: accept partial results even if primme_ret != 0,
    * as long as we got >=1 finite singular value.
    */
-  if (numConv <= 0) {
-    SPARSE_SVD_LOG(
-      "[bf] sparse SVD: PRIMME_SVDS produced 0 usable modes; keeping CSR block\n");
-#if BF_SPARSE_SVD_STATS
-    BF_SVDSTAT_INC(gSparseSvd_reject_solver);
-    bfSparseSvdMaybePrintStats();
-#endif
-    truncated = false;
-    goto cleanup;
-  }
+if (numConv <= 0) {
+  REJECT_SOLVER("PRIMME numConv=0 (ret=%d) m=%lu n=%lu nnz=%lu maxRank=%lu",
+                primme_ret, m_, n_, nnz_, (unsigned long)maxRank);
+}
+
 
   /* Require the leading singular value to be sane */
-  if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
-    SPARSE_SVD_LOG(
-      "[bf] sparse SVD: PRIMME_SVDS leading s0 invalid (s0=%g); keeping CSR block\n",
-      (double)svals[0]);
-    truncated = false;
-    goto cleanup;
-  }
+if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
+  REJECT_SOLVER("bad svals[0]=%.3e (finite=%d) m=%lu n=%lu nnz=%lu maxRank=%lu",
+                (double)svals[0], (int)bfIsFiniteReal(svals[0]),
+                m_, n_, nnz_, (unsigned long)maxRank);
+}
+
 
   /* Work only with the converged singular triplets. */
   if ((BfSize)numConv < maxRank)
@@ -3129,15 +3149,10 @@ if (maxAbs < 1e-11) {
         for (BfSize i = 0; i < n; ++i) dot += (double)va[i] * (double)vb[i];
 
         if (fabs(dot) > (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL) {
-          SPARSE_SVD_LOG(
-            "[bf] sparse SVD: solver sanity reject (V-ortho): a=%lu b=%lu dot=%.3e tol=%.3e\n",
-            (unsigned long)a, (unsigned long)b, dot, (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL);
-#if BF_SPARSE_SVD_STATS
-          BF_SVDSTAT_INC(gSparseSvd_reject_solver);
-          bfSparseSvdMaybePrintStats();
-#endif
-          truncated = false;
-          goto cleanup;
+          REJECT_SOLVER("V-ortho fail: |dot(v%lu,v%lu)|=%.3e tol=%.3e m=%lu n=%lu nnz=%lu kchk=%lu",
+                        (unsigned long)a, (unsigned long)b, dot,
+                        (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL,
+                        m_, n_, nnz_, (unsigned long)kchk);
         }
       }
     }
@@ -3394,29 +3409,20 @@ if (maxAbs < 1e-11) {
       double nAv = sqrt(nAv2);
 
       if (fabs(nv - 1.0) > (double)BF_SPARSE_SVD_SANITY_VNORM_TOL) {
-        SPARSE_SVD_LOG(
-          "[bf] sparse SVD: solver sanity reject: ||v||=%.6e (tol=%.3e) j=%lu\n",
-          nv, (double)BF_SPARSE_SVD_SANITY_VNORM_TOL, (unsigned long)j);
-#if BF_SPARSE_SVD_STATS
-        BF_SVDSTAT_INC(gSparseSvd_reject_solver);
-        bfSparseSvdMaybePrintStats();
-#endif
-        truncated = false;
-        goto cleanup;
+        REJECT_SOLVER("V-norm fail: j=%lu ||v||=%.6e (|nv-1|=%.3e) tol=%.3e m=%lu n=%lu nnz=%lu",
+                      (unsigned long)j, nv, fabs(nv - 1.0),
+                        (double)BF_SPARSE_SVD_SANITY_VNORM_TOL,
+                        m_, n_, nnz_);
       }
+
 
       if (sj > 0) {
         double rel = fabs(nAv - (double)sj) / (double)sj;
         if (rel > (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL) {
-          SPARSE_SVD_LOG(
-            "[bf] sparse SVD: solver sanity reject: ||A v||=%.6e sigma=%.6e rel=%.3e tol=%.3e j=%lu\n",
-            nAv, (double)sj, rel, (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL, (unsigned long)j);
-#if BF_SPARSE_SVD_STATS
-          BF_SVDSTAT_INC(gSparseSvd_reject_solver);
-          bfSparseSvdMaybePrintStats();
-#endif
-          truncated = false;
-          goto cleanup;
+          REJECT_SOLVER("Av~sigma fail: j=%lu ||Av||=%.6e sigma=%.6e rel=%.3e tol=%.3e m=%lu n=%lu nnz=%lu",
+                        (unsigned long)j, nAv, (double)sj, rel,
+                        (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL,
+                        m_, n_, nnz_);
         }
       }
     }
