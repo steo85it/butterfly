@@ -360,6 +360,25 @@ cdef inline int _zero2(double[::1, :] A) nogil:
     return 0
 
 
+cdef inline bint _should_checkpoint(
+    int out_t,
+    int checkpoint_every,
+    bint checkpoint_at_end,
+    int final_out_t,
+) nogil:
+    """
+    out_t < 0 means "not stored" (e.g. not last rep when return_last_cycle_only).
+    We checkpoint only on stored outputs.
+    """
+    if out_t < 0:
+        return False
+    if checkpoint_every > 0 and (out_t % checkpoint_every) == 0:
+        return True
+    if checkpoint_at_end and out_t == final_out_t:
+        return True
+    return False
+
+
 cpdef object run_thermal_series_with_bf(
     object ff_op,
     cnp.ndarray[cnp.double_t, ndim=2] E_series,
@@ -376,6 +395,13 @@ cpdef object run_thermal_series_with_bf(
     int num_reps=1,
     bint return_last_cycle_only=True,
     bint return_diagnostics=False,
+    bint return_fluxes=False,
+    bint debug_timing=False,
+    int timing_every=1,
+    object checkpoint_cb=None,
+    int checkpoint_every=0,
+    bint checkpoint_at_end=True,
+    bint checkpoint_copy=True,
 ):
     """
     Time-dependent thermal model driven by a BF FF operator.
@@ -413,6 +439,16 @@ cpdef object run_thermal_series_with_bf(
         Temperature at all depths and times.
     Tsurf_all : (nt, Nfaces)
         Surface temperature at each time.
+
+    Optional checkpointing
+    ----------------------
+    If checkpoint_cb is provided and checkpoint_every > 0, the function calls:
+        checkpoint_cb(state_dict)
+    on stored output indices out_t where out_t % checkpoint_every == 0, and also
+    at the final stored output if checkpoint_at_end is True.
+
+    The state_dict contains exact restart state including radiative state (Qrefl/QIR).
+    If checkpoint_copy is True, arrays in state_dict are copies (safe for I/O).
     """
     import os
     print("affinity:", len(os.sched_getaffinity(0)), sorted(os.sched_getaffinity(0))[:32])
@@ -515,6 +551,13 @@ cpdef object run_thermal_series_with_bf(
     else:
         nt_out = nt * num_reps
 
+    # final output index (last stored out_t)
+    cdef int final_out_t
+    if nt_out > 0:
+        final_out_t = <int>(nt_out - 1)
+    else:
+        final_out_t = -1
+
     # --- allocate output arrays ---
     cdef cnp.ndarray[cnp.double_t, ndim=3] T_all = np.empty(
         (nt_out, Nfaces, nz), dtype=np.float64)
@@ -523,6 +566,22 @@ cpdef object run_thermal_series_with_bf(
 
     cdef double[:, :, ::1] T_all_view = T_all
     cdef double[:, ::1] Tsurf_all_view = Tsurf_all
+
+    # --- OPTIONAL: per-face flux time series outputs ---
+    cdef cnp.ndarray[cnp.double_t, ndim=2] Qrefl_all = None
+    cdef cnp.ndarray[cnp.double_t, ndim=2] QIR_all = None
+    cdef cnp.ndarray[cnp.double_t, ndim=2] Qnet_all = None
+    cdef double[:, ::1] Qrefl_all_view
+    cdef double[:, ::1] QIR_all_view
+    cdef double[:, ::1] Qnet_all_view
+
+    if return_fluxes:
+        Qrefl_all = np.empty((nt_out, Nfaces), dtype=np.float64)
+        QIR_all   = np.empty((nt_out, Nfaces), dtype=np.float64)
+        Qnet_all  = np.empty((nt_out, Nfaces), dtype=np.float64)
+        Qrefl_all_view = Qrefl_all
+        QIR_all_view   = QIR_all
+        Qnet_all_view  = Qnet_all
 
     # --- diagnostics (small) ---
     cdef cnp.ndarray[cnp.double_t, ndim=2] mu_z = None
@@ -654,11 +713,24 @@ cpdef object run_thermal_series_with_bf(
     cdef Py_ssize_t rep, out_t
     cdef double mu_j, dtmp, dmax
 
+    if timing_every < 1:
+        timing_every = 1
+
     # NEW: step diagnostic accumulators (reused each t_idx)
     cdef double accE, accQrefl, accQIR, accQnet
     cdef double raw_refl, raw_ir
     cdef double min_raw_refl, min_raw_ir
     cdef long long neg_raw_refl, neg_raw_ir
+
+    # --- checkpoint callback local vars ---
+    # (checkpoint_every / checkpoint_cb / checkpoint_at_end / checkpoint_copy
+    #  are function args; validate/sanitize once here)
+    cdef bint do_ck = False
+    cdef object state = None
+    if checkpoint_every < 0:
+        checkpoint_every = 0
+    if checkpoint_cb is not None and not callable(checkpoint_cb):
+        raise TypeError("checkpoint_cb must be callable or None")
 
     for rep in range(num_reps):
 
@@ -825,9 +897,57 @@ cpdef object run_thermal_series_with_bf(
                 for j in range(nz):
                     T_all_view[out_t, i, j] = Tmat[i, j]
 
+                if return_fluxes:
+                    # At t0, Qrefl_next/QIR_next correspond to radiative solution at t=0
+                    Qrefl_all_view[out_t, i] = Qrefl_next_view[i]
+                    QIR_all_view[out_t, i]   = QIR_next_view[i]
+                    Qnet_all_view[out_t, i]  = Q_view[i]
+
             if return_diagnostics:
                 for j in range(nz):
                     sum_z_view[j] += Tmat[i, j]
+
+        # ---- checkpoint callback at t0 (after radiative shift, after store) ----
+        do_ck = _should_checkpoint(<int>out_t, checkpoint_every, checkpoint_at_end, final_out_t)
+        if do_ck and checkpoint_cb is not None:
+            # Build exact restart state for *next* step:
+            #   T = conduction state (model._T)
+            #   Qprev = model._Qprev
+            #   Qrefl/QIR = current radiative state (already shifted to *_view)
+            #   Tsurf_prev = seed used next step (kept in Tsurf_prev_view)
+            if checkpoint_copy:
+                state = {
+                    "rep": int(rep),
+                    "t_idx": int(0),
+                    "out_t": int(out_t),
+                    "nt": int(nt),
+                    "nt_out": int(nt_out),
+                    "Nfaces": int(Nfaces),
+                    "nz": int(nz),
+                    "T": np.asarray(model._T).copy(),
+                    "Qprev": np.asarray(model._Qprev).copy(),
+                    "Qrefl": np.asarray(Qrefl).copy(),
+                    "QIR": np.asarray(QIR).copy(),
+                    "Tsurf_prev": np.asarray(Tsurf_prev).copy(),
+                    "return_fluxes": bool(return_fluxes),
+                }
+            else:
+                state = {
+                    "rep": int(rep),
+                    "t_idx": int(0),
+                    "out_t": int(out_t),
+                    "nt": int(nt),
+                    "nt_out": int(nt_out),
+                    "Nfaces": int(Nfaces),
+                    "nz": int(nz),
+                    "T": np.asarray(model._T),
+                    "Qprev": np.asarray(model._Qprev),
+                    "Qrefl": np.asarray(Qrefl),
+                    "QIR": np.asarray(QIR),
+                    "Tsurf_prev": np.asarray(Tsurf_prev),
+                    "return_fluxes": bool(return_fluxes),
+                }
+            checkpoint_cb(state)
 
         if return_diagnostics:
             for j in range(nz):
@@ -1031,10 +1151,63 @@ cpdef object run_thermal_series_with_bf(
                     for j in range(nz):
                         T_all_view[out_t, i, j] = Tmat[i, j]
 
+                    if return_fluxes:
+                        Qrefl_all_view[out_t, i] = Qrefl_next_view[i]
+                        QIR_all_view[out_t, i]   = QIR_next_view[i]
+                        Qnet_all_view[out_t, i]  = Q_view[i]
+
                 if return_diagnostics:
                     for j in range(nz):
                         sum_z_view[j] += Tmat[i, j]
 
+            # ---- checkpoint callback (after conduction + radiative shift + store) ----
+            do_ck = _should_checkpoint(<int>out_t, checkpoint_every, checkpoint_at_end, final_out_t)
+            if do_ck and checkpoint_cb is not None:
+                if checkpoint_copy:
+                    state = {
+                        "rep": int(rep),
+                        "t_idx": int(t_idx),
+                        "out_t": int(out_t),
+                        "nt": int(nt),
+                        "nt_out": int(nt_out),
+                        "Nfaces": int(Nfaces),
+                        "nz": int(nz),
+                        "T": np.asarray(model._T).copy(),
+                        "Qprev": np.asarray(model._Qprev).copy(),
+                        "Qrefl": np.asarray(Qrefl).copy(),
+                        "QIR": np.asarray(QIR).copy(),
+                        "Tsurf_prev": np.asarray(Tsurf_prev).copy(),
+                        "return_fluxes": bool(return_fluxes),
+                    }
+                else:
+                    state = {
+                        "rep": int(rep),
+                        "t_idx": int(t_idx),
+                        "out_t": int(out_t),
+                        "nt": int(nt),
+                        "nt_out": int(nt_out),
+                        "Nfaces": int(Nfaces),
+                        "nz": int(nz),
+                        "T": np.asarray(model._T),
+                        "Qprev": np.asarray(model._Qprev),
+                        "Qrefl": np.asarray(Qrefl),
+                        "QIR": np.asarray(QIR),
+                        "Tsurf_prev": np.asarray(Tsurf_prev),
+                        "return_fluxes": bool(return_fluxes),
+                    }
+                checkpoint_cb(state)
+
+            # Optional debug timing log (per step)
+            if debug_timing and ((t_idx % timing_every) == 0):
+                # These t? variables are set in both use_many and non-many paths.
+                # prepS = tA - t0, applyS = tB - tA, postS = tC - tB
+                # prepL = tD - tC, applyL = tE - tD, postL = tF - tE
+                # cond = tG - tF, store = tH - tG
+                print(f"[bf-thermal-timing] rep {rep+1}/{num_reps} t={t_idx}/{nt-1} "
+                      f"prepS={tA - t0:.4f} applyS={tB - tA:.4f} postS={tC - tB:.4f} "
+                      f"prepL={tD - tC:.4f} applyL={tE - tD:.4f} postL={tF - tE:.4f} "
+                      f"cond={tG - tF:.4f} store={tH - tG:.4f} total={tH - t0:.4f}")
+                sys.stdout.flush()
             if return_diagnostics:
                 for j in range(nz):
                     tbar_z_view[j] = sum_z_view[j] * invN
@@ -1051,9 +1224,10 @@ cpdef object run_thermal_series_with_bf(
                     if tbar_z_view[j] > tbar_max_view[j]:
                         tbar_max_view[j] = tbar_z_view[j]
 
-            print(f"[timing] prepS={tA - t0:.4f} applyS={tB - tA:.4f} postS={tC - tB:.4f} "
-                  f"prepL={tD - tC:.4f} applyL={tE - tD:.4f} postL={tF - tE:.4f} "
-                  f"cond={tG - tF:.4f} store={tH - tG:.4f} total={tH - t0:.4f}")
+            # DEBUG ONLY
+            # print(f"[timing] prepS={tA - t0:.4f} applyS={tB - tA:.4f} postS={tC - tB:.4f} "
+            #       f"prepL={tD - tC:.4f} applyL={tE - tD:.4f} postL={tF - tE:.4f} "
+            #       f"cond={tG - tF:.4f} store={tH - tG:.4f} total={tH - t0:.4f}")
 
         # end of cycle: write mu_z, amp_z, drift
         if return_diagnostics:
@@ -1077,7 +1251,10 @@ cpdef object run_thermal_series_with_bf(
 
     # ---- AFTER finishing all reps ----
     if not return_diagnostics:
-        return T_all, Tsurf_all
+        if return_fluxes:
+            return T_all, Tsurf_all, Qrefl_all, QIR_all, Qnet_all
+        else:
+            return T_all, Tsurf_all
 
     diag = {
         "mu_z": mu_z,
@@ -1095,5 +1272,8 @@ cpdef object run_thermal_series_with_bf(
         "negReflRaw_t": negReflRaw_t,
         "negIRRaw_t": negIRRaw_t,
     }
-    return T_all, Tsurf_all, diag
+    if return_fluxes:
+        return T_all, Tsurf_all, Qrefl_all, QIR_all, Qnet_all, diag
+    else:
+        return T_all, Tsurf_all, diag
 
