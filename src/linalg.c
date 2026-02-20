@@ -70,6 +70,40 @@ _Static_assert(sizeof(BfReal) == sizeof(double),
                "PRIMME_SVDS/ARPACK backends require BfReal == double");
 #endif
 
+/* ---- Sparse SVD aggregate stats (decls/macros must be visible to REJECT) ---- */
+
+#ifndef BF_SPARSE_SVD_STATS
+#define BF_SPARSE_SVD_STATS 1
+#endif
+
+/* Print summary every N leaf attempts (0 disables periodic printing) */
+#ifndef BF_SPARSE_SVD_STATS_EVERY
+#define BF_SPARSE_SVD_STATS_EVERY 0
+#endif
+
+/* Counters (best-effort; in OpenMP builds, use atomic updates) */
+static long long gSparseSvd_leafTotal        = 0;
+static long long gSparseSvd_acceptSvd        = 0;
+static long long gSparseSvd_reject_notAchTol = 0;
+static long long gSparseSvd_reject_rowSum    = 0;
+static long long gSparseSvd_reject_bytes     = 0;
+static long long gSparseSvd_reject_physics   = 0;
+static long long gSparseSvd_reject_solver    = 0;
+static long long gSparseSvd_reject_solver_vortho = 0;
+static long long gSparseSvd_reject_solver_vnorm  = 0;
+static long long gSparseSvd_reject_solver_avsig  = 0;
+static long long gSparseSvd_skip_nnz0        = 0;
+static long long gSparseSvd_skip_numZero     = 0;
+static long long gSparseSvd_skip_tiny        = 0;
+
+#ifdef _OPENMP
+  #define BF_SVDSTAT_INC(x) do { _Pragma("omp atomic") x++; } while (0)
+  #define BF_SVDSTAT_ADD(x, v) do { _Pragma("omp atomic") x += (v); } while (0)
+#else
+  #define BF_SVDSTAT_INC(x) do { (x)++; } while (0)
+  #define BF_SVDSTAT_ADD(x, v) do { (x) += (v); } while (0)
+#endif
+
 /* ---- Minimal rejSolver tracing ---------------------------------------- */
 
 #ifndef BF_SPARSE_SVD_REJSOLVER_TRACE
@@ -82,14 +116,37 @@ _Static_assert(sizeof(BfReal) == sizeof(double),
   #define REJSOLVER_LOG(...) do {} while (0)
 #endif
 
-/* One-liner helper: bump rejSolver + log reason (no big frameworks). */
-#define REJECT_SOLVER(reason_fmt, ...) do {                                   \
-  REJSOLVER_LOG("[bf][sparse_svd][rejSolver] " reason_fmt "\n", __VA_ARGS__); \
-  /* Optional: keep your existing counter if present */                       \
-  /* BF_SVDSTAT_INC(gSparseSvd_reject_solver); */                             \
+
+typedef enum {
+  BF_SPARSE_SVD_REJ_OTHER = 0,
+  BF_SPARSE_SVD_REJ_VORTHO,
+  BF_SPARSE_SVD_REJ_VNORM,
+  BF_SPARSE_SVD_REJ_AVSIG
+} BfSparseSvdRejSolverKind;
+
+static const char *bfSparseSvdRejKindStr(BfSparseSvdRejSolverKind k) {
+  switch (k) {
+  case BF_SPARSE_SVD_REJ_VORTHO: return "V-ortho";
+  case BF_SPARSE_SVD_REJ_VNORM:  return "V-norm";
+  case BF_SPARSE_SVD_REJ_AVSIG:  return "Av~sigma";
+  default:                       return "other";
+  }
+}
+
+#define REJECT_SOLVER_KIND(kind, reason_fmt, ...) do {                        \
+  BF_SVDSTAT_INC(gSparseSvd_reject_solver);                                   \
+  if ((kind) == BF_SPARSE_SVD_REJ_VORTHO) BF_SVDSTAT_INC(gSparseSvd_reject_solver_vortho); \
+  else if ((kind) == BF_SPARSE_SVD_REJ_VNORM) BF_SVDSTAT_INC(gSparseSvd_reject_solver_vnorm); \
+  else if ((kind) == BF_SPARSE_SVD_REJ_AVSIG) BF_SVDSTAT_INC(gSparseSvd_reject_solver_avsig); \
+  REJSOLVER_LOG("[bf][sparse_svd][rejSolver][%s] " reason_fmt "\n",            \
+                bfSparseSvdRejKindStr(kind), __VA_ARGS__);                    \
   truncated = false;                                                         \
   goto cleanup;                                                              \
 } while (0)
+
+/* Backward-compatible default */
+#define REJECT_SOLVER(reason_fmt, ...)                                        \
+  REJECT_SOLVER_KIND(BF_SPARSE_SVD_REJ_OTHER, reason_fmt, __VA_ARGS__)
 
 
 /* ---- CSR SVD debug logging ----------------------------------------- */
@@ -140,35 +197,9 @@ static double bfPrimmeSvdsMaxWalltime(void) {
   return wall;
 }
 
+#endif /* BF_HAVE_PRIMME_SVDS */
+
 /* ---- Sparse SVD aggregate stats --------------------------------------- */
-#ifndef BF_SPARSE_SVD_STATS
-#define BF_SPARSE_SVD_STATS 1
-#endif
-
-/* Print summary every N leaf attempts (0 disables periodic printing) */
-#ifndef BF_SPARSE_SVD_STATS_EVERY
-#define BF_SPARSE_SVD_STATS_EVERY 0
-#endif
-
-/* Counters (best-effort; in OpenMP builds, use atomic updates) */
-static long long gSparseSvd_leafTotal        = 0;
-static long long gSparseSvd_acceptSvd        = 0;
-static long long gSparseSvd_reject_notAchTol = 0;
-static long long gSparseSvd_reject_rowSum    = 0;
-static long long gSparseSvd_reject_bytes     = 0;
-static long long gSparseSvd_reject_physics   = 0;
-static long long gSparseSvd_reject_solver    = 0;
-static long long gSparseSvd_skip_nnz0        = 0;
-static long long gSparseSvd_skip_numZero     = 0;
-static long long gSparseSvd_skip_tiny        = 0;
-
-#ifdef _OPENMP
-  #define BF_SVDSTAT_INC(x) do { _Pragma("omp atomic") x++; } while (0)
-  #define BF_SVDSTAT_ADD(x, v) do { _Pragma("omp atomic") x += (v); } while (0)
-#else
-  #define BF_SVDSTAT_INC(x) do { (x)++; } while (0)
-  #define BF_SVDSTAT_ADD(x, v) do { (x) += (v); } while (0)
-#endif
 
 static void bfSparseSvdPrintStatsNow(char const *tag) {
 #if BF_SPARSE_SVD_STATS
@@ -179,6 +210,9 @@ static void bfSparseSvdPrintStatsNow(char const *tag) {
   long long rejB  = gSparseSvd_reject_bytes;
   long long rejP  = gSparseSvd_reject_physics;
   long long rejS  = gSparseSvd_reject_solver;
+  long long rejSvO = gSparseSvd_reject_solver_vortho;
+  long long rejSvN = gSparseSvd_reject_solver_vnorm;
+  long long rejSvA = gSparseSvd_reject_solver_avsig;
   long long sk0   = gSparseSvd_skip_nnz0;
   long long skZ   = gSparseSvd_skip_numZero;
   long long skTi  = gSparseSvd_skip_tiny;
@@ -188,11 +222,13 @@ static void bfSparseSvdPrintStatsNow(char const *tag) {
   bfLogInfo(
     "[bf][sparse_svd][stats]%s leaves=%lld  acceptSVD=%lld(%.1f%%) "
     "rejTol=%lld  rejRowSum=%lld  rejBytes=%lld  rejPhys=%lld  rejSolver=%lld  "
+    "rejSolverBreakdown(Vortho=%lld Vnorm=%lld AvSig=%lld) "
     "skip(nnz0=%lld numZero=%lld tiny=%lld)\n",
     tag ? tag : "",
     t,
     acc, 100.0*(double)acc/denom,
     rejT, rejRS, rejB, rejP, rejS,
+    rejSvO, rejSvN, rejSvA,
     sk0, skZ, skTi);
 #else
   (void)tag;
@@ -231,6 +267,9 @@ void bfSparseSvdResetStats(void) {
   gSparseSvd_reject_bytes     = 0;
   gSparseSvd_reject_physics   = 0;
   gSparseSvd_reject_solver    = 0;
+  gSparseSvd_reject_solver_vortho = 0;
+  gSparseSvd_reject_solver_vnorm  = 0;
+  gSparseSvd_reject_solver_avsig  = 0;
   gSparseSvd_skip_nnz0        = 0;
   gSparseSvd_skip_numZero     = 0;
   gSparseSvd_skip_tiny        = 0;
@@ -258,6 +297,7 @@ static void bfSparseSvdInstallAtexitOnce(void) {
 #endif
 }
 
+#if BF_HAVE_PRIMME_SVDS
 static void bfPrimmeSvdsCappedMonitor(
     void *basisSvals, int *basisSize, int *basisFlags,
     int *iblock, int *blockSize, void *basisNorms, int *numConverged,
@@ -803,6 +843,9 @@ BfSize bfTruncSpecGetNumTerms(BfTruncSpec const *truncSpec, BfMatDiagReal const 
   BfSize k = 0;
 
   if (S == NULL || S->numElts == 0)
+    return 0;
+
+  if (truncSpec == NULL)
     return 0;
 
   if (!bfIsFiniteReal(S->data[0]) || S->data[0] <= 0)
@@ -2886,13 +2929,6 @@ const unsigned long nnz_ = (unsigned long)nnz;
                                 &primme);
   (void)primme_ret;
 
-  /* Free PRIMME-owned internal allocations ASAP (stack 'primme' persists,
-   * but PRIMME may allocate work arrays that otherwise accumulate per leaf). */
-  if (primme_inited) {
-    primme_svds_free(&primme);
-    primme_inited = false;
-  }
-
   /* Snapshot counters after call */
   long long csrA_after  = gPrimmeCsrMatvecCalls_A;
   long long csrAT_after = gPrimmeCsrMatvecCalls_AT;
@@ -2936,6 +2972,12 @@ const unsigned long nnz_ = (unsigned long)nnz;
     csrAT_delta,
     csr_total);
 
+  /* Free PRIMME-owned internal allocations AFTER we log stats */
+  if (primme_inited) {
+    primme_svds_free(&primme);
+    primme_inited = false;
+  }
+
   /* Also show approximate ratio CSR / “operator matvec” if available */
 #if BF_SPARSE_SVD_DEBUG
   if (primme.stats.numMatvecs > 0) {
@@ -2967,6 +3009,33 @@ if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
                 m_, n_, nnz_, (unsigned long)maxRank);
 }
 
+#if BF_SPARSE_SVD_DEBUG
+{
+for (int j = 0; j < (numConv < 3 ? numConv : 3); ++j) {
+  double nrm_interleave = 0.0;
+  {
+    const BfSize ldsv = m + n;
+    const BfReal *vj = (const BfReal *)svecs + (BfSize)j*ldsv + (BfSize)m;
+    for (BfSize i = 0; i < n; ++i) nrm_interleave += (double)vj[i]*(double)vj[i];
+    nrm_interleave = sqrt(nrm_interleave);
+  }
+
+  double nrm_block = 0.0;
+  {
+    const BfSize numSvals = (BfSize)primme.numSvals;
+    const BfReal *Vblock = (const BfReal *)svecs + (BfSize)m * numSvals;
+    const BfReal *vj = Vblock + (BfSize)j*(BfSize)n;
+    for (BfSize i = 0; i < n; ++i) nrm_block += (double)vj[i]*(double)vj[i];
+    nrm_block = sqrt(nrm_block);
+  }
+
+  SPARSE_SVD_LOG("[bf] PRIMME svecs layout check: j=%d ||v|| interleave=%.6e block=%.6e\n",
+                 j, nrm_interleave, nrm_block);
+//  bfLogInfo("[bf] PRIMME svecs layout check: j=%d ||v|| interleave=%.6e block=%.6e\n",
+//            j, nrm_interleave, nrm_block);
+}
+}
+#endif
 
   /* Work only with the converged singular triplets. */
   if ((BfSize)numConv < maxRank)
@@ -2982,27 +3051,28 @@ if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
   if (Z == NULL)
     RAISE_ERROR(BF_ERROR_MEMORY_ERROR);
 
-  /* PRIMME returns each singular vector pair as one (m+n)-vector per column:
-   * column j = [u_j (m entries); v_j (n entries)], with ld = m+n.
-   * We only need v_j here.
-   */
-  const BfSize ldsv = m + n;
+/* PRIMME_SVDS svecs layout (typical):
+ *   Ublock: m x numSvals (column-major)
+ *   Vblock: n x numSvals (column-major), stored after Ublock
+ */
+const BfSize numSvals = (BfSize)primme.numSvals; /* == requested numSvals */
+const BfReal *Ublock = svecs;
+const BfReal *Vblock = svecs + (BfSize)m * numSvals;
 
-  for (BfSize j = 0; j < maxRank; ++j) {
-    BfReal sj = svals[j];
-    if (!bfIsFiniteReal(sj) || sj <= 0) {
-      truncated = false;
-      goto cleanup;
-    }
-    lambda[j] = sj*sj;
+for (BfSize j = 0; j < maxRank; ++j) {
+  BfReal sj = svals[j];
+  if (!bfIsFiniteReal(sj) || sj <= 0) { truncated = false; goto cleanup; }
 
-    const BfReal *col = svecs + j*ldsv;
-    const BfReal *vj  = col + m;
+  lambda[j] = sj*sj;
 
-    BfReal *Zcol = Z + j*(BfSize)n;
-    for (BfSize i = 0; i < n; ++i)
-      Zcol[i] = vj[i];
-  }
+  /* v_j is column j of Vblock (length n) */
+  const BfReal *vj = Vblock + j*(BfSize)n;
+
+  BfReal *Zcol = Z + j*(BfSize)n;
+  for (BfSize i = 0; i < n; ++i)
+    Zcol[i] = vj[i];
+}
+
 
   SPARSE_SVD_LOG(
     "[bf] sparse SVD: PRIMME_SVDS accepted maxRank=%lu for m=%lu n=%lu nnz=%lu\n",
@@ -3149,10 +3219,11 @@ if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
         for (BfSize i = 0; i < n; ++i) dot += (double)va[i] * (double)vb[i];
 
         if (fabs(dot) > (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL) {
-          REJECT_SOLVER("V-ortho fail: |dot(v%lu,v%lu)|=%.3e tol=%.3e m=%lu n=%lu nnz=%lu kchk=%lu",
-                        (unsigned long)a, (unsigned long)b, dot,
-                        (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL,
-                        m_, n_, nnz_, (unsigned long)kchk);
+          REJECT_SOLVER_KIND(BF_SPARSE_SVD_REJ_VORTHO,
+            "V-ortho fail: |dot(v%lu,v%lu)|=%.3e tol=%.3e m=%lu n=%lu nnz=%lu kchk=%lu",
+            (unsigned long)a, (unsigned long)b, dot,
+            (double)BF_SPARSE_SVD_SANITY_ORTHO_TOL,
+            m_, n_, nnz_, (unsigned long)kchk);
         }
       }
     }
@@ -3409,20 +3480,22 @@ if (!bfIsFiniteReal(svals[0]) || svals[0] <= 0) {
       double nAv = sqrt(nAv2);
 
       if (fabs(nv - 1.0) > (double)BF_SPARSE_SVD_SANITY_VNORM_TOL) {
-        REJECT_SOLVER("V-norm fail: j=%lu ||v||=%.6e (|nv-1|=%.3e) tol=%.3e m=%lu n=%lu nnz=%lu",
-                      (unsigned long)j, nv, fabs(nv - 1.0),
-                        (double)BF_SPARSE_SVD_SANITY_VNORM_TOL,
-                        m_, n_, nnz_);
+        REJECT_SOLVER_KIND(BF_SPARSE_SVD_REJ_VNORM,
+          "V-norm fail: j=%lu ||v||=%.6e (|nv-1|=%.3e) tol=%.3e m=%lu n=%lu nnz=%lu",
+          (unsigned long)j, nv, fabs(nv - 1.0),
+          (double)BF_SPARSE_SVD_SANITY_VNORM_TOL,
+          m_, n_, nnz_);
       }
 
 
       if (sj > 0) {
         double rel = fabs(nAv - (double)sj) / (double)sj;
         if (rel > (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL) {
-          REJECT_SOLVER("Av~sigma fail: j=%lu ||Av||=%.6e sigma=%.6e rel=%.3e tol=%.3e m=%lu n=%lu nnz=%lu",
-                        (unsigned long)j, nAv, (double)sj, rel,
-                        (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL,
-                        m_, n_, nnz_);
+          REJECT_SOLVER_KIND(BF_SPARSE_SVD_REJ_AVSIG,
+            "Av~sigma fail: j=%lu ||Av||=%.6e sigma=%.6e rel=%.3e tol=%.3e m=%lu n=%lu nnz=%lu",
+            (unsigned long)j, nAv, (double)sj, rel,
+            (double)BF_SPARSE_SVD_SANITY_SIG_REL_TOL,
+            m_, n_, nnz_);
         }
       }
     }
